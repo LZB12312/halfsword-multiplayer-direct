@@ -1,29 +1,27 @@
-Validation of 0.8.0-pre27-direct1
+Validation of Half Sword Direct IP 0.2.0
 
-Built on Windows x64 with LLVM-MinGW UCRT 20261104, C++20, Release (-O2).
-Full build passed with -Wall -Wextra -Werror for C++.
-Binary imports inspected: Windows APIs/UCRT only; no Steam or third-party runtime DLL dependency.
+Windows x64, LLVM-MinGW UCRT 20261104, C++20, Release (-O2).
+C++ builds use -Wall -Wextra -Werror.
 
 Passed automated checks:
-- Real UDP host + two separate clients: lobby snapshots, membership, chat,
-  ready state, reliable fragmented 16 KiB payloads, unreliable packets.
-- Capacity rejection, occupied local port, connection timeout.
-- Host kick, client reconnect, graceful host disconnect.
-- Network harness explicitly verifies steam_api64.dll is not loaded.
-- Address input validation, truncated frames, sender identity binding,
-  protected host state, wrong target filtering, 20,000 malformed frames.
-- Mock UPnP gateway: mapping creation/removal, unavailable gateway,
-  existing mapping preservation, inspection/add failure, permanent-lease
-  fallback, preservation when another application changes the rule.
-- Upstream regression programs: lobby scene, password, moderation, roster,
-  server roster, protocol, voice (7 passed).
-- git diff --check passed.
+- Real UDP host and two independent clients: membership, snapshots, chat,
+  ready state, display-name updates, reliable 16 KiB and unreliable payloads.
+- Capacity rejection, occupied port, timeout, kick/rejoin, host disconnect.
+- Sender-bound name changes, control-character and UTF-8 length handling,
+  protected host state, wrong-target filtering, 20,000 malformed frames.
+- Mock UPnP mapping lifecycle and error paths; tests disable real UPnP.
+- Roster identity preservation across renames; lobby scene, loadout-change,
+  sever/recovery, gore, update and version regression programs.
+- In the installed supported game, the direct equipment launcher created
+  UI_Tavern_Inventory with valid preview character and camera references.
+  Closing exported the Free Mode passport; opening, closing and reopening
+  retained the host lobby without map travel. Tested through the opt-in,
+  loopback-only agent bridge. No career-save writes were enabled.
 
-Not validated here:
-- Actual Half Sword combat, UI rendering, microphone/audio devices.
-- Internet matches between separate networks.
-- UPnP discovery/mapping/renewal through a physical router.
-- The Linux cross-build script; the supplied DLL was built with build.ps1.
+Limits:
+- Visual layout and interactive equipment picking need a player check.
+- Mid-round return/map travel and edited equipment need a two-player check.
+- Internet play, physical-router UPnP and hardware audio were not retested.
+- Dismemberment recovery improvements do not establish that every desync is fixed.
 
-The UPnP tests use a fake gateway. All real UDP tests set upnp=0 and do
-not modify router or Windows Firewall settings.
+Game assets used for local inspection are not included in this repository.

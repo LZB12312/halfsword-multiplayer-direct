@@ -41,7 +41,7 @@ jobs:
           python implementation/client/HSMMod/tests/run_direct_network.py
           if ($LASTEXITCODE) { throw 'Network tests failed' }
           $cxx = Join-Path $env:LLVM_MINGW 'bin/x86_64-w64-mingw32-clang++.exe'
-          foreach ($test in @('combat/test_hsm_sever.cpp','combat/test_hsm_sever_recovery.cpp','sync/test_hsm_gore.cpp','session/test_hsm_update.cpp','session/test_hsm_version.cpp')) {
+          foreach ($test in @('combat/test_hsm_sever.cpp','combat/test_hsm_sever_recovery.cpp','sync/test_hsm_gore.cpp','session/test_hsm_update.cpp','session/test_hsm_version.cpp','session/test_hsm_roster.cpp','match/test_hsm_lobby_scene.cpp','session/test_hsm_loadout_change.cpp')) {
             & $cxx -std=c++20 -D_USE_MATH_DEFINES -O1 -Wall -Wextra -Werror -Iimplementation/shared -Iimplementation/shared/protocol "implementation/shared/$test" -static -o "$env:RUNNER_TEMP/check.exe"
             if ($LASTEXITCODE) { throw "Compile failed: $test" }
             & "$env:RUNNER_TEMP/check.exe"

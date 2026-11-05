@@ -2,6 +2,8 @@
 // packet senders by their ENet connection. All gameplay goes through the host.
 #include "net/direct_api.h"
 #include "net/upnp.h"
+#include "net/address_service.h"
+#include "session/hsm_display_name.h"
 #include "hsm_protocol.h"
 #include "log.h"
 #include "paths.h"
@@ -48,7 +50,7 @@ struct Backend {
     bool ready=false, hosting=false, entered=false, joinable=true, dirty=false;
     ENetHost* host=nullptr; ENetPeer* server=nullptr;
     UserId me=1, next=2;
-    int limit=8; uint16_t port=27015; bool upnp=true;
+    int limit=8; uint16_t port=27015; bool upnp=true, publicLookup=true;
     uint32_t joinAt=0;
     std::string address="127.0.0.1:27015", name="Player";
     Values data; std::map<UserId,Member> members;
@@ -56,9 +58,10 @@ struct Backend {
     std::map<ENetPeer*,uint32_t> pending;
     std::deque<Event> events; std::deque<Message> messages;
     net::UpnpMapping mapping;
+    net::AddressService addresses;
     ~Backend() { Clear(); if(ready) enet_deinitialize(); }
     void Clear() {
-        mapping.Stop();
+        mapping.Stop(); addresses.Stop();
         if(host) { for(size_t i=0;i<host->peerCount;++i) enet_peer_disconnect_now(&host->peers[i],0); enet_host_destroy(host); }
         host=nullptr; server=nullptr; hosting=entered=dirty=false; joinAt=0;
         peers.clear(); pending.clear(); members.clear(); data.clear(); messages.clear(); events.clear();
@@ -113,6 +116,11 @@ struct Backend {
         }
         if(op==MemberUpdate && hosting && sender && channel==0) {
             auto key=r.Str(64), value=r.Str();
+            if(r.Done() && key=="display_name") {
+                const auto clean=CleanDisplayName(value);
+                if(!clean.empty() && members[sender].name!=clean) { members[sender].name=clean; Changed(); }
+                return;
+            }
             if(!r.Done() || (key!="ready" && key!="hsm_team" && key!="hsm_ver" && key!="hsm_mod")) return;
             if(members[sender].data[key]!=value) { members[sender].data[key]=value; Changed(); }
             return;
@@ -150,10 +158,24 @@ bool Init() {
     b.ready=true; b.name=Read(L"name",L"Player").substr(0,32); b.address=Read(L"connect",L"127.0.0.1:27015");
     auto ps=Read(L"port",L"27015"); auto port=std::strtoul(ps.c_str(),nullptr,10);
     b.port=uint16_t(port && port<=65535 ? port : 27015); b.upnp=Read(L"upnp",L"1")!="0";
+    b.publicLookup=Read(L"public_ip_lookup",L"1")!="0";
     HSM_LOG("direct: ready; host UDP port %u, connect=%s, UPnP=%s",b.port,b.address.c_str(),b.upnp?"on":"off"); return true;
 }
 bool Ready() { return b.ready; }
 std::string ConnectAddress() { return b.address; }
+bool SetDisplayName(const std::string& name) {
+    const auto clean=CleanDisplayName(name); if(clean.empty()) return false;
+    b.name=clean;
+    if(b.entered && b.hosting) { b.members[b.me].name=clean; b.Changed(); }
+    else if(b.entered) { Writer w(MemberUpdate); w.Str("display_name"); w.Str(clean); if(!b.Packet(b.server,w)) return false; }
+    return true;
+}
+std::string ShareAddress() {
+    if(b.hosting) { const auto ip=b.addresses.Public(); return ip.empty()?std::string():ip+":"+std::to_string(b.port); }
+    if(b.entered && b.server) { char ip[64]{}; if(!enet_address_get_host_ip(&b.server->address,ip,sizeof ip)) return std::string(ip)+":"+std::to_string(b.server->address.port); }
+    return {};
+}
+std::string LanAddress() { const auto ip=b.addresses.Local(); return b.hosting && !ip.empty()?ip+":"+std::to_string(b.port):std::string(); }
 bool SetConnectAddress(const std::string& address) {
     if(address.empty() || address.size()>253 || address.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:")!=std::string::npos) return false;
     auto colon=address.find(':');
@@ -209,7 +231,7 @@ void CreateLobby(LobbyType, int max) {
     ENetAddress address{ENET_HOST_ANY,b.port}; b.host=enet_host_create(&address,16,kChanCount+1,0,0);
     if(!b.host) { HSM_LOG("direct: cannot bind UDP port %u",b.port); b.EventOf(Event::LobbyCreated,false); return; }
     Limits(); b.hosting=b.entered=true; b.members[1]={b.name,{}};
-    b.EventOf(Event::LobbyCreated); if(b.upnp) b.mapping.Start(b.port);
+    b.EventOf(Event::LobbyCreated); if(b.upnp) b.mapping.Start(b.port); b.addresses.Start(b.publicLookup);
     HSM_LOG("direct: hosting UDP port %u (forward this UDP port manually if UPnP is unavailable)",b.port);
 }
 void JoinLobby(UserId) {

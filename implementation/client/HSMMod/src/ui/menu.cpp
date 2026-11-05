@@ -11,6 +11,8 @@
 #include "ue4ss_load.h"
 #include "net/report_client.h"
 #include "net/update_check.h"
+#include "net/address_service.h"
+#include "ui/loadout_editor.h"
 #include "match/hsm_hud_style.h"
 #include "match/hsm_lobby_scene.h"
 #include "match/hsm_menu_pick.h"
@@ -112,6 +114,10 @@ struct State {
     Box reportBox;
     EditBox reportText;
     EditBox connectText;
+    EditBox nameEdit;
+    Box addressRow;
+    Text ipLabel, featureNote;
+    Flat saveName, copyIp, copyLan, pasteAddress, editLoadout;
     Text reportNote;
     uint32_t reportSeen = 0;   // Session::ReportStatusSeq last shown in reportNote
     bool reportOpenNow = false;
@@ -152,6 +158,7 @@ struct State {
     Text startLabel;
     LobbyScene scene;                        // the last drawn: what the clicks act on
 } g;
+bool requestOpen=false;
 
 bool StillAlive(UObject* o, int32_t index, UClass* cls) { return o && ObjectAt(index) == o && ClassOf(o) == cls; }
 
@@ -372,6 +379,8 @@ void BuildIdleLeft() {
     g.connectText.Hint("Host IPv4 or hostname:27015");
     g.connectText.Set(direct::ConnectAddress());
     AddToVerticalBox(col, g.connectText, 10);
+    g.pasteAddress=MakeFlat("PASTE ADDRESS",15);
+    AddToVerticalBox(col,g.pasteAddress.card.button,6);
     g.idleHint = NewText("Host a lobby or join one to choose the mode and the map.", 15, style::kMenuDim);
     if (g.idleHint) { g.idleHint.Wrap(true); AddToVerticalBox(col, g.idleHint, 18); }
 }
@@ -476,6 +485,8 @@ void BuildInLeft() {
         AddFlatH(actions2, g.balance, 8); AddFlatH(actions2, g.leave, 0);
     }
     BuildPasswordRow(col);
+    g.editLoadout=MakeFlat("EDIT LOADOUT",15);
+    AddToVerticalBox(col,g.editLoadout.card.button,8);
     BuildChat(col);
 }
 
@@ -793,6 +804,17 @@ bool BuildPanel() {
     AddToVerticalBox(page, rule, 12);
     g.status = NewText("", 15, style::kMenuDim);
     if (g.status) AddToVerticalBox(page, g.status, 8);
+    Box profile=g.kit.MakeRow();
+    g.nameEdit=g.kit.MakeEditBox(); g.nameEdit.Hint("Display name"); g.nameEdit.Set(direct::PersonaName(direct::MyUserId()));
+    g.saveName=MakeFlat("SAVE NAME",15);
+    AddToHorizontalBox(profile,NewText("DISPLAY NAME",15,style::kMenuDim),0,12);
+    AddToHorizontalBox(profile,g.nameEdit,1,12); AddFlatH(profile,g.saveName,0);
+    AddToVerticalBox(page,profile,8);
+    g.addressRow=g.kit.MakeRow(); g.ipLabel=NewText("",15,style::kMenuText);
+    g.copyIp=MakeFlat("COPY PUBLIC IP",15); g.copyLan=MakeFlat("COPY LAN IP",15);
+    AddToHorizontalBox(g.addressRow,g.ipLabel,1,12); AddFlatH(g.addressRow,g.copyIp,8); AddFlatH(g.addressRow,g.copyLan,0);
+    AddToVerticalBox(page,g.addressRow,8);
+    g.featureNote=NewText("",15,style::kMenuOk); AddToVerticalBox(page,g.featureNote,4);
     g.notice = NewText("", 20, style::kMenuAccentInk);   // Session::TakeNotice: kicked, banned, refused; until the page closes
     if (g.notice) { g.notice.Wrap(true); g.notice.Show(false); AddToVerticalBox(page, g.notice, 8); }
     g.updateNote = NewText("", 15, style::kMenuOk);   // net/update_check.h: only when a newer release exists
@@ -1424,6 +1446,25 @@ void HandleClicks(Session& session) {
     if (act(Clicked(g.helpToggle.card), g.settingsShown)) session.SetHelpImprove(!help);
     if (g.settingsShown) g.voice.Tick(session);
     HandleChat(session, s.in && !g.settingsShown);
+    if(g.nameEdit.Focused()) SetLobbyTyping(true);
+    if(Clicked(g.saveName.card)) {
+        const bool ok=lobby.SetDisplayName(g.nameEdit.Value());
+        g.featureNote.Set(ok?"Display name saved":"Enter a non-empty display name");
+    }
+    const auto share=direct::ShareAddress(), lan=direct::LanAddress();
+    g.addressRow.Show(s.in);
+    g.ipLabel.Set(!share.empty()?"HOST IP: "+share:"Public IP not available yet"+ (lan.empty()?std::string():" | LAN: "+lan));
+    Live(g.copyIp.card,!share.empty()); Live(g.copyLan.card,!lan.empty());
+    Paint(g.copyIp.card); Paint(g.copyLan.card); Paint(g.saveName.card); Paint(g.pasteAddress.card);
+    if(Clicked(g.copyIp.card) && !share.empty()) g.featureNote.Set(net::CopyText(share)?"Host address copied":"Could not open the clipboard; try again");
+    if(Clicked(g.copyLan.card) && !lan.empty()) g.featureNote.Set(net::CopyText(lan)?"LAN address copied":"Could not open the clipboard; try again");
+    if(s.idle && Clicked(g.pasteAddress.card)) g.connectText.Set(net::ClipboardText());
+    Paint(g.editLoadout.card);
+    if(s.in && Clicked(g.editLoadout.card)) {
+        const auto error=session.OpenLoadoutEditor();
+        if(error.empty()) { ClosePage(); return; }
+        g.featureNote.Set(error);
+    }
     if (s.idle && g.connectText.Focused()) SetLobbyTyping(true);
     HandlePassword(session, s.hostPassword && !g.settingsShown);
     HandleDamage(lobby, s, acted);               // after the two boxes: its own text box keeps the hotkeys off too
@@ -1513,8 +1554,10 @@ void HandleClicks(Session& session) {
 }
 }  // namespace
 
+void RequestOpen() { requestOpen=true; }
 void Tick(Session& session, UObject* worldContext) {
     if (!session.steamMode()) return;
+    if(loadout::IsOpen()) return;
     game::modmaps::Tick();                       // the modded-map scan (worker results, asset registry); cheap when idle
     if (worldContext != g.worldContext) { Reset(); g.worldContext = worldContext; }
     ULONGLONG now = GetTickCount64();
@@ -1537,6 +1580,7 @@ void Tick(Session& session, UObject* worldContext) {
         }
     }
     if (!g.built) Build();
+    if(requestOpen && session.lobby().InLobby() && g.panel) { g.panelOpen=true; g.panel.Show(true); g.nextText=0; requestOpen=false; }
     if (!g.openButton) return;
     // Turned away by a host: the page opens on its own with the reason in large type, so it is not missed.
     if (std::string why = session.TakeNotice(); !why.empty() && g.notice) {

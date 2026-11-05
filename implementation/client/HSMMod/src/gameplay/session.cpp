@@ -38,6 +38,8 @@
 #include "gameplay/save_guard.h"
 #include "gameplay/shared_dice.h"
 #include "gameplay/severs.h"
+#include "ui/loadout_editor.h"
+#include "ui/umg.h"
 #include "gameplay/standin_gore.h"
 #include "gameplay/spectate.h"
 #include "gameplay/lobby.h"
@@ -321,9 +323,23 @@ public:
     // role=server: the server opens a public Steam lobby itself; players find it in the lobby browser and Steam relays the
     // traffic (no port forwarding). Needs Steam running and signed in on that machine.
     bool SteamServer() const { return cfg_.role == Role::Server; }
+    void ReturnToLobby() override {
+        if(!net_ || !lobby_.InLobby() || !IsHost() || !lastGameMode_) return;
+        lobby_.SetProgression(false);
+        adapter_.SetGamePaused(false);
+        ui::RequestOpen();
+        HostTravel(kMenuLevel);
+        HSM_LOG("session: host returned everyone to the lobby; membership retained");
+    }
+    std::string OpenLoadoutEditor() override {
+        if(!lobby_.InLobby() || InFightLevel()) return "Return to the lobby before editing equipment";
+        lobby_.SetReady(false);
+        return ui::loadout::Open(adapter_,lastGameMode_);
+    }
     void StartOnMap(const std::string& path) override {
         if (!lastGameMode_ || (net_ && !IsHost())) return;
         if (net_ && !BuildsAllowStart()) return;
+        if(ui::loadout::IsOpen()) { ui::loadout::Close(adapter_); ChangeLoadout(); }
         if (!IsServer() && lobby_.IsHost() && !lobby_.Progression()) {   // Duel is for exactly 2 players, Last Man Standing needs 2 or more
             const ModeAvail av = ModeAvailable(lobby_.config().format, lobby_.PlayerCount());
             if (!av.ok) { HSM_LOG("session: not starting: %s", av.hint); ui::ShowLine("HSMMod", style::kBone, av.hint); return; }
@@ -548,6 +564,10 @@ public:
         }
         if (!selfTestOk_) return;
         if (steamMode()) { lobby_.Tick(); game::modpack::Tick(lobby_); }
+        if(IsHost() && net_) {
+            for(const auto& m:lobby_.members()) roster_.Rename(m.host?kHostKey:m.id,m.name);
+            for(auto& [peer,p]:peers_) { (void)peer; const auto name=direct::PersonaName(p.key); if(!name.empty()) p.name=name; }
+        }
         if (steamMode()) LobbyPlayersTick();
         if (steamMode()) MigrationTick();
         if (SteamServer()) ServerLobbyTick();
@@ -568,6 +588,7 @@ public:
             menuInputRepeat_ = first && done;
             if (done) HSM_LOG("session: menu level: cursor and UI input given back");
         }
+        if(ui::loadout::Tick(adapter_)) { ChangeLoadout(); ui::RequestOpen(); }
         if (!inFight_) ui::Tick(*this, gameMode);   // the main menu exists only in menu levels (its scan walks every object)
         else if (FighterLevel()) ui::LeaveMenus();
         if (net_ && FighterLevel()) { TickOwnBuild(); TickStockFlags(); }
@@ -1795,6 +1816,10 @@ public:
     }
 
     std::string NameOfSlot(uint8_t slot) const {
+        if(const RosterMember* m=roster_.BySlot(slot)) {
+            const auto name=direct::PersonaName(slot==0?direct::MyUserId():m->key);
+            if(!name.empty()) return name;
+        }
         uint8_t e = Roster::EntityForSlot(slot);
         for (const FighterEntry& f : info_.fighters) if (f.entity == e && !f.name.empty()) return f.name;
         if (const RosterMember* m = roster_.BySlot(slot)) return m->name;
@@ -1907,6 +1932,38 @@ private:
         }
         if (c.verb == "quit") { quitRequested_ = true; return ok(); }
         if (c.verb == "widgets") return WidgetsJson();
+        if(c.verb=="uiclasses") {
+            std::string j="{\"ok\":true,\"classes\":["; bool first=true;
+            for(int32_t i=0;i<ObjectCount();++i) {
+                UObject* o=ObjectAt(i); if(!o || !ClassOf(o)) continue;
+                if(ObjectName(reinterpret_cast<UObject*>(ClassOf(o)))!="WidgetBlueprintGeneratedClass") continue;
+                j+=(first?"":",")+JsonString(FullName(o)); first=false;
+            }
+            return j+"]}";
+        }
+        if(c.verb=="lobbyhost") { lobby_.Host(direct::LobbyType::Private); return ok(); }
+        if(c.verb=="lobbyeditor" && c.args.empty()) {
+            const auto error=OpenLoadoutEditor(); return error.empty()?ok():err(error);
+        }
+        if(c.verb=="lobbyeditor" && c.args.size()==1 && c.args[0]=="close") {
+            ui::loadout::Close(adapter_); ChangeLoadout(); ui::RequestOpen(); return ok();
+        }
+        if(c.verb=="editorstate") {
+            bool preview=false,camera=false;
+            for(auto* w:FindInstances("UI_Tavern_Inventory_C")) if(ui::InViewport(w)) {
+                if(auto** p=Field<UObject*>(w,"MyDressUpDarling")) preview=*p && !IsGarbage(*p);
+                if(auto** p=Field<UObject*>(w,"My Controller")) camera=*p && !IsGarbage(*p);
+            }
+            return std::string("{\"ok\":true,\"open\":")+(ui::loadout::IsOpen()?"true":"false")+",\"preview\":"+(preview?"true":"false")+",\"camera\":"+(camera?"true":"false")+",\"lobby\":"+(lobby_.InLobby()?"true":"false")+"}";
+        }
+        if(c.verb=="uiinfo" && c.args.size()==1) {
+            UClass* cls=FindClass(c.args[0]); if(!cls) return err("class not loaded");
+            std::string j="{\"ok\":true,\"class\":"+JsonString(FullName(reinterpret_cast<UObject*>(cls)))+",\"functions\":["; bool first=true;
+            for(auto* fn:FunctionsWithPrefix(cls,"")) { j+=(first?"":",")+JsonString(ObjectName(reinterpret_cast<UObject*>(fn))); first=false; }
+            j+="],\"properties\":["; first=true;
+            for(auto* p:StructProperties(cls)) { j+=(first?"":",")+JsonString(PropertyName(p)+":"+PropertyType(p)); first=false; }
+            return j+"]}";
+        }
         if (c.verb == "pause" && c.args.size() == 1) { adapter_.SetGamePaused(c.args[0] == "on"); return ok(); }
         if (c.verb == "prof") return ue::prof::Command(c.args);
         if (c.verb == "vmhook") return agent::VmHookCommand(c.args, [this] { return InFightLevel() ? adapter_.PlayerWillie(0) : nullptr; });
@@ -2034,6 +2091,7 @@ private:
     }
 
     void ResetNetwork(const char* why) {
+        ui::loadout::Close(adapter_);
         if (!migration_.Active()) { migrateBoard_ = ScoreCarry{}; migrateObjects_.clear(); }
         if (net_) { HSM_LOG("session: network reset (%s)", why); net_->Stop(); }
         directNet_ = nullptr; net_.reset();
@@ -2142,6 +2200,7 @@ private:
             if (hostPeer_) { Ready r; r.travelSeq = travelSeq_; r.level = pendingLevel_; net_->Send(hostPeer_, kChanReliable, Encode(r), true); }
             return;
         }
+        if(ui::loadout::IsOpen()) { ui::loadout::Close(adapter_); ChangeLoadout(); }
         RememberFoes();
         size_t applied = game::ApplyGameSettings(tr.settings);
         fightSettings_ = tr.settings;
@@ -2187,6 +2246,7 @@ private:
     }
 
     void OnLevelLoaded() {
+        ui::loadout::Close(adapter_,false);
         abyss_.Clear(adapter_);   // its tiles went with the old level
         currentLevel_ = ObjectName(OuterOf(OuterOf(lastGameMode_)));   // GameMode -> PersistentLevel -> World
         progressionHub_ = InFightLevel() && currentLevel_.find("Hub") != std::string::npos && !adapter_.FreeModeActive();
@@ -6754,6 +6814,15 @@ private:
         return v;
     }
     std::string ChangeLoadout() override {
+        if(lobby_.InLobby() && !InFightLevel()) {
+            const bool freeMode=adapter_.FreeModeActive();
+            SetBool(adapter_.GameInstance(),"Free Mode Activated",true);
+            if(IsHost()) ShareHostLoadout();
+            else if(welcomed_) UploadLoadout();
+            SetBool(adapter_.GameInstance(),"Free Mode Activated",freeMode);
+            lobby_.SetReady(false);
+            return "Lobby loadout updated; mark ready when finished";
+        }
         std::string line = IsHost() ? HostChangeLoadout() : ClientChangeLoadout();
         loadoutNote_ = line; loadoutNoteUntil_ = NowMs() + 8000;
         return line;

@@ -10,5 +10,6 @@ namespace ui {
 void Tick(Session& session, ue::UObject* worldContext);
 void LeaveMenus();   // fight levels: close the multiplayer page, take a leftover main menu off the screen
 bool PanelOpen();    // the multiplayer page is on screen (its main menu is alive and in the viewport)
+void RequestOpen();  // restore the lobby page after the equipment editor or host travel
 }
 }  // namespace hsm

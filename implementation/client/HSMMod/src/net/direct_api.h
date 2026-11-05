@@ -41,6 +41,9 @@ bool Ready();
 std::string ConnectAddress();
 bool SetConnectAddress(const std::string& address);
 std::string ConnectionInfo();
+std::string ShareAddress();
+std::string LanAddress();
+bool SetDisplayName(const std::string& name);
 std::string RemoteAddress(UserId user);
 void DisconnectUser(UserId user); // host moderation: remove a connection and lobby member
 void Tick();                      // polls call results; pumps callbacks if the game does not

@@ -38,6 +38,10 @@ static void TestIdempotentAndReuse() {
     CHECK(*r.Add(3, "b") == 2);
     CHECK(*r.Add(2, "a-again") == 1);                      // same key keeps its slot
     CHECK(r.size() == 3);
+    CHECK(r.Rename(2, "renamed"));
+    CHECK(r.Find(2)->name == "renamed" && r.Find(2)->slot == 1 && r.Find(2)->entity == 2);
+    CHECK(r.Find(1)->name == "host" && !r.Rename(99, "missing"));
+    CHECK(!r.Rename(2, "renamed"));
     CHECK(r.Remove(2) && !r.Remove(2));
     CHECK(*r.Add(4, "c") == 1);                            // lowest free slot reused
     CHECK(r.ByEntity(2) && r.ByEntity(2)->key == 4);

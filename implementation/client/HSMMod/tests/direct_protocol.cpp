@@ -29,6 +29,13 @@ int main() {
     incoming(fakeUpdate,0); CHECK(b.members[2].data.empty()); CHECK(b.data.empty());
     Writer update(MemberUpdate); update.Str("ready"); update.Str("1"); incoming(update,0);
     CHECK(b.members[2].data.at("ready")=="1"); CHECK(b.members[1].data.empty());
+    CHECK(hsm::CleanDisplayName(" \t New\nName  ")=="NewName");
+    CHECK(hsm::CleanDisplayName(" \r\n ").empty());
+    CHECK(hsm::CleanDisplayName(std::string(31,'a')+"\xc3\xa9")==std::string(31,'a'));
+    Writer rename(MemberUpdate); rename.Str("display_name"); rename.Str("  Renamed\nClient  "); incoming(rename,0);
+    CHECK(b.members[2].name=="RenamedClient"); CHECK(b.members[1].name=="Host");
+    Writer emptyName(MemberUpdate); emptyName.Str("display_name"); emptyName.Str("\n "); incoming(emptyName,0);
+    CHECK(b.members[2].name=="RenamedClient");
     Writer game(Game); game.U64(1); game.U8(42); incoming(game,1);
     CHECK(b.messages.size()==1); CHECK(b.messages.front().from==2); CHECK(b.messages.front().data==std::vector<uint8_t>{42}); b.messages.clear();
     Writer wrongTarget(Game); wrongTarget.U64(3); wrongTarget.U8(42); incoming(wrongTarget,1); CHECK(b.messages.empty());

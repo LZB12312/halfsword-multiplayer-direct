@@ -1,5 +1,6 @@
 #include "gameplay/lobby.h"
 #include "config.h"
+#include "session/hsm_display_name.h"
 #include "gameplay/mod_pack.h"
 #include "hsm_protocol.h"
 #include "log.h"
@@ -305,6 +306,12 @@ void Lobby::SetOverride(direct::UserId member, int team) {
 void Lobby::ClearOverrides() { for (const LobbyMember& m : members_) SetOverride(m.id, -1); }
 
 void Lobby::SetReady(bool ready) { if (InLobby()) direct::SetMemberData(lobby_, "ready", ready ? "1" : "0"); }
+bool Lobby::SetDisplayName(const std::string& name) {
+    const auto clean=CleanDisplayName(name);
+    if(clean.empty() || !direct::SetDisplayName(clean)) { SetStatus("Enter a display name (up to 32 UTF-8 bytes)"); return false; }
+    SaveIniValues({{"name",clean}});
+    SetStatus("Display name updated"); return true;
+}
 
 void Lobby::SetPublicState(const std::string& state, const std::string& map, const std::string& mode) {
     if (!IsHost()) return;

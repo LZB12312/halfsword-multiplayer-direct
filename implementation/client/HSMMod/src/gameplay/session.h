@@ -14,6 +14,8 @@ public:
     virtual bool steamMode() const = 0;
     virtual void StartOnMap(const std::string& path) = 0;   // host: open a fight level; the lobby follows
     virtual void StartProgression() = 0;                    // host: the stock Progression hub, Free Mode off
+    virtual void ReturnToLobby() = 0;                       // host: end the current round and bring everyone to the lobby
+    virtual std::string OpenLoadoutEditor() = 0;            // direct stock equipment editor, without leaving the lobby
     virtual std::string SubmitReport(const std::string& text) = 0;   // a bug report (same checks as /bug); the line to show
     virtual std::string ReportStatus() const = 0;                    // the last report's outcome line, as told to the player
     virtual uint32_t ReportStatusSeq() const = 0;                    // changes with every new outcome (0: none yet)

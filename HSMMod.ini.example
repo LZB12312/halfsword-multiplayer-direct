@@ -8,3 +8,5 @@ upnp=1
 connect=127.0.0.1:27015
 reports=off
 update_check=1
+; HTTPS public IPv4 lookup for the host address label (LAN still works when off).
+public_ip_lookup=1

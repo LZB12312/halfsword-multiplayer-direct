@@ -2,6 +2,8 @@
 #include "gameplay/session.h"
 #include "match/hsm_hud_style.h"
 #include "log.h"
+#include "net/direct_api.h"
+#include "net/address_service.h"
 #include <windows.h>
 #include <algorithm>
 
@@ -315,6 +317,11 @@ bool EscPanel::Build(Kit& kit, Canvas root) {
         if (t) { AddV(pages_[2], t, 6); t.Show(false); }
     }
 
+    shareAddress_=m_.NewText("",17,style::kBone);
+    copyAddress_=m_.MakeFlat("COPY HOST ADDRESS",16);
+    AddV(pages_[2],shareAddress_,10); AddV(pages_[2],copyAddress_.card.button,8);
+    returnLobby_=m_.MakeFlat("RETURN TO LOBBY / CHANGE MAP",17);
+    AddV(page,returnLobby_.card.button,10);
     loadoutNote_ = m_.NewText("", 16, style::kIron);
     if (loadoutNote_) { loadoutNote_.Wrap(true); AddV(page, loadoutNote_, 12); loadoutNote_.Show(false); }
     AddV(page, footer, 16);
@@ -458,6 +465,12 @@ EscPanel::Action EscPanel::Tick(Session& session, bool reportOn) {
         help_.card.selected = help;
         if (reportOn && Clicked(help_.card)) { session.SetHelpImprove(!help); nextData_ = 0; }
     }
+    const auto address=direct::ShareAddress();
+    shareAddress_.Set(address.empty()?"Host address is not available yet":"HOST IP: "+address);
+    Live(copyAddress_,!address.empty()); Paint(copyAddress_.card);
+    if(Clicked(copyAddress_.card) && !address.empty()) net::CopyText(address);
+    returnLobby_.card.button.Show(session.lobby().IsHost()); Paint(returnLobby_.card);
+    if(session.lobby().IsHost() && Clicked(returnLobby_.card)) { session.ReturnToLobby(); return Action::Resume; }
     const bool resume = Clicked(resume_.card), game = Clicked(gameMenu_.card), report = Clicked(report_.card), leave = Clicked(leave_.card);
     if (leaveArmedAt_ && now - leaveArmedAt_ >= kConfirmMs) leaveArmedAt_ = 0;
     if (leave_.card) {

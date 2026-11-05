@@ -64,11 +64,13 @@ int main(int argc,char** argv) {
                 if(mode=="reject") { CHECK(!e.ok); d::LeaveLobby(1); puts("PASS full-host rejection"); return 0; }
                 CHECK(e.ok); joined=true; CHECK(d::MyUserId()>1); CHECK(d::LobbyData(1,"test")=="snapshot-value");
                 d::SetMemberData(1,"ready","1");
+                CHECK(d::SetDisplayName("Renamed-"+std::to_string(d::MyUserId())));
                 CHECK(d::SendLobbyChat(1,"hello from client"));
             }
             if(e.kind==d::Event::LobbyChat) { CHECK(e.user>1); CHECK(e.text=="hello from client"); chat=true; }
         }
         if(!joined) { Sleep(2); continue; }
+        if(!host) ready=d::PersonaName(d::MyUserId())=="Renamed-"+std::to_string(d::MyUserId());
         if(host) for(auto id:d::LobbyMembers(1)) if(id!=1 && !seen.count(id)) {
             CHECK(!d::RemoteAddress(id).empty()); seen.insert(id);
         }
@@ -86,8 +88,8 @@ int main(int argc,char** argv) {
             if(host) { CHECK(d::Send(m.from,m.channel,m.data.data(),uint32_t(m.data.size()),m.channel==0?d::kReliable:0)); if(m.channel==0) complete.insert(m.from); }
             if(m.channel==0) large=true; else unreliable=true;
         }
-        if(!host) ready=d::MemberData(1,d::MyUserId(),"ready")=="1";
-        else ready=std::all_of(seen.begin(),seen.end(),[](auto id){ return d::MemberData(1,id,"ready")=="1"; });
+        if(!host) ready=ready && d::MemberData(1,d::MyUserId(),"ready")=="1";
+        else ready=std::all_of(seen.begin(),seen.end(),[](auto id){ return d::MemberData(1,id,"ready")=="1" && d::PersonaName(id)=="Renamed-"+std::to_string(id); });
         if(chat && large && unreliable && ready && (!host || complete.size()==2)) {
             if(!finished) finished=now;
         }

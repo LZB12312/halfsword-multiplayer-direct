@@ -42,6 +42,10 @@ public:
             if (members_[i].key == key) { members_.erase(members_.begin() + long(i)); return true; }
         return false;
     }
+    bool Rename(uint64_t key, const std::string& name) {
+        for(auto& m:members_) if(m.key==key && m.name!=name) { m.name=name; return true; }
+        return false;
+    }
 
     const RosterMember* Find(uint64_t key) const {
         for (const RosterMember& m : members_) if (m.key == key) return &m;

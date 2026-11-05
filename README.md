@@ -9,7 +9,7 @@ The game's own distribution, launcher and supported executable requirements are 
 
 Based on Dudiebug/halfsword-multiplayer-mod commit
 `cb8c6646f361f1e1ccb81980108874bdf6fead27` (0.8.0-pre27).
-Fork version: **0.1.0**. Everyone must use this same fork and build.
+Fork version: **0.2.0**. Everyone must use this same fork and build.
 The upstream Steam mod cannot connect to it.
 
 ## Install
@@ -29,7 +29,9 @@ UE4SS coexistence follows the original proxy arrangement: HSMMod's DLL loads
 
 ## Host
 
-Set your player name and host settings in `HSMMod.ini`, then restart the game:
+Change your display name with **SAVE NAME** in the multiplayer menu. It is saved
+for future sessions and updates other players' lobby and scoreboard displays.
+Host settings remain in `HSMMod.ini`:
 
 ```ini
 [net]
@@ -39,6 +41,7 @@ port=27015
 upnp=1
 reports=off
 update_check=1
+public_ip_lookup=1
 ```
 
 Click **HOST DIRECT**. Allow the game through Windows Firewall for UDP on the
@@ -65,6 +68,24 @@ For manual forwarding, set `upnp=0` and create a router rule:
 Reserve that LAN address in your router's DHCP settings. Only the host needs
 forwarding. Share the host's public IPv4 and port with Internet players.
 For LAN players, share its LAN IPv4 and port instead.
+
+The lobby shows **HOST IP** with **COPY IP** and **COPY LAN** buttons. The join
+address field has a **PASTE ADDRESS** button and supports ordinary text pasting.
+Public IPv4 discovery uses HTTPS to api.ipify.org on a background thread when
+hosting. Set `public_ip_lookup=0` to disable that request; LAN copying still works.
+The displayed public IP does not verify port forwarding or bypass CGNAT.
+
+## Lobby equipment and map changes
+
+Click **EDIT LOADOUT** in a connected lobby to open the game's full chest
+equipment editor directly. No Free Mode navigation or map travel is required.
+**BACK TO LOBBY** closes the preview and sends the updated loadout while keeping
+everyone connected. Editing clears your ready state; mark ready again afterwards.
+The normal session save guard keeps these edits separate from career saves.
+
+During a round, the host can press Escape and select **RETURN TO LOBBY / CHANGE MAP**.
+All players return together with lobby membership retained. Choose another map
+in the lobby and start the next match. Clients cannot force a host map change.
 
 ## Join
 
