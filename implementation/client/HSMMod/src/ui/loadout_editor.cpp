@@ -13,10 +13,36 @@ struct Ref {
 };
 struct State {
     Ref editor,preview,camera,light,controller,pawn,view;
+    struct HiddenMenu { Ref widget; uint8_t visibility; };
+    std::vector<HiddenMenu> hiddenMenus;
     Kit kit; mp::Flat back;
+    FRotator controlRotation{};
+    bool haveControlRotation=false;
     bool active=false,freeMode=true;
 } s;
 UObject* Statics(const char* cls) { const auto* c=FindClass(cls); return c?DefaultObject(c):nullptr; }
+void HideMenus() {
+    // The equipment widget's centre is transparent: the main menu must not
+    // remain underneath it. Keep it in the viewport so the lobby survives.
+    for(const char* cls:{"UI_Startup_Menu_C","UI_MainMenuSNF_C"})
+        for(auto* w:FindInstances(cls)) if(InViewport(w)) {
+            bool known=false;
+            for(const auto& item:s.hiddenMenus) if(item.widget.Live() && item.widget.p==w) { known=true; break; }
+            if(!known) {
+                Call get(w,"GetVisibility");
+                if(!get.invoke()) continue;
+                State::HiddenMenu item{}; item.widget.Set(w); item.visibility=get.get<uint8_t>("ReturnValue");
+                s.hiddenMenus.push_back(item);
+            }
+            Call(w,"SetVisibility").set<uint8_t>("InVisibility",uint8_t(Vis::Hidden)).invoke();
+        }
+}
+void ShowPreview() {
+    if(!s.controller.Live() || !s.camera.Live()) return;
+    Call current(s.controller.p,"GetViewTarget");
+    if(current.invoke() && current.get<UObject*>("ReturnValue")==s.camera.p) return;
+    Call(s.controller.p,"SetViewTargetWithBlend").set<UObject*>("NewViewTarget",s.camera.p).set<float>("BlendTime",0).invoke();
+}
 bool TagInventory(UObject* actor) {
     auto* prop=FindProperty(ClassOf(actor),"Tags"); void* dest=FieldPtr(actor,"Tags");
     if(!prop || !dest) return false;
@@ -30,10 +56,13 @@ void Close(game::Adapter& a,bool restoreView) {
     if(!s.active) return;
     if(s.camera.Live()) Call(s.camera.p,"Destroy Spawned Item").invoke();
     if(s.editor.Live()) Call(s.editor.p,"RemoveFromParent").invoke();
+    if(restoreView) for(const auto& item:s.hiddenMenus) if(item.widget.Live())
+        Call(item.widget.p,"SetVisibility").set<uint8_t>("InVisibility",item.visibility).invoke();
     if(restoreView && s.controller.Live()) {
         if(s.pawn.Live()) Call(s.controller.p,"Possess").set<UObject*>("InPawn",s.pawn.p).invoke();
         else Call(s.controller.p,"UnPossess").invoke();
         if(s.view.Live()) Call(s.controller.p,"SetViewTargetWithBlend").set<UObject*>("NewViewTarget",s.view.p).set<float>("BlendTime",0).invoke();
+        if(s.haveControlRotation) Call(s.controller.p,"SetControlRotation").set<FRotator>("NewRotation",s.controlRotation).invoke();
     }
     for(auto* r:{&s.preview,&s.camera,&s.light}) if(r->Live()) a.DestroyActor(r->p);
     if(restoreView) SetBool(a.GameInstance(),"Free Mode Activated",s.freeMode);
@@ -60,6 +89,9 @@ std::string Open(game::Adapter& a,UObject* context) {
     if(s.controller.Live()) {
         Call pawn(s.controller.p,"K2_GetPawn"); s.pawn.Set(pawn.invoke()?pawn.get<UObject*>("ReturnValue"):nullptr);
         Call view(s.controller.p,"GetViewTarget"); s.view.Set(view.invoke()?view.get<UObject*>("ReturnValue"):nullptr);
+        Call rotation(s.controller.p,"GetControlRotation");
+        s.haveControlRotation=rotation.invoke();
+        if(s.haveControlRotation) s.controlRotation=rotation.get<FRotator>("ReturnValue");
     }
     s.preview.Set(a.SpawnActorAt(dress,{5000,5000,1000},{}));
     s.camera.Set(a.SpawnActorAt(camera,{5250,5000,1080},{0,180,0}));
@@ -82,6 +114,9 @@ std::string Open(game::Adapter& a,UObject* context) {
     if(!s.editor.Live() || !Call(s.editor.p,"AddToViewport").set<int32_t>("ZOrder",200).invoke()) {
         Close(a); return "Could not open the equipment editor";
     }
+    Call(s.controller.p,"SetControlRotation").set<FRotator>("NewRotation",{0,180,0}).invoke();
+    HideMenus();
+    ShowPreview();
     s.kit=Kit(s.editor.p,Vis::Visible);
     if(auto* text=FindTextBlock(s.editor.p,12)) s.kit.FontFrom(text,"equipment editor");
     mp::Maker maker(&s.kit); s.back=maker.MakeFlat("BACK TO LOBBY",18);
@@ -94,6 +129,8 @@ std::string Open(game::Adapter& a,UObject* context) {
 bool Tick(game::Adapter& a) {
     if(!s.active) return false;
     if(!s.editor.Live() || !InViewport(s.editor.p) || mp::Clicked(s.back.card)) { Close(a); return true; }
+    HideMenus();
+    ShowPreview();
     mp::Paint(s.back.card); return false;
 }
 }

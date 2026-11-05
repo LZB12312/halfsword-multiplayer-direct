@@ -9,7 +9,7 @@ The game's own distribution, launcher and supported executable requirements are 
 
 Based on Dudiebug/halfsword-multiplayer-mod commit
 `cb8c6646f361f1e1ccb81980108874bdf6fead27` (0.8.0-pre27).
-Fork version: **0.2.1**. Everyone must use this same fork and build.
+Fork version: **0.2.2**. Everyone must use this same fork and build.
 The upstream Steam mod cannot connect to it.
 
 ## Install
@@ -78,7 +78,8 @@ The displayed public IP does not verify port forwarding or bypass CGNAT.
 ## Lobby equipment and map changes
 
 Click **EDIT LOADOUT** in a connected lobby to open the game's full chest
-equipment editor directly. No Free Mode navigation or map travel is required.
+equipment editor directly. No Free Mode navigation or map travel is required. The main menu is hidden
+while editing and the preview camera is explicitly selected.
 **BACK TO LOBBY** closes the preview and sends the updated loadout while keeping
 everyone connected. Editing clears your ready state; mark ready again afterwards.
 The normal session save guard keeps these edits separate from career saves.
