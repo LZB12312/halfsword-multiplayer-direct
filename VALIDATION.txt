@@ -1,4 +1,4 @@
-Validation of Half Sword Direct IP 0.2.0
+Validation of Half Sword Direct IP 0.2.1
 
 Windows x64, LLVM-MinGW UCRT 20261104, C++20, Release (-O2).
 C++ builds use -Wall -Wextra -Werror.

@@ -1,4 +1,4 @@
-# Half Sword Multiplayer — Direct IP fork
+# Half Sword Multiplayer â€” Direct IP fork
 
 This fork replaces the mod's Steamworks networking and lobby backend with ENet
 over UDP. It provides a host-owned lobby, player names from `HSMMod.ini`, chat,
@@ -9,7 +9,7 @@ The game's own distribution, launcher and supported executable requirements are 
 
 Based on Dudiebug/halfsword-multiplayer-mod commit
 `cb8c6646f361f1e1ccb81980108874bdf6fead27` (0.8.0-pre27).
-Fork version: **0.2.0**. Everyone must use this same fork and build.
+Fork version: **0.2.1**. Everyone must use this same fork and build.
 The upstream Steam mod cannot connect to it.
 
 ## Install
@@ -48,7 +48,7 @@ Click **HOST DIRECT**. Allow the game through Windows Firewall for UDP on the
 chosen port. The mod does not change your Windows Firewall rules.
 
 With `upnp=1`, the host discovers a UPnP IGD router on a background thread and
-requests external **UDP 27015 → this PC's UDP 27015** (or your chosen port).
+requests external **UDP 27015 â†’ this PC's UDP 27015** (or your chosen port).
 Check `HSMMod.log` for `upnp:` lines: they report success/failure, internal
 address and the gateway's external IPv4. Discovery does not prove Internet
 reachability. Existing router mappings are preserved. Leases are renewed every

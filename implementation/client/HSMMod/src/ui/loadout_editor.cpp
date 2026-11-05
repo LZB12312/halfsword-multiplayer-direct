@@ -28,6 +28,7 @@ bool TagInventory(UObject* actor) {
 bool IsOpen() { return s.active; }
 void Close(game::Adapter& a,bool restoreView) {
     if(!s.active) return;
+    if(s.camera.Live()) Call(s.camera.p,"Destroy Spawned Item").invoke();
     if(s.editor.Live()) Call(s.editor.p,"RemoveFromParent").invoke();
     if(restoreView && s.controller.Live()) {
         if(s.pawn.Live()) Call(s.controller.p,"Possess").set<UObject*>("InPawn",s.pawn.p).invoke();
@@ -65,7 +66,11 @@ std::string Open(game::Adapter& a,UObject* context) {
     if(!s.controller.Live() || !s.preview.Live() || !s.camera.Live() || !TagInventory(s.preview.p) || !TagInventory(s.camera.p)) {
         Close(a); return "Could not prepare the equipment preview";
     }
-    Call(s.preview.p,"SetActorEnableCollision").set<bool>("bNewActorEnableCollision",false).invoke();
+    // The stock map supplies this instance reference. The camera uses it for
+    // equipment drag/drop and pointing, so a spawned camera needs it explicitly.
+    auto** target=Field<UObject*>(s.camera.p,"MyDressUpDarling");
+    if(!target) { Close(a); return "Equipment preview camera binding is unavailable"; }
+    *target=s.preview.p;
     if(auto** movement=Field<UObject*>(s.preview.p,"CharacterMovement");movement && *movement) Call(*movement,"DisableMovement").invoke();
     if(auto* cls=FindClass("PointLight")) {
         s.light.Set(a.SpawnActorAt(cls,{5150,5050,1200},{}));
