@@ -9,7 +9,7 @@ The game's own distribution, launcher and supported executable requirements are 
 
 Based on Dudiebug/halfsword-multiplayer-mod commit
 `cb8c6646f361f1e1ccb81980108874bdf6fead27` (0.8.0-pre27).
-Fork version: **0.2.3**. Everyone must use this same fork and build.
+Fork version: **0.3.0**. Everyone must use this same fork and build.
 The upstream Steam mod cannot connect to it.
 
 ## Install
@@ -167,3 +167,12 @@ logging distinguishes an accepted cut from a missing sever-state bit.
 These changes address recovery gaps found during the reported torso-cut desync;
 matching torso geometry on the client and host still needs a two-player retest.
 The observed host-side cut is confirmed by its log; the client log was unavailable.
+
+## Dismemberment ease
+
+The connected lobby has a host-only **DISMEMBERMENT EASE** slider, shared
+with all clients and retained across map changes. It ranges from 25% (harder)
+to 400% (easier), with 100% leaving the native cut-marker wear unchanged.
+Try 200% for easier cuts. This changes cutting wear, not general health damage.
+Native weapon, armour, cut geometry and gore-enabled checks still apply.
+Leaving the session restores the neutral multiplier; a new lobby starts at 100%.

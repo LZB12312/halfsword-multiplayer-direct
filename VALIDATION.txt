@@ -1,4 +1,4 @@
-Validation of Half Sword Direct IP 0.2.3
+Validation of Half Sword Direct IP 0.3.0
 
 Windows x64, LLVM-MinGW UCRT 20261104, C++20, Release (-O2).
 C++ builds use -Wall -Wextra -Werror.
@@ -18,7 +18,7 @@ Passed automated checks:
   retained the host lobby without map travel. Tested through the opt-in,
   loopback-only agent bridge. No career-save writes were enabled.
 
-0.2.3 preview correction:
+0.3.0 preview correction:
 - Main-menu visibility is saved, hidden during editing and restored on return.
 - The editor selects its preview camera and restores the previous camera and
   control rotation on close. This patch needs an in-game visual recheck.
@@ -31,6 +31,15 @@ Limits:
 
 Game assets used for local inspection are not included in this repository.
 
-0.2.3 adds an invisible collision floor for the physics-based editor body.
+0.2.3 added an invisible collision floor for the physics-based editor body.
 The floor uses an engine BoxComponent; no game assets are distributed.
 This change compiles but still needs an in-game stability check.
+
+0.3.0 dismemberment ease:
+- Native Blueprint inspection identifies Dismemberment Check.Damage as the
+  cutting-marker wear input; the general Get Damage call is unchanged.
+- Neutral/harder/easier scaling, limits and native invalid-input tests pass.
+- Real UDP clients receive the host setting and cannot overwrite it.
+- Full build and regression suite run in the tagged GitHub release workflow.
+- Slider layout, native hook execution and actual cutting balance require
+  an in-game playtest; no claim is made that all base-game differences are fixed.

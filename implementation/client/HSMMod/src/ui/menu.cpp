@@ -117,6 +117,11 @@ struct State {
     EditBox nameEdit;
     Box addressRow;
     Text ipLabel, featureNote;
+    Box severRow;
+    Slider severSlider;
+    Text severLabel;
+    float severShown=-1;
+    bool severDragging=false;
     Flat saveName, copyIp, copyLan, pasteAddress, editLoadout;
     Text reportNote;
     uint32_t reportSeen = 0;   // Session::ReportStatusSeq last shown in reportNote
@@ -815,6 +820,14 @@ bool BuildPanel() {
     AddToHorizontalBox(g.addressRow,g.ipLabel,1,12); AddFlatH(g.addressRow,g.copyIp,8); AddFlatH(g.addressRow,g.copyLan,0);
     AddToVerticalBox(page,g.addressRow,8);
     g.featureNote=NewText("",15,style::kMenuOk); AddToVerticalBox(page,g.featureNote,4);
+    g.severRow=g.kit.MakeRow();
+    g.severLabel=NewText("DISMEMBERMENT EASE: 100%",15,style::kMenuText);
+    g.severSlider=g.kit.MakeSlider(); g.severSlider.Range(25,400,25);
+    AddToHorizontalBox(g.severRow,g.severLabel,0,16);
+    AddToHorizontalBox(g.severRow,NewText("HARDER",14,style::kMenuDim),0,8);
+    AddToHorizontalBox(g.severRow,g.severSlider,1,8);
+    AddToHorizontalBox(g.severRow,NewText("EASIER (100% = NORMAL)",14,style::kMenuDim),0,0);
+    AddToVerticalBox(page,g.severRow,8);
     g.notice = NewText("", 20, style::kMenuAccentInk);   // Session::TakeNotice: kicked, banned, refused; until the page closes
     if (g.notice) { g.notice.Wrap(true); g.notice.Show(false); AddToVerticalBox(page, g.notice, 8); }
     g.updateNote = NewText("", 15, style::kMenuOk);   // net/update_check.h: only when a newer release exists
@@ -1446,6 +1459,24 @@ void HandleClicks(Session& session) {
     if (act(Clicked(g.helpToggle.card), g.settingsShown)) session.SetHelpImprove(!help);
     if (g.settingsShown) g.voice.Tick(session);
     HandleChat(session, s.in && !g.settingsShown);
+    g.severRow.Show(s.in && !g.settingsShown);
+    const bool canSever=s.in && lobby.IsHost() && !g.settingsShown;
+    g.severSlider.Enabled(canSever);
+    g.severSlider.Colors(style::kMenuDim,canSever?style::kMenuAccentInk:style::kMenuDim);
+    const float severAt=g.severSlider.Value();
+    if(canSever && std::isfinite(severAt) && g.severSlider.Dragging()) {
+        g.severDragging=true;
+        g.severLabel.Set("DISMEMBERMENT EASE: "+std::to_string(int(std::round(severAt/25))*25)+"%");
+    } else {
+        if(canSever && std::isfinite(severAt) && g.severShown>=0 &&
+           (g.severDragging || std::fabs(severAt-g.severShown)>0.5f))
+            lobby.SetSeverEase(int(std::round(severAt/25))*25);
+        g.severDragging=false;
+        const float wanted=float(lobby.SeverEase());
+        if(g.severShown<0 || !std::isfinite(severAt) || std::fabs(severAt-wanted)>0.01f) g.severSlider.Set(wanted);
+        g.severShown=wanted;
+        g.severLabel.Set("DISMEMBERMENT EASE: "+std::to_string(lobby.SeverEase())+"%");
+    }
     if(g.nameEdit.Focused()) SetLobbyTyping(true);
     if(Clicked(g.saveName.card)) {
         const bool ok=lobby.SetDisplayName(g.nameEdit.Value());

@@ -51,6 +51,7 @@ int main(int argc,char** argv) {
         d::CreateLobby(d::LobbyType::Private,3);
         CHECK(d::LobbyOwner(1)==1);
         d::SetLobbyData(1,"test","snapshot-value");
+        CHECK(d::SetLobbyData(1,"hsm_sever","250"));
     } else d::JoinLobby(1);
     bool joined=host, chat=false, large=false, unreliable=false, ready=false;
     std::set<d::UserId> seen, complete;
@@ -63,6 +64,9 @@ int main(int argc,char** argv) {
             if(e.kind==d::Event::LobbyEntered) {
                 if(mode=="reject") { CHECK(!e.ok); d::LeaveLobby(1); puts("PASS full-host rejection"); return 0; }
                 CHECK(e.ok); joined=true; CHECK(d::MyUserId()>1); CHECK(d::LobbyData(1,"test")=="snapshot-value");
+                CHECK(d::LobbyData(1,"hsm_sever")=="250");
+                CHECK(!d::SetLobbyData(1,"hsm_sever","400"));
+                CHECK(d::LobbyData(1,"hsm_sever")=="250");
                 d::SetMemberData(1,"ready","1");
                 CHECK(d::SetDisplayName("Renamed-"+std::to_string(d::MyUserId())));
                 CHECK(d::SendLobbyChat(1,"hello from client"));

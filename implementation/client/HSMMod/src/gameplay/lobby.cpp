@@ -306,6 +306,8 @@ void Lobby::SetOverride(direct::UserId member, int team) {
 void Lobby::ClearOverrides() { for (const LobbyMember& m : members_) SetOverride(m.id, -1); }
 
 void Lobby::SetReady(bool ready) { if (InLobby()) direct::SetMemberData(lobby_, "ready", ready ? "1" : "0"); }
+int Lobby::SeverEase() const { return InLobby()?std::clamp(IntOr(direct::LobbyData(lobby_,"hsm_sever"),100),25,400):100; }
+void Lobby::SetSeverEase(int pct) { if(IsHost()) direct::SetLobbyData(lobby_,"hsm_sever",std::to_string(std::clamp(pct,25,400))); }
 bool Lobby::SetDisplayName(const std::string& name) {
     const auto clean=CleanDisplayName(name);
     if(clean.empty() || !direct::SetDisplayName(clean)) { SetStatus("Enter a display name (up to 32 UTF-8 bytes)"); return false; }

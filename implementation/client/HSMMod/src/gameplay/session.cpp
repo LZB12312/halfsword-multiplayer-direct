@@ -38,6 +38,7 @@
 #include "gameplay/save_guard.h"
 #include "gameplay/shared_dice.h"
 #include "gameplay/severs.h"
+#include "gameplay/sever_ease.h"
 #include "ui/loadout_editor.h"
 #include "ui/umg.h"
 #include "gameplay/standin_gore.h"
@@ -564,6 +565,7 @@ public:
         }
         if (!selfTestOk_) return;
         if (steamMode()) { lobby_.Tick(); game::modpack::Tick(lobby_); }
+        game::TickSeverEase(lobby_.SeverEase());
         if(IsHost() && net_) {
             for(const auto& m:lobby_.members()) roster_.Rename(m.host?kHostKey:m.id,m.name);
             for(auto& [peer,p]:peers_) { (void)peer; const auto name=direct::PersonaName(p.key); if(!name.empty()) p.name=name; }
