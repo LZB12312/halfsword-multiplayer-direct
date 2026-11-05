@@ -13,12 +13,22 @@ mkdir -p build/obj
 COMMON="$OPT -Wall -Wextra -D_WIN32_WINNT=0x0A00 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -fstack-protector-strong"
 # The build string players compare (session/hsm_build.h): kModVersion plus this checkout's commit (and -dirty), if any.
 DESCRIBE=$(git describe --always --dirty --exclude='*' 2>/dev/null | tr -cd 'A-Za-z0-9._+-' || true)
-INC="-Isrc -I../../shared -I../../shared/protocol -Ithird_party/minhook/include"
+INC="-Isrc -I../../shared -I../../shared/protocol -Ithird_party/minhook/include -Ithird_party/enet/include -Ithird_party/miniupnpc/include -iquotethird_party/miniupnpc -DMINIUPNP_STATICLIB"
 
 objs=()
+for f in third_party/miniupnpc/src/{igd_desc_parse,miniupnpc,minixml,minisoap,minissdpc,miniwget,upnpcommands,upnpdev,upnpreplyparse,upnperrors,connecthostport,portlistingparse,receivedata,addr_is_reserved}.c; do
+  o=build/obj/miniupnpc_$(basename "${f%.c}").o
+  "$CC" $COMMON -w $INC -c "$f" -o "$o"
+  objs+=("$o")
+done
 for f in third_party/minhook/src/{buffer,hook,trampoline}.c third_party/minhook/src/hde/hde64.c; do
   o=build/obj/$(basename "${f%.c}").o
   "$CC" $COMMON -w -Ithird_party/minhook/include -c "$f" -o "$o"
+  objs+=("$o")
+done
+for f in third_party/enet/{callbacks,compress,host,list,packet,peer,protocol,win32}.c; do
+  o=build/obj/enet_$(basename "${f%.c}").o
+  "$CC" $COMMON -w -Ithird_party/enet/include -c "$f" -o "$o"
   objs+=("$o")
 done
 for f in src/*.cpp src/*/*.cpp; do
@@ -36,5 +46,5 @@ if "$CXX" -c -x c++ /dev/null -o /dev/null -mguard=cf 2>/dev/null; then
   echo 1 > build/guard_cf
 fi
 "$CXX" -shared -o build/dwmapi.dll "${objs[@]}" src/dwmapi.def \
-  $LINK_FLAGS -static -static-libgcc -static-libstdc++ -Wl,--kill-at -lws2_32 -lwinmm
+  $LINK_FLAGS -static -static-libgcc -static-libstdc++ -Wl,--kill-at -lws2_32 -lwinmm -liphlpapi
 echo "built build/dwmapi.dll ($CFG)"

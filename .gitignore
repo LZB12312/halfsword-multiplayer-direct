@@ -1,0 +1,10 @@
+# Runtime logs/credentials and recordings must not be published.
+*.log
+*.dmp
+*.hsmrec
+HSMMod.ini
+HSMMod.bans
+*.status.json
+__pycache__/
+dist/
+HalfSword-Direct-IP.zip

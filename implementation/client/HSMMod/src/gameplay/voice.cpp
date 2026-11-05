@@ -1,6 +1,6 @@
 #include "gameplay/voice.h"
 #include "log.h"
-#include "steam/steam_api.h"
+#include "net/direct_api.h"
 #include "voice/hsm_adpcm.h"
 #include <windows.h>
 #include <mmsystem.h>
@@ -57,11 +57,11 @@ std::string Voice::SourceName() const {
 
 void Voice::SetRecording(Source s, int waveInIndex) {
     if (s == source_ && (s != Source::WaveIn || waveInIndex == waveInIndex_)) return;
-    if (source_ == Source::Steam) steam::StopVoice();
+    if (source_ == Source::Steam) direct::StopVoice();
     if (source_ == Source::WaveIn) CloseWaveIn();
     source_ = Source::None; waveInIndex_ = -2;
     gate_.Reset(); preroll_.Clear(); sending_ = false; gateOpen_ = false; inAcc_.clear();
-    if (s == Source::Steam) { steam::StartVoice(); source_ = s; }
+    if (s == Source::Steam) { direct::StartVoice(); source_ = s; }
     else if (s == Source::WaveIn && OpenWaveIn(waveInIndex)) { source_ = s; waveInIndex_ = waveInIndex; }
     recording_ = source_ != Source::None;
 }
@@ -158,7 +158,7 @@ void Voice::Capture(bool mayTalk, bool keyAllowed, bool meter, uint32_t nowMs, C
             HSM_LOG("voice: the picked microphone is not connected; using the Windows default");
         }
         if (index >= 0) src = Source::WaveIn;
-        else if (steam::VoiceAvailable()) src = Source::Steam;
+        else if (direct::VoiceAvailable()) src = Source::Steam;
         else {
             if (mayTalk && !steamWarned_) { steamWarned_ = true; HSM_LOG("voice: Steam voice is not available here; recording the Windows default device"); }
             src = Source::WaveIn;
@@ -175,14 +175,14 @@ void Voice::Capture(bool mayTalk, bool keyAllowed, bool meter, uint32_t nowMs, C
 
     if (source_ == Source::Steam) {
         std::vector<uint8_t> chunk;
-        if (!steam::TakeVoice(chunk) || chunk.empty()) {
+        if (!direct::TakeVoice(chunk) || chunk.empty()) {
             if (sending_ && (!mayTalk || (set_.mic == voice::Mic::Open && !gate_.Feed(-120.f, nowMs)) || (set_.mic == voice::Mic::PushToTalk && !keyDown))) sending_ = false;
             if (set_.mic == voice::Mic::PushToTalk) gateOpen_ = keyDown;
             return;
         }
         const bool needPcm = set_.mic == voice::Mic::Open || meter || monitor_;
         float db = -120.f;
-        const bool decoded = needPcm && steam::DecompressVoice(chunk.data(), chunk.size(), voice::kSampleRate, pcm_);
+        const bool decoded = needPcm && direct::DecompressVoice(chunk.data(), chunk.size(), voice::kSampleRate, pcm_);
         if (decoded) db = voice::RmsDbfs(pcm_.data(), pcm_.size());
         Chunk(std::move(chunk), decoded ? &pcm_ : nullptr, db, keyDown, mayTalk, nowMs, out);
     } else {
@@ -212,7 +212,7 @@ void Voice::Receive(uint8_t entity, uint16_t seq, bool adpcm, const uint8_t* dat
         std::vector<int16_t> raw;
         if (!voice::DecodeAdpcm(data, size, raw)) { ++stats_.badChunks; return; }
         voice::Upsample16To24(raw.data(), raw.size(), pcm);
-    } else if (!steam::DecompressVoice(data, size, voice::kSampleRate, pcm)) {
+    } else if (!direct::DecompressVoice(data, size, voice::kSampleRate, pcm)) {
         ++stats_.badChunks; return;
     }
     if (pcm.empty()) { ++stats_.badChunks; return; }

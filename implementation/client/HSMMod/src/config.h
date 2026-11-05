@@ -11,10 +11,10 @@
 
 namespace hsm {
 // Steam: lobby-driven (Multiplayer button on the main menu; lobby owner hosts). Server: below.
-enum class Role { Off, Steam, Server };   // Server: a hosted retail instance with no fighter of its own, auto-starting matches
+enum class Role { Off, Direct, Server };   // Server: a hosted retail instance with no fighter of its own, auto-starting matches
 
 struct Config {
-    Role role = Role::Steam;
+    Role role = Role::Direct;
     std::string playerName = "Player";
     int snapshotHz = 30;
     int inputHz = 60;
@@ -24,7 +24,7 @@ struct Config {
     // true: clients also send Pose and Vitals straight to each other (Steam lobbies only; session/hsm_mesh.h), and the host
     // stops relaying what a client already hears directly (default from 0.7.0-pre6). false (mesh=0): every stream goes
     // through the host, as in 0.6.5. Used where the host and the client both have it on.
-    bool mesh = true;
+    bool mesh = false;
     // false (the default after 0.8.0-pre14): no hand-off (sync/hsm_handoff.h, rev 32). Every fighter stays with its own player,
     // grabs included, as in 0.8.0-pre7. hand_off=1 turns it back on; it happens only where the host and both players have it.
     bool handOff = false;
@@ -66,14 +66,14 @@ struct Config {
     // true (default from 0.7.0-pre6): with the mesh on, the host also plans each client pair's fastest path from the
     // measured pings and a client may pass another pair's Pose and Vitals on (detours, session/hsm_detour.h). detour=0
     // turns it off; nothing happens with mesh=0.
-    bool detour = true;
+    bool detour = false;
     // true (default): on a Steam lobby every client pings the host and every other client every 2 s and reports the
     // results to the host every 10 s; both log them in the health window ("ping:" lines). Measures what a mesh would get
     // without turning it on. Host and clients both need it; mesh=1 is not needed.
-    bool peerPing = true;
+    bool peerPing = false;
     // true (default): when a Steam lobby's host leaves, the member Steam makes the new lobby owner hosts the same lobby
     // and the others follow it (session/hsm_migration.h) instead of everyone going back to the menu.
-    bool hostMigration = true;
+    bool hostMigration = false;
     // true (default): the host resets the map at each Duel round and each rematch (props back to their start, objects spawned
     // in the round gone, the level's own weapons back on their spots); 0 sends no MapReset. Read on the host only.
     bool mapReset = true;

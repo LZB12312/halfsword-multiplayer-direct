@@ -16,11 +16,18 @@
 namespace hsm {
 namespace {
 constexpr char kDefaultIni[] =
-    "; HalfSwordMP configuration. role = steam | server | off\n"
-    "; steam: use the Multiplayer button on the main menu (Steam lobbies, invites, no port forwarding). off: completely vanilla.\n"
+    "; HalfSwordMP configuration. role = direct | server | off\n"
+    "; direct: host or join by IP with the Multiplayer button. off: completely vanilla.\n"
     "[net]\n"
-    "role=steam\n"
+    "role=direct\n"
     "name=Player\n"
+    "; Forward this UDP port to the host PC, or enable UPnP on your router.\n"
+    "port=27015\n"
+    "upnp=1\n"
+    "; JOIN CONNECT ADDRESS uses this IPv4 address or DNS name (optionally host:port).\n"
+    "connect=127.0.0.1:27015\n"
+    "reports=off\n"
+    "update_check=1\n"
     "snapshot_hz=30\n"
     "input_hz=60\n"
     "; the key that opens the chat: enter, t, y or u (Enter sends, Esc cancels)\n"
@@ -40,7 +47,7 @@ constexpr char kDefaultIni[] =
     "juggernaut_scale=1.35\n"
     "; in-game bug reports: type /bug <what went wrong> in the chat to file a GitHub issue with your HSMMod log\n"
     "; (Steam IDs, IP addresses and your Windows user name are removed first). Nothing is sent unless you type it.\n"
-    "reports=on\n"
+
     "report_url=https://reports.dudiebug.net\n"
     "; 1: also send your HSMMod log (Steam IDs, IPs and your Windows user name removed; player names stay) when someone in\n"
     "; your lobby files a bug report or your game crashed last time. The MULTIPLAYER page and the Esc menu in a match have\n"
@@ -67,12 +74,12 @@ constexpr char kDefaultIni[] =
     "voice_cutoff=30\n"
     "voice_volume=100\n"
     "; role=server (a hosted retail instance with no fighter of its own that starts matches by itself):\n"
-    "; the server opens a public Steam lobby that shows in the game's lobby browser. server_format=ffa|duel|lms|teams|survival|zombies (teams3 / teams4: three or four teams; duel runs as lms unless exactly\n"
+    "; the server listens on the configured UDP port. server_format=ffa|duel|lms|teams|survival|zombies (teams3 / teams4: three or four teams; duel runs as lms unless exactly\n"
     "; 2 players are in), server_teams=2..4 (teams for server_format=teams),\n"
     "; server_maps=all or a comma list of map names, server_score_limit=0 (format default), server_time_limit_s=0 (none),\n"
     "; server_countdown_s=30, server_min_players=2 (1..8), server_damage=stock or a percent (player damage for everyone,\n"
     "; 100 = the game's rate 1.0, inside the game's own damage slider)\n"
-    "; server_admins=Steam IDs (comma list) allowed to /kick, /ban, /unban, /clear [all|weapons|armor|rocks] and /resetmap from the chat; server_votekick=1 lets players\n"
+    "; server_admins is disabled in direct mode; use HSMMod.cmd. server_votekick=1 lets players\n"
     "; vote a player out (15 min) or /voteban them (7 days, two thirds). The console takes kick, ban, unban, bans, players,\n"
     "; clear and say (HSMMod.cmd)\n"
     "server_format=ffa\n"
@@ -121,12 +128,11 @@ double ClampD(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi
 }  // namespace
 
 const char* RoleName(Role r) {
-    return r == Role::Steam ? "steam" : r == Role::Server ? "server" : "off";
+    return r == Role::Direct ? "direct" : r == Role::Server ? "server" : "off";
 }
-// Direct IP (role=host|client, -hsmrole=host|client) was removed in 0.8.0: logged once, then Steam is used.
-static Role ParseRole(const std::string& r, const char* source) {
-    if (r == "host" || r == "client") HSM_LOG("config: %s=%s is ignored: direct IP was removed in 0.8.0; using role=steam", source, r.c_str());
-    return r == "off" ? Role::Off : r == "server" ? Role::Server : Role::Steam;
+// Old role=steam remains an alias for direct for existing configuration files.
+static Role ParseRole(const std::string& r, const char*) {
+    return r == "off" ? Role::Off : r == "server" ? Role::Server : Role::Direct;
 }
 
 // Reads the whole ini, sets the key in the text, writes a sibling file and moves it over the ini (a crash in between
@@ -158,9 +164,8 @@ Config LoadConfig() {
         if (FILE* f = _wfopen(ini.c_str(), L"w")) { std::fputs(kDefaultIni, f); std::fclose(f); }
     }
     Config c;
-    std::string role = ReadString(ini, L"role", "steam");
+    std::string role = ReadString(ini, L"role", "direct");
     c.role = ParseRole(role, "role");
-    if (!ReadString(ini, L"server_transport", "").empty()) HSM_LOG("config: server_transport is ignored: direct IP was removed in 0.8.0, servers use a public Steam lobby");
     c.playerName = ReadString(ini, L"name", "Player").substr(0, 32);
     c.snapshotHz = Clamp(std::atoi(ReadString(ini, L"snapshot_hz", "30").c_str()), 5, 120);
     c.inputHz = Clamp(std::atoi(ReadString(ini, L"input_hz", "60").c_str()), 10, 240);
@@ -169,7 +174,7 @@ Config LoadConfig() {
         c.hostPhysics = sm == "host";
         if (sm != "host" && sm != "owner") HSM_LOG("config: sync_mode=%s is not host or owner; owner", sm.c_str());
     }
-    c.mesh = ReadString(ini, L"mesh", "1") != "0";
+    c.mesh = false;   // Direct mode: host relays traffic; no host migration.
     c.handOff = ReadString(ini, L"hand_off", "0") != "0";
     c.grabDrag = ReadString(ini, L"grab_drag", "1") != "0";
     c.syncStructures = ParseStructureMode(ReadString(ini, L"sync_structures", "soft"));
@@ -183,9 +188,9 @@ Config LoadConfig() {
     }
     c.scabbardFix = ReadString(ini, L"scabbard_fix", "1") != "0";
     c.fenceFix = ReadString(ini, L"fence_fix", "1") != "0";
-    c.detour = ReadString(ini, L"detour", "1") != "0";
-    c.peerPing = ReadString(ini, L"peer_ping", "1") != "0";
-    c.hostMigration = ReadString(ini, L"host_migration", "1") != "0";
+    c.detour = false;   // Direct mode: host relays traffic; no host migration.
+    c.peerPing = false;   // Direct mode: host relays traffic; no host migration.
+    c.hostMigration = false;   // Direct mode: host relays traffic; no host migration.
     c.mapReset = ReadString(ini, L"map_reset", "1") != "0";
     c.progressionVote = ReadString(ini, L"progression_vote", "1") != "0";
     c.progressionPayout = ReadString(ini, L"progression_payout", "1") != "0";
@@ -218,7 +223,7 @@ Config LoadConfig() {
     c.ctfFlagInHand = ReadString(ini, L"ctf_carry", "hand") != "back";
     c.paintDefer = ReadString(ini, L"paint_defer", "1") != "0";
     c.juggernautScale = ClampD(std::atof(ReadString(ini, L"juggernaut_scale", "1.35").c_str()), hsm::kJuggernautScaleMin, hsm::kJuggernautScaleMax);
-    c.reports = ReadString(ini, L"reports", "on") != "off";
+    c.reports = ReadString(ini, L"reports", "off") != "off";
     c.reportUrl = ReadString(ini, L"report_url", "https://reports.dudiebug.net");
     if (c.reportUrl == "https://reports.dutybug.net") c.reportUrl = "https://reports.dudiebug.net";   // a misspelt default written by 0.7.0-pre1/pre2
     c.helpImprove = ReadString(ini, L"help_improve", "0") == "1";
@@ -235,7 +240,7 @@ Config LoadConfig() {
         const std::string d = ReadString(ini, L"server_damage", "stock");
         c.serverDamagePct = d.empty() || d == "stock" ? -1 : Clamp(std::atoi(d.c_str()), 0, 1000);
     }
-    c.serverAdmins = ReadString(ini, L"server_admins", "");
+    c.serverAdmins.clear(); // Direct mode has no authenticated remote accounts; console admin only.
     c.serverVoteKick = ReadString(ini, L"votekick", ReadString(ini, L"server_votekick", "1").c_str()) != "0";
     c.ue4ss = ReadModString(ini, L"ue4ss", "1") != "0";
     c.ue4ssBefore = ue4ss::ParseOrder(ReadModString(ini, L"ue4ss_order", "after")) == ue4ss::Order::Before;

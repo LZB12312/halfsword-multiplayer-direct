@@ -1,3 +1,5 @@
+// Direct fork: auto-download verified releases from LZB12312/halfsword-multiplayer-direct.
+// Restart the game to use an installed update; update_check=0 disables checking/downloading.
 // Update check: once per game start, one HTTPS GET of GitHub's releases list (api.github.com) on a worker thread, with
 // a User-Agent of "HSMMod/<version>" and nothing else about the player. The result is logged, shown on the multiplayer
 // page and once in the chat of the first fight level. Which release counts as newer is session/hsm_version.h; the

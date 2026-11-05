@@ -1,0 +1,70 @@
+name: Build and release direct-IP mod
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $header = Get-Content implementation/client/HSMMod/src/gameplay/lobby.h -Raw
+          $version = [regex]::Match($header, 'kModVersion = "([^"]+)"').Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag does not match compiled mod version' }
+      - name: Fetch pinned LLVM-MinGW toolchain
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
+          Invoke-WebRequest 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-x86_64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '552191B5754C49A5A20723276A6FC56541EA1922C4C50B7B669022333FC1B40F') { throw 'Toolchain checksum mismatch' }
+          Expand-Archive $archive (Join-Path $env:RUNNER_TEMP 'toolchain')
+          $tc = (Get-ChildItem (Join-Path $env:RUNNER_TEMP 'toolchain') -Directory | Select-Object -First 1).FullName
+          "LLVM_MINGW=$tc" >> $env:GITHUB_ENV
+      - name: Build DLL
+        shell: pwsh
+        run: ./implementation/client/HSMMod/build.ps1
+      - name: Test direct transport, updater and sever recovery
+        shell: pwsh
+        run: |
+          python implementation/client/HSMMod/tests/run_direct_network.py
+          if ($LASTEXITCODE) { throw 'Network tests failed' }
+          $cxx = Join-Path $env:LLVM_MINGW 'bin/x86_64-w64-mingw32-clang++.exe'
+          foreach ($test in @('combat/test_hsm_sever.cpp','combat/test_hsm_sever_recovery.cpp','sync/test_hsm_gore.cpp','session/test_hsm_update.cpp','session/test_hsm_version.cpp')) {
+            & $cxx -std=c++20 -D_USE_MATH_DEFINES -O1 -Wall -Wextra -Werror -Iimplementation/shared -Iimplementation/shared/protocol "implementation/shared/$test" -static -o "$env:RUNNER_TEMP/check.exe"
+            if ($LASTEXITCODE) { throw "Compile failed: $test" }
+            & "$env:RUNNER_TEMP/check.exe"
+            if ($LASTEXITCODE) { throw "Test failed: $test" }
+          }
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item implementation/client/HSMMod/build/dwmapi.dll dist/dwmapi.dll
+          $hash = (Get-FileHash dist/dwmapi.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path (Resolve-Path dist) 'dwmapi.dll.sha256'), "$hash  dwmapi.dll`n")
+          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md,HSMMod.ini.example dist/
+          Compress-Archive -Path dist/* -DestinationPath HalfSword-Direct-IP.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HalfSword-Direct-IP
+          path: |
+            dist/*
+            HalfSword-Direct-IP.zip
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/dwmapi.dll dist/dwmapi.dll.sha256 HalfSword-Direct-IP.zip --title "Half Sword Direct IP $env:GITHUB_REF_NAME" --generate-notes

@@ -31,6 +31,12 @@ constexpr double kSeverMaxExtent = 2000.0;       // uu; the game's boxes are (10
 constexpr double kSeverMaxBoxOffset = 2000.0;    // uu from the frame bone; the game's boxes sit about 500 away
 constexpr double kSeverRepeatMs = 500.0;         // the attacker sends one claim per (victim, part) per this
 constexpr double kSeverPendingMs = 3000.0;       // a claim waits this long for the owner's vitals to confirm it
+// Limbs can use the hide-bone fallback after 400 ms; the pelvis cannot be hidden
+// without hiding the whole fighter. Keep native pelvis geometry recoverable for
+// the bounded pending lifetime instead of permanently leaving an intact torso.
+inline bool NativeSeverDisplayFresh(uint8_t part, double ageMs) {
+    return part < kSeverParts && ageMs >= 0 && ageMs <= (part == 2 ? kSeverPendingMs : 300.0);
+}
 constexpr uint32_t kSeverDelayedMs = 100;        // Constraint_Weapon_Stuck_BP.cpp:666: Delay 0.1 s, then Delayed
 constexpr double kStuckBladeMaxMs = 10000.0;     // a stuck blade never reported released lets go after this
 

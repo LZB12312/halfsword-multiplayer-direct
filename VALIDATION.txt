@@ -1,0 +1,29 @@
+Validation of 0.8.0-pre27-direct1
+
+Built on Windows x64 with LLVM-MinGW UCRT 20261104, C++20, Release (-O2).
+Full build passed with -Wall -Wextra -Werror for C++.
+Binary imports inspected: Windows APIs/UCRT only; no Steam or third-party runtime DLL dependency.
+
+Passed automated checks:
+- Real UDP host + two separate clients: lobby snapshots, membership, chat,
+  ready state, reliable fragmented 16 KiB payloads, unreliable packets.
+- Capacity rejection, occupied local port, connection timeout.
+- Host kick, client reconnect, graceful host disconnect.
+- Network harness explicitly verifies steam_api64.dll is not loaded.
+- Address input validation, truncated frames, sender identity binding,
+  protected host state, wrong target filtering, 20,000 malformed frames.
+- Mock UPnP gateway: mapping creation/removal, unavailable gateway,
+  existing mapping preservation, inspection/add failure, permanent-lease
+  fallback, preservation when another application changes the rule.
+- Upstream regression programs: lobby scene, password, moderation, roster,
+  server roster, protocol, voice (7 passed).
+- git diff --check passed.
+
+Not validated here:
+- Actual Half Sword combat, UI rendering, microphone/audio devices.
+- Internet matches between separate networks.
+- UPnP discovery/mapping/renewal through a physical router.
+- The Linux cross-build script; the supplied DLL was built with build.ps1.
+
+The UPnP tests use a fake gateway. All real UDP tests set upnp=0 and do
+not modify router or Windows Firewall settings.

@@ -1,22 +1,20 @@
-// ITransport over Steam (ISteamNetworkingMessages: relayed, NAT-traversing, no port forwarding).
-// Peers are lobby members only: the session calls AllowPeer/DropPeer from Steam lobby membership events,
-// and messages from anyone else are discarded. Game thread only (the Steam API calls are non-blocking).
+// Validated gameplay messages over the direct ENet backend. Host relays traffic; game thread only.
 #pragma once
 #include "net/transport.h"
 #include <unordered_map>
 
 namespace hsm {
 
-class SteamTransport final : public ITransport {
+class DirectTransport final : public ITransport {
 public:
-    explicit SteamTransport(Validator v) : validate_(std::move(v)) {}
-    ~SteamTransport() override { Stop(); }
+    explicit DirectTransport(Validator v) : validate_(std::move(v)) {}
+    ~DirectTransport() override { Stop(); }
 
     uint32_t AllowPeer(uint64_t steamId);      // returns peer id; queues a Connected event the first time
     void DropPeer(uint64_t steamId);           // queues Disconnected and closes the Steam session
     bool IsAllowed(uint64_t steamId) const { return byId_.count(steamId) != 0; }
     uint32_t PeerOf(uint64_t steamId) const;
-    uint64_t SteamOf(uint32_t peer) const;
+    uint64_t UserOf(uint32_t peer) const;
 
     void Stop() override;
     void Send(uint32_t peer, uint8_t channel, std::vector<uint8_t> data, bool reliable) override;

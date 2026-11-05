@@ -1,5 +1,4 @@
-// Voice chat (0.7.0-pre5, devices and the meter 0.7.0-pre6): the microphone through Steam (ISteamUser voice: the
-// Windows default device) or, for a device the player picked, through waveIn (16 kHz mono, sent as IMA ADPCM,
+// Direct voice chat: the Windows default or selected microphone through waveIn (16 kHz mono, sent as IMA ADPCM,
 // voice/hsm_adpcm.h); playback through waveOut on its own thread. The decisions (level gate, who hears whom, gains)
 // are in shared/voice/hsm_voice.h; the session feeds this class what it may send and how loud each speaker is.
 // Game thread, except the audio thread inside.

@@ -1,0 +1,10 @@
+; Copy these settings into HSMMod.ini beside the game executable.
+; Existing HSMMod.ini settings do not need to be replaced.
+[net]
+role=direct
+name=Player
+port=27015
+upnp=1
+connect=127.0.0.1:27015
+reports=off
+update_check=1

@@ -15,7 +15,7 @@
 
 namespace hsm::update {
 namespace {
-constexpr const char kRepo[] = "Dudiebug/halfsword-multiplayer-mod";
+constexpr const char kRepo[] = "LZB12312/halfsword-multiplayer-direct";
 
 std::atomic<bool> g_started{false};
 std::mutex g_mu;
@@ -72,9 +72,14 @@ void Check() {
     UpdateAssets assets;
     const AssetsVerdict av = SelectUpdateAssets(release, kRepo, assets);
     if (av != AssetsVerdict::Ok) HSM_LOG("update: no one-click update (%s)", AssetsVerdictText(av));
-    std::lock_guard<std::mutex> lock(g_mu);
-    g_notice = "HSMMod " + latest + " is out (you have " + cur + "). Get it from GitHub: " + kRepo;
-    if (av == AssetsVerdict::Ok) { g_tag = offer->tag; g_assets = assets; g_haveAssets = true; }
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_notice = "HSMMod " + latest + " is out (you have " + cur + "). Source: " + kRepo;
+        if (av == AssetsVerdict::Ok) { g_tag = offer->tag; g_assets = assets; g_haveAssets = true; }
+    }
+    // Download and verify in the background. The loaded code stays unchanged;
+    // the installed version takes effect only after restarting the game.
+    if (av == AssetsVerdict::Ok) StartInstall();
 }
 
 // ------------------------------------------------------------------ UPDATE NOW

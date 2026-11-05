@@ -92,6 +92,7 @@ private:
         uint8_t entity = 0;
         bool standIn = false;   // dismemberment was allowed for this call: forbid it again afterwards
         uint32_t claimId = 0;
+        combat::SeverClaim claim; // accepted geometry, retained for owner confirmation after Delayed
     };
     struct Retry {              // refused while another sever on that fighter was in process: tried once more after it
         combat::SeverClaim claim;

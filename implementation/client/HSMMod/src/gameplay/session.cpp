@@ -75,7 +75,7 @@
 #include "match/hsm_spectate.h"
 #include "net/report_client.h"
 #include "net/update_check.h"
-#include "net/steam_transport.h"
+#include "net/direct_transport.h"
 #include "net/transport.h"
 #include "session/hsm_authority.h"
 #include "session/hsm_mesh.h"
@@ -305,10 +305,10 @@ public:
             ResetNetwork("left lobby");
             if (strandedInFight) { HSM_LOG("client: lobby gone; returning to the main menu"); game::OpenLevel(lastGameMode_, kMenuLevel, true, ""); }
         };
-        lobby_.onOwnerChanged = [this](steam::SteamId old, steam::SteamId now) { return OnLobbyOwnerChanged(old, now); };
-        lobby_.onMemberJoined = [this](steam::SteamId id) { if (steamNet_ && lobby_.IsHost()) steamNet_->AllowPeer(id); };
-        lobby_.onMemberLeft = [this](steam::SteamId id) { lobbyGate_.Forget(id); meshPeers_.Forget(id); if (steamNet_) steamNet_->DropPeer(id); };
-        lobby_.onChat = [this](steam::SteamId from, const std::string& text) { OnLobbyChat(from, text); };
+        lobby_.onOwnerChanged = [this](direct::UserId old, direct::UserId now) { return OnLobbyOwnerChanged(old, now); };
+        lobby_.onMemberJoined = [this](direct::UserId id) { if (directNet_ && lobby_.IsHost()) directNet_->AllowPeer(id); };
+        lobby_.onMemberLeft = [this](direct::UserId id) { lobbyGate_.Forget(id); meshPeers_.Forget(id); if (directNet_) directNet_->DropPeer(id); };
+        lobby_.onChat = [this](direct::UserId from, const std::string& text) { OnLobbyChat(from, text); };
         lobby_.onPresence = [](const std::string& name, bool joined) { ui::ShowLine("HSMMod", style::kBone, (name.empty() ? "?" : name) + (joined ? " joined" : " left")); };
         ui::ChatSetup(cfg_.chatKey, [this](bool on) {   // in a menu level the chat closing gives the menu its cursor back
                 adapter_.CaptureInput(on); if (!on && !InFightLevel()) adapter_.ShowPauseCursor(); }, [this] { return adapter_.GamePaused() || adapter_.PauseMenuOpen(); });
@@ -937,14 +937,14 @@ public:
 
     // A line from a member (ours comes back the same way, and is limited when it is sent). Shown in the chat history,
     // which the multiplayer page and the match chat share.
-    void OnLobbyChat(steam::SteamId from, const std::string& text) {
-        const bool mine = from == steam::MySteamId();
+    void OnLobbyChat(direct::UserId from, const std::string& text) {
+        const bool mine = from == direct::MyUserId();
         if (!mine && !lobbyGate_.Allow(from, NowMs())) return;
         std::string name;
         Rgba ink = style::kIron;
         for (const game::LobbyMember& m : lobby_.members())
             if (m.id == from) { name = m.name; ink = LobbyChatInk(lobby_.config(), m.team, m.hostOverride); }
-        if (name.empty()) name = steam::PersonaName(from);
+        if (name.empty()) name = direct::PersonaName(from);
         ui::ShowLine(name.empty() ? "?" : name, ink, text);
     }
 
@@ -1291,7 +1291,7 @@ public:
     std::string BanKeyOf(uint32_t peer) {
         auto it = peers_.find(peer);
         if (it == peers_.end()) return {};
-        return (it->second.key >> 63) ? std::string() : SteamBanKey(it->second.key);
+        return (it->second.key >> 63) ? std::string() : IpBanKey(direct::RemoteAddress(it->second.key));
     }
 
     // "#slot" or a name; false (and the issuer told why) when no single connected player matches.
@@ -1374,7 +1374,7 @@ public:
     // A banned (or just kicked) Steam ID; null when this peer may join.
     const BanEntry* BannedEntry(const NetEvent& ev) {
         LoadBans();
-        return ev.steamId ? bans_.Find(SteamBanKey(ev.steamId), UnixNow()) : nullptr;
+        return ev.steamId ? bans_.Find(IpBanKey(direct::RemoteAddress(ev.steamId)), UnixNow()) : nullptr;
     }
 
     static int64_t UnixNow() { return int64_t(std::time(nullptr)); }
@@ -1418,7 +1418,7 @@ public:
         }
         HSM_LOG("client: rejected by the host (reason %d); leaving", int(why));
         const bool fight = InFightLevel();
-        const steam::SteamId lobbyId = lobby_.id();
+        const direct::UserId lobbyId = lobby_.id();
         welcomed_ = false;                             // the lobby's onLeft must not open the menu a second time
         if (steamMode()) lobby_.Leave();
         ResetNetwork("rejected by the host");
@@ -1834,7 +1834,7 @@ private:
     bool CombatEnabled() const {
         return !MatchLevel() || CombatPhase(IsHost() ? match_.phase() : MatchPhase(info_.phase));
     }
-    std::string MyName() const { return steam::PersonaName(steam::MySteamId()); }
+    std::string MyName() const { return direct::PersonaName(direct::MyUserId()); }
 
     // ------------------------------------------------------------------ agent bridge (sensors/actuators)
     static constexpr const char* kAxisNames[kAxisCount] = {"MoveForward", "MoveRight", "TurnMouse", "LookMouse", "TurnGamepad",
@@ -2023,20 +2023,20 @@ private:
     void OnLobbyEntered() {
         ui::ChatClearLines();   // the last lobby's chat is not this one's
         lobbyGate_.Clear();
-        auto st = std::make_unique<SteamTransport>(lobby_.IsHost() ? ValidateForHost : ValidateForClient);
-        steamNet_ = st.get();
+        auto st = std::make_unique<DirectTransport>(lobby_.IsHost() ? ValidateForHost : ValidateForClient);
+        directNet_ = st.get();
         net_ = std::move(st);
         ++sessionGen_;
         if (lobby_.IsHost()) {
-            for (const game::LobbyMember& m : lobby_.members()) if (m.id != steam::MySteamId()) steamNet_->AllowPeer(m.id);
+            for (const game::LobbyMember& m : lobby_.members()) if (m.id != direct::MyUserId()) directNet_->AllowPeer(m.id);
             hostPending_ = true;
-        } else { hostSteam_ = lobby_.owner(); steamNet_->AllowPeer(hostSteam_); }
+        } else { hostUser_ = lobby_.owner(); directNet_->AllowPeer(hostUser_); }
     }
 
     void ResetNetwork(const char* why) {
         if (!migration_.Active()) { migrateBoard_ = ScoreCarry{}; migrateObjects_.clear(); }
         if (net_) { HSM_LOG("session: network reset (%s)", why); net_->Stop(); }
-        steamNet_ = nullptr; net_.reset();
+        directNet_ = nullptr; net_.reset();
         ++sessionGen_; reportOffer_ = ReportOffer{}; autoAttachDue_ = false;   // R2: no offer or late report outlives its session
         game::shareddice::Clear();                   // the game's own randomness again
         claims_.Stop();                              // the hooks go before any fighter does
@@ -2065,7 +2065,7 @@ private:
         puppets_.clear(); world_ = ClientWorld{}; clientBlobs_.Clear(); clientAssembler_ = BlobAssembler{}; lastUpload_.clear();
         modMapHost_.reset(); modMapChecked_ = false; modMapApproved_.clear(); pendingTravel_.reset();
         hostPeer_ = 0; welcomed_ = false; snappedOwn_ = false; hellosSent_ = 0;
-        hostSteam_ = 0; meshOn_ = false; meshPeers_.Clear(); meshHearing_.Clear(); meshMasks_.Clear(); peerMapDirty_ = false;
+        hostUser_ = 0; meshOn_ = false; meshPeers_.Clear(); meshHearing_.Clear(); meshMasks_.Clear(); peerMapDirty_ = false;
         peerPingOn_ = false; meshDedupe_.Clear(); pings_.Clear(); pongs_.Clear(); pingTables_.clear(); nextPingTable_ = 0;
         routeLinks_.Clear(); routePlanner_.Clear(); nextRoutePlan_ = 0;
         for (MsgBudget& b : meshBudget_) b = MsgBudget{};
@@ -3334,9 +3334,9 @@ private:
 
     // ------------------------------------------------------------------ mesh (host side)
     // Offered only on a Steam lobby with owner sync.
-    bool MeshHost() const { return cfg_.mesh && steamNet_; }
+    bool MeshHost() const { return cfg_.mesh && directNet_; }
     // The PeerMap goes out for the mesh and for per-player pings (peer_ping=1, on with the mesh off).
-    bool PeerMapHost() const { return steamNet_ && (cfg_.mesh || cfg_.peerPing); }
+    bool PeerMapHost() const { return directNet_ && (cfg_.mesh || cfg_.peerPing); }
 
     // A client joined, left or was dropped: its own report is void, nobody hears it any more, and the clients get a new map.
     void MeshRosterChanged(uint8_t slot) {
@@ -3495,8 +3495,8 @@ private:
 
     // True while the peer's Steam player is still in our lobby: its session is a slow join in progress, not a squatter.
     bool LobbyMemberStillJoining(uint32_t peer) {
-        if (!steamNet_ || !lobby_.InLobby()) return false;
-        const uint64_t id = steamNet_->SteamOf(peer);
+        if (!directNet_ || !lobby_.InLobby()) return false;
+        const uint64_t id = directNet_->UserOf(peer);
         if (!id) return false;
         for (const game::LobbyMember& m : lobby_.members()) if (m.id == id) return true;
         return false;
@@ -4512,7 +4512,7 @@ private:
     // The identity a player's score follows (FighterInfo::id): their SteamID, the host's own included; 0 when unknown.
     uint64_t ScoreId(uint8_t entity) const {
         const RosterMember* m = steamMode() ? roster_.ByEntity(entity) : nullptr;
-        return !m ? 0 : m->key == kHostKey ? steam::MySteamId() : (m->key >> 63) ? 0 : m->key;
+        return !m ? 0 : m->key == kHostKey ? direct::MyUserId() : (m->key >> 63) ? 0 : m->key;
     }
 
     void StartMatch() {
@@ -4522,7 +4522,7 @@ private:
         for (const RosterMember& m : roster_.members()) {
             TeamRequest r; r.slot = m.slot;
             if (steamMode()) for (const game::LobbyMember& lm : lobby_.members())
-                if (lm.id == (m.key == kHostKey ? steam::MySteamId() : m.key)) { r.pick = int8_t(lm.team); r.hostOverride = int8_t(lm.hostOverride); }
+                if (lm.id == (m.key == kHostKey ? direct::MyUserId() : m.key)) { r.pick = int8_t(lm.team); r.hostOverride = int8_t(lm.hostOverride); }
             req.push_back(r);
         }
         slotTeam_ = ResolveTeams(req, cfg.format, cfg.teams);
@@ -4597,14 +4597,14 @@ private:
         if (lobby_.state() == game::Lobby::State::Idle && DueAt(now, serverLobbyAt_)) {
             serverLobbyAt_ = now + 15000;
             HSM_LOG("server: opening a public Steam lobby");
-            lobby_.Host(steam::LobbyType::Public, true);   // one member more: the server is not a player
+            lobby_.Host(direct::LobbyType::Public, true);   // one member more: the server is not a player
         }
         if (lobby_.IsHost() && DueAt(now, serverConfigAt_)) {
             serverConfigAt_ = now + 5000;
             lobby_.SetConfig(ServerMatchConfig());
             // The browser shows the server's name (name= in HSMMod.ini) instead of "<account>'s fight".
             const std::string shown = cfg_.playerName.empty() || cfg_.playerName == "Player" ? MyName() + " (server)" : cfg_.playerName;
-            if (steam::LobbyData(lobby_.id(), "name") != shown) steam::SetLobbyData(lobby_.id(), "name", shown);
+            if (direct::LobbyData(lobby_.id(), "name") != shown) direct::SetLobbyData(lobby_.id(), "name", shown);
         }
     }
 
@@ -5994,7 +5994,7 @@ private:
         if (!voiceConfigured_) { voiceConfigured_ = true; voice_.Configure(VoiceSettingsFromConfig()); }
         const bool meter = VoiceMeterWanted(now);
         if (!meter && !voice_.Recording()) { if (voice_.Monitor()) voice_.SetMonitor(false); return; }
-        if (meter && !steam::Ready() && !voiceSteamTried_) { voiceSteamTried_ = true; steam::Init(); }
+        if (meter && !direct::Ready() && !voiceSteamTried_) { voiceSteamTried_ = true; direct::Init(); }
         voice_.Capture(false, VoiceKeyAllowed(), meter, now, voiceOut_);
         if (!meter) { voice_.Stop(); voice_.SetMonitor(false); }
     }
@@ -6005,9 +6005,9 @@ private:
         const uint32_t now = NowMs();
         const bool on = VoiceOn();
         if (!voiceConfigured_) { voiceConfigured_ = true; voice_.Configure(VoiceSettingsFromConfig()); }
-        if ((on || VoiceMeterWanted(now)) && !steam::Ready() && !voiceSteamTried_) {   // Steam records the default microphone and decodes
+        if ((on || VoiceMeterWanted(now)) && !direct::Ready() && !voiceSteamTried_) {   // Steam records the default microphone and decodes
             voiceSteamTried_ = true;
-            if (!steam::Init()) HSM_LOG("voice: Steam is not running here; the microphone is recorded by the mod, Steam-compressed voices cannot be played");
+            if (!direct::Init()) HSM_LOG("voice: Steam is not running here; the microphone is recorded by the mod, Steam-compressed voices cannot be played");
         }
         const uint8_t me = MyEntity();
         if (on && now >= voiceVitalsAt_) {   // 10 Hz: my own fighter's consciousness, read here
@@ -6401,9 +6401,9 @@ private:
     // ------------------------------------------------------------------ host migration (session/hsm_migration.h)
     // The lobby's owner changed (Lobby::RefreshMembers): the old host left. The session closes at once (until the next
     // step this machine may be the lobby owner while its transport is still a client's) and waits for MigrationTick.
-    bool OnLobbyOwnerChanged(steam::SteamId old, steam::SteamId now) {
+    bool OnLobbyOwnerChanged(direct::UserId old, direct::UserId now) {
         if (!cfg_.hostMigration || SteamServer()) return false;
-        HSM_LOG("session: host migration: the lobby owner changed (%s)", now == steam::MySteamId() ? "now this machine" : "another member");
+        HSM_LOG("session: host migration: the lobby owner changed (%s)", now == direct::MyUserId() ? "now this machine" : "another member");
         BeginMigration(old);
         return true;
     }
@@ -6415,11 +6415,11 @@ private:
         if (migration_.Active()) return true;
         HSM_LOG("client: host lost; host migration: waiting up to %u s for Steam to name a new host", kMigrationOwnerWaitMs / 1000);
         ui::ShowLine("HSMMod", style::kBone, "The host is gone. Waiting for a new host...");
-        BeginMigration(hostSteam_);
+        BeginMigration(hostUser_);
         return true;
     }
 
-    void BeginMigration(steam::SteamId oldHost) {
+    void BeginMigration(direct::UserId oldHost) {
         if (!migration_.Active()) {
             migration_.Start(oldHost, NowMs());
             // The map to open again (the new host) or to wait in (the others): the fight level the old host had open.
@@ -6434,8 +6434,8 @@ private:
     void MigrationTick() {
         if (!migration_.Active()) return;
         const uint32_t now = NowMs();
-        const steam::SteamId owner = lobby_.InLobby() ? lobby_.owner() : 0;
-        switch (migration_.Tick(owner, steam::MySteamId(), lobby_.InLobby(), cfg_.hostMigration, now)) {
+        const direct::UserId owner = lobby_.InLobby() ? lobby_.owner() : 0;
+        switch (migration_.Tick(owner, direct::MyUserId(), lobby_.InLobby(), cfg_.hostMigration, now)) {
             case MigrationStep::BecomeHost:
                 HSM_LOG("session: host migration: this machine is the new host%s%s", migrateLevel_.empty() ? "" : "; reopening ",
                         migrateLevel_.c_str());
@@ -6446,7 +6446,7 @@ private:
                 break;
             case MigrationStep::FollowHost:
                 HSM_LOG("session: host migration: following the new host");
-                ui::ShowLine("HSMMod", style::kBone, "The host left. " + (steam::PersonaName(owner).empty() ? std::string("Another player") : steam::PersonaName(owner)) + " is the new host.");
+                ui::ShowLine("HSMMod", style::kBone, "The host left. " + (direct::PersonaName(owner).empty() ? std::string("Another player") : direct::PersonaName(owner)) + " is the new host.");
                 ResetNetwork("host migration");
                 OnLobbyEntered();                 // a client of the new owner: Hello, Welcome (migration_.Welcomed)
                 break;
@@ -6762,17 +6762,17 @@ private:
     // ------------------------------------------------------------------ mesh (client side)
     // Whether an event is the host's session or stream. Only the lobby owner's Steam ID is the host; every other peer a
     // Steam client has is a mesh peer the host's PeerMap named.
-    bool FromHost(const NetEvent& ev) const { return !steamNet_ || ev.steamId == hostSteam_; }
+    bool FromHost(const NetEvent& ev) const { return !directNet_ || ev.steamId == hostUser_; }
 
     // Pose and Vitals go direct only with the mesh on; with per-player pings alone the peers are only pinged.
     void RefreshMeshSend() { meshSend_ = meshOn_ ? meshPeers_.Peers() : std::vector<uint32_t>{}; }
 
-    // The host's roster of mesh peers: allow the new ones (both ends allow each other, so SteamTransport admits them),
+    // The host's roster of mesh peers: allow the new ones (both ends allow each other, so DirectTransport admits them),
     // close the ones that went, and report what is heard again.
     void ApplyPeerMap(const PeerMapMsg& m) {
-        const MeshPeers::Change c = meshPeers_.Apply(m, mySlot_, steam::MySteamId(), hostSteam_);
-        for (uint64_t id : c.drop) steamNet_->DropPeer(id);
-        for (uint64_t id : c.want) meshPeers_.Bind(id, steamNet_->AllowPeer(id));
+        const MeshPeers::Change c = meshPeers_.Apply(m, mySlot_, direct::MyUserId(), hostUser_);
+        for (uint64_t id : c.drop) directNet_->DropPeer(id);
+        for (uint64_t id : c.want) meshPeers_.Bind(id, directNet_->AllowPeer(id));
         RefreshMeshSend();
         meshHearing_.Invalidate();
         HSM_LOG("client: mesh: %zu direct peers (%zu new, %zu gone)", meshPeers_.Named(), c.want.size(), c.drop.size());
@@ -7103,8 +7103,8 @@ private:
                             w.modBuild.c_str(), game::ModBuild().c_str());
                 if (!streams_.Started()) StartOwner();   // a repeated Welcome keeps the stream clock
                 if (migration_.step() == MigrationStep::Following) { migration_.Welcomed(); migrateBoard_ = ScoreCarry{}; migrateObjects_.clear(); HSM_LOG("client: host migration done"); }
-                meshOn_ = cfg_.mesh && steamNet_ && (w.flags & kWelcomeMesh);
-                peerPingOn_ = cfg_.peerPing && steamNet_ && (w.flags & kWelcomePeerPing);
+                meshOn_ = cfg_.mesh && directNet_ && (w.flags & kWelcomeMesh);
+                peerPingOn_ = cfg_.peerPing && directNet_ && (w.flags & kWelcomePeerPing);
                 if (!meshOn_ && !peerPingOn_ && meshPeers_.Named()) ApplyPeerMap(PeerMapMsg{});   // the host stopped offering it
                 RefreshMeshSend();
                 if (meshOn_ || peerPingOn_) HSM_LOG("client: mesh %s, per-player pings %s", meshOn_ ? "on" : "off", peerPingOn_ ? "on" : "off");
@@ -7270,7 +7270,7 @@ private:
     const bool localFighter_ = cfg_.role != Role::Server;
     game::Lobby lobby_;
     std::unique_ptr<ITransport> net_;
-    SteamTransport* steamNet_ = nullptr;
+    DirectTransport* directNet_ = nullptr;
     game::Adapter adapter_;
     game::Mirror mirror_;
     game::SaveGuard saveGuard_;                      // the player's GameProgress, kept out of the session
@@ -7428,10 +7428,10 @@ private:
     uint8_t chatPhase_ = 0;   // the match phase the chat last saw (MatchPhase)
     // client
     uint32_t hostPeer_ = 0, uploadId_ = 0;
-    // Mesh (session/hsm_mesh.h). Client: hostSteam_ is the lobby owner (the only host peer); meshPeers_ the other clients the
+    // Mesh (session/hsm_mesh.h). Client: hostUser_ is the lobby owner (the only host peer); meshPeers_ the other clients the
     // PeerMap named; meshSend_ their transport peers; meshHearing_ which of them arrive directly. Host: meshMasks_ per
     // client, and the PeerMap goes out when the roster changed.
-    uint64_t hostSteam_ = 0;
+    uint64_t hostUser_ = 0;
     bool meshOn_ = false, peerMapDirty_ = false;
     MeshPeers meshPeers_;
     std::vector<uint32_t> meshSend_;

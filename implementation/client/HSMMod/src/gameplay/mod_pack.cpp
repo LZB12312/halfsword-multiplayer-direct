@@ -6,7 +6,7 @@
 namespace hsm::game::modpack {
 namespace {
 std::string g_configured;
-steam::SteamId g_decidedFor = 0;     // the lobby the host has already decided about
+direct::UserId g_decidedFor = 0;     // the lobby the host has already decided about
 std::string g_lastJoinLog;
 
 const char* Reason(const PackCheck& c) {

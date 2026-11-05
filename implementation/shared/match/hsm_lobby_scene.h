@@ -609,12 +609,12 @@ inline LobbyScene BuildLobbyScene(const LobbyLocal& l) {
     s.me = l.myName;
     s.badge = "v" + l.version + " \xC2\xB7 protocol " + std::to_string(int(kProtocolRevision));
     switch (l.phase) {
-        case LobbyPhase::Offline: s.pill = {"Steam not ready", style::kWarn}; break;
+        case LobbyPhase::Offline: s.pill = {"Network not ready", style::kWarn}; break;
         case LobbyPhase::Idle: s.pill = {"Not in a lobby", style::kIron}; break;
         case LobbyPhase::Creating: s.pill = {"Creating a lobby", style::kWarn}; break;
         case LobbyPhase::Joining: s.pill = {"Joining a lobby", style::kWarn}; break;
         case LobbyPhase::InLobby: {
-            if (l.host) { s.pill = {l.publicLobby ? "Hosting \xC2\xB7 public" : "Hosting \xC2\xB7 friends", style::kOk}; break; }
+            if (l.host) { s.pill = {"Hosting via direct UDP", style::kOk}; break; }
             std::string owner;
             for (const LobbyPlayer& p : l.players) if (p.host) owner = p.name;
             s.pill = {owner.empty() ? std::string("In a lobby") : "In " + owner + "'s lobby", style::kOk};

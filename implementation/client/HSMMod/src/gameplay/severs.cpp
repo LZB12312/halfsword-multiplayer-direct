@@ -1,4 +1,5 @@
 #include "gameplay/severs.h"
+#include "gameplay/combat_sync.h"
 #include "log.h"
 #include "session/hsm_authority.h"
 #include "sync/hsm_grab.h"
@@ -29,7 +30,6 @@ constexpr const char* kInProcess = "Dismemberment In Process";        // set by 
                                                                       // cleared 0.5 s after Delayed finishes (8514)
 constexpr const char* kCurrentPart = "Currently Dismembered Part";
 constexpr const char* kNoDismember = "Force Disable Dismemberment";   // the stand-in rig re-asserts it every frame
-constexpr double kLateShowMs = 300;          // a claim this late after the owner reported its part still shows natively
 constexpr double kRetryMs = 2000;            // a sever refused for another in process waits this long for it to finish
 constexpr double kBlockedDelayedMs = 1000;   // a blocked Initiate's Delayed follows 0.1 s later; remembered this long
 constexpr size_t kMaxBlockedOnMine = 64;
@@ -400,7 +400,7 @@ Severs::Run Severs::Begin(UObject* willie, const SeverClaim& c, double nowMs, bo
         DestroyBoxes(a);
         return before ? Run::InProcess : Run::Refused;
     }
-    due_.push_back(DueDelayed{nowMs + combat::kSeverDelayedMs, std::move(a), c.victim, standIn, c.claimId});
+    due_.push_back(DueDelayed{nowMs + combat::kSeverDelayedMs, std::move(a), c.victim, standIn, c.claimId, c});
     return Run::Accepted;
 }
 
@@ -495,6 +495,22 @@ void Severs::CallDelayed(DueDelayed& d) {
         return;
     }
     ++n_.delayed;
+    if (!d.standIn) {
+        // Replay bypasses the native post-hook, so OwnCutDone cannot announce
+        // this accepted cut. Send the owner's confirmed geometry reliably too.
+        const bool confirmed = (ReadSeveredMask(a.willie.obj) & (1u << a.part)) != 0;
+        HSM_LOG("severs: owner e%u part %u Delayed completed; severed bit %s", d.entity, a.part, confirmed ? "set" : "missing");
+        if (confirmed && env_.sendNotice) {
+            SeverClaim notice = d.claim;
+            notice.attacker = notice.victim;
+            notice.claimId = ++nextClaimId_[notice.victim];
+            notice.attackerTsMs = streams_->ClockMs(SteadyNowMs());
+            notice.source = StrikeSource::Body;
+            notice.weaponComponent.clear();
+            env_.sendNotice(notice);
+            ++n_.noticed;
+        }
+    }
 }
 
 void Severs::DestroyBoxes(const Rebuilt& a) {
@@ -566,7 +582,7 @@ void Severs::RunRetries(double nowMs) {
             continue;
         }
         // A stand-in shows a part natively only as late as a late claim may (the gore fallback shows it after that).
-        if (take.standIn && nowMs - bitAtMs_[take.claim.victim][take.claim.part] > kLateShowMs) {
+        if (take.standIn && !combat::NativeSeverDisplayFresh(take.claim.part, nowMs - bitAtMs_[take.claim.victim][take.claim.part])) {
             ++n_.retryLost;
             continue;
         }
@@ -584,7 +600,7 @@ void Severs::Remember(const SeverClaim& c, double nowMs) {
     pending_.Put(c, nowMs);
     // The owner's vitals may have reported the part already (they travel unreliably and faster than a resent claim).
     const uint32_t bit = 1u << c.part;
-    if ((severed_[c.victim] & bit) && !(shownMask_[c.victim] & bit) && nowMs - bitAtMs_[c.victim][c.part] <= kLateShowMs) {
+    if ((severed_[c.victim] & bit) && !(shownMask_[c.victim] & bit) && combat::NativeSeverDisplayFresh(c.part, nowMs - bitAtMs_[c.victim][c.part])) {
         SeverClaim taken;
         if (pending_.Take(c.victim, c.part, nowMs, taken)) Show(taken, nowMs, true);
     }

@@ -145,7 +145,7 @@ static void TestSelectFormat() {
 static void TestPill() {
     LobbyLocal l; l.version = "0.2.0";
     LobbyScene s = BuildLobbyScene(l);
-    CHECK(s.pill.text == "Steam not ready" && Same(s.pill.color, kWarn));
+    CHECK(s.pill.text == "Network not ready" && Same(s.pill.color, kWarn));
     CHECK(!s.idle && !s.in);
     l.phase = LobbyPhase::Idle;
     s = BuildLobbyScene(l);
@@ -159,9 +159,9 @@ static void TestPill() {
 
     LobbyLocal h = InLobby(true);
     s = BuildLobbyScene(h);
-    CHECK(s.pill.text == "Hosting " + kDot + " friends" && Same(s.pill.color, kOk) && s.in && !s.idle);
+    CHECK(s.pill.text == "Hosting via direct UDP" && Same(s.pill.color, kOk) && s.in && !s.idle);
     h.publicLobby = true;
-    CHECK(BuildLobbyScene(h).pill.text == "Hosting " + kDot + " public");
+    CHECK(BuildLobbyScene(h).pill.text == "Hosting via direct UDP");
     LobbyLocal m = InLobby(false);
     s = BuildLobbyScene(m);
     CHECK(s.pill.text == "In Ann's lobby" && Same(s.pill.color, kOk));

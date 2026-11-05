@@ -57,7 +57,7 @@ struct TabView { Card card; Text label; Panel line; };   // MODE | RULES | MAP: 
 // A player's Steam avatar as an engine texture, made once and kept while the engine keeps it (an Image's brush holds
 // it; one no row shows any more is collected, and made again when it is needed).
 struct Avatar {
-    steam::SteamId id = 0;
+    direct::UserId id = 0;
     UObject* texture = nullptr;
     UClass* cls = nullptr;                           // with index: the slot still holds this texture
     int32_t index = -1;
@@ -111,6 +111,7 @@ struct State {
     Text reportHow;                              // how to report from a fight (/bug)
     Box reportBox;
     EditBox reportText;
+    EditBox connectText;
     Text reportNote;
     uint32_t reportSeen = 0;   // Session::ReportStatusSeq last shown in reportNote
     bool reportOpenNow = false;
@@ -140,7 +141,7 @@ struct State {
     std::vector<BrowserView> rows;           // kBrowserRows
     std::vector<uint64_t> rowLobbies;        // the Steam lobby each shown row joins
     std::vector<MemberView> members;         // kMaxLobbyMembers
-    std::vector<steam::SteamId> memberIds;
+    std::vector<direct::UserId> memberIds;
     std::vector<Avatar> avatars;
     bool avatarFailLogged = false;
     std::vector<ModeView> modes;             // kModeOrder, then Brawl, then Progression
@@ -363,10 +364,14 @@ void BuildChat(Box& left) {
 void BuildIdleLeft() {
     Box& col = g.idleLeft;
     Section(col, "HOST A LOBBY", 0);
-    g.hostFriends = MakeHost("HOST FOR FRIENDS", "Friends join through Steam or your invite. It is not listed for anyone else.");
-    g.hostPublic = MakeHost("HOST PUBLIC", "Listed in the public lobbies for anyone with the mod.");
+    g.hostFriends = MakeHost("HOST DIRECT", "Host on your UDP port. UPnP is attempted when enabled; manual forwarding also works.");
+    g.hostPublic = MakeHost("JOIN ADDRESS", "Enter the host IPv4 address or hostname below, with :port if needed.");
     for (HostView* h : {&g.hostFriends, &g.hostPublic})
         if (h->card) AddToVerticalBox(col, h->card.button, 10).Align(HAlign::Fill, VAlign::Fill);
+    g.connectText = g.kit.MakeEditBox();
+    g.connectText.Hint("Host IPv4 or hostname:27015");
+    g.connectText.Set(direct::ConnectAddress());
+    AddToVerticalBox(col, g.connectText, 10);
     g.idleHint = NewText("Host a lobby or join one to choose the mode and the map.", 15, style::kMenuDim);
     if (g.idleHint) { g.idleHint.Wrap(true); AddToVerticalBox(col, g.idleHint, 18); }
 }
@@ -378,11 +383,11 @@ void BuildIdleRight() {
     Box head = g.kit.MakeRow(), chips = g.kit.MakeRow(), list = g.kit.MakeScroll();
     if (!head || !chips || !list) { HSM_LOG("ui: the lobby browser could not be made"); return; }
     AddToVerticalBox(col, head, 0);
-    Text title = NewText("PUBLIC LOBBIES", 15, style::kMenuAccentInk);
+    Text title = NewText("CONFIGURED HOST", 15, style::kMenuAccentInk);
     if (title) AddToHorizontalBox(head, title, 0, 16).Align(HAlign::Left, VAlign::Center);
     g.browserCount = NewText("", 14, style::kMenuDim);
     if (g.browserCount) AddToHorizontalBox(head, g.browserCount, 1, 12).Align(HAlign::Left, VAlign::Center);
-    g.refresh = MakeFlat("REFRESH", 15, {14, 5, 14, 5});
+    g.refresh = MakeFlat("SHOW CONNECT ADDRESS", 15, {14, 5, 14, 5});
     AddFlatH(head, g.refresh, 0);
     AddToVerticalBox(col, chips, 12);
     for (Flat& c : g.chips) {
@@ -460,7 +465,7 @@ void BuildInLeft() {
     }
     g.memberIds.assign(g.members.size(), 0);
     Box actions1 = g.kit.MakeRow(), actions2 = g.kit.MakeRow();
-    g.invite = MakeFlat("INVITE FRIENDS", 15, {14, 6, 14, 6});
+    g.invite = MakeFlat("SHOW CONNECTION INFO", 15, {14, 6, 14, 6});
     g.readyUp = MakeFlat("Mark me ready", 15, {14, 6, 14, 6});
     g.balance = MakeFlat("AUTO-BALANCE", 15, {14, 6, 14, 6});
     g.leave = MakeFlat("LEAVE LOBBY", 15, {14, 6, 14, 6});
@@ -893,8 +898,8 @@ LobbyLocal Local(game::Lobby& lobby) {
     LobbyLocal l;
     l.phase = PhaseOf(lobby.state());
     l.host = lobby.IsHost();
-    l.publicLobby = lobby.type() == steam::LobbyType::Public;
-    l.myName = steam::PersonaName(steam::MySteamId());
+    l.publicLobby = lobby.type() == direct::LobbyType::Public;
+    l.myName = direct::PersonaName(direct::MyUserId());
     l.status = lobby.status();
     l.version = game::kModVersion;
     l.myBuild = game::ModBuild();
@@ -916,7 +921,7 @@ LobbyLocal Local(game::Lobby& lobby) {
         for (const game::LobbyMember& m : lobby.members()) {
             if (server && m.host) continue;   // role=server: the server is not a player
             LobbyPlayer p;
-            p.name = m.name; p.host = m.host; p.ready = m.ready; p.me = m.id == steam::MySteamId();
+            p.name = m.name; p.host = m.host; p.ready = m.ready; p.me = m.id == direct::MyUserId();
             p.team = m.team; p.hostOverride = m.hostOverride; p.build = m.build;
             l.players.push_back(p);
         }
@@ -1091,7 +1096,7 @@ void Draw(const LobbyScene& s) {
 UObject* ImportAvatar(int image) {
     uint32_t w = 0, h = 0;
     std::vector<uint8_t> rgba;
-    if (!steam::AvatarRGBA(image, w, h, rgba)) return nullptr;
+    if (!direct::AvatarRGBA(image, w, h, rgba)) return nullptr;
     std::vector<uint8_t> file = RgbaToBmp(rgba.data(), rgba.size(), w, h);
     UObject* cls = FindObject("KismetRenderingLibrary", "Class");
     UObject* lib = cls ? DefaultObject(reinterpret_cast<UClass*>(cls)) : nullptr;
@@ -1104,7 +1109,7 @@ UObject* ImportAvatar(int image) {
 
 // The player's avatar texture, or null while there is none (yet): Steam answers -1 while it fetches an avatar, so a
 // miss is asked again a second later, kAvatarTries times.
-UObject* AvatarFor(steam::SteamId id, ULONGLONG now) {
+UObject* AvatarFor(direct::UserId id, ULONGLONG now) {
     Avatar* a = nullptr;
     for (Avatar& e : g.avatars) if (e.id == id) a = &e;
     if (!a) { g.avatars.push_back(Avatar{id}); a = &g.avatars.back(); }
@@ -1113,7 +1118,7 @@ UObject* AvatarFor(steam::SteamId id, ULONGLONG now) {
     if (now < a->nextTry || a->tries >= kAvatarTries) return nullptr;
     ++a->tries;
     a->nextTry = now + 1000;
-    int image = steam::MediumAvatar(id);
+    int image = direct::MediumAvatar(id);
     if (image == 0) { a->tries = kAvatarTries; return nullptr; }   // no avatar set
     if (image < 0) return nullptr;
     a->texture = ImportAvatar(image);
@@ -1361,7 +1366,7 @@ void HandleClicks(Session& session) {
         Paint(g.pwOk.card); Paint(g.pwCancel.card);
         SetLobbyTyping(focused);
         if (!ok && !cancel) return;
-        const steam::SteamId id = lobby.PasswordAsk();
+        const direct::UserId id = lobby.PasswordAsk();
         const std::string typed = CleanPassword(g.pwText.Value());
         if (ok && !cancel && typed.empty()) { g.pwNote.Set("Type the password first."); g.pwText.Focus(); return; }
         g.pwOpen = false; g.pw.Show(false); g.pwText.Clear(); SetLobbyTyping(false);
@@ -1419,12 +1424,13 @@ void HandleClicks(Session& session) {
     if (act(Clicked(g.helpToggle.card), g.settingsShown)) session.SetHelpImprove(!help);
     if (g.settingsShown) g.voice.Tick(session);
     HandleChat(session, s.in && !g.settingsShown);
+    if (s.idle && g.connectText.Focused()) SetLobbyTyping(true);
     HandlePassword(session, s.hostPassword && !g.settingsShown);
     HandleDamage(lobby, s, acted);               // after the two boxes: its own text box keeps the hotkeys off too
 
     // Not in a lobby: hosting, the browser and its filters.
-    if (act(Clicked(g.hostFriends.card), s.idle)) lobby.Host(steam::LobbyType::FriendsOnly);
-    if (act(Clicked(g.hostPublic.card), s.idle)) lobby.Host(steam::LobbyType::Public);
+    if (act(Clicked(g.hostFriends.card), s.idle)) lobby.Host(direct::LobbyType::FriendsOnly);
+    if (act(Clicked(g.hostPublic.card), s.idle)) lobby.JoinAddress(g.connectText.Value());
     if (act(Clicked(g.refresh.card), s.idle)) lobby.RefreshList();
     for (size_t i = 0; i < g.chips.size(); ++i)
         if (act(Clicked(g.chips[i].card), s.idle && i < s.filters.size())) g.filter = ToggleFilter(g.filter, i);
@@ -1466,7 +1472,7 @@ void HandleClicks(Session& session) {
             lobby.SetMaxPlayers(StepPlayerLimit(lobby.MaxPlayers(), lobby.PlayerCount(), dir));
         } else if (row->id == LobbyRow::MyTeam) {
             int mine = kNoTeam;
-            for (const game::LobbyMember& m : lobby.members()) if (m.id == steam::MySteamId()) mine = m.team;
+            for (const game::LobbyMember& m : lobby.members()) if (m.id == direct::MyUserId()) mine = m.team;
             lobby.SetTeamPick(StepTeamPick(int8_t(mine), teams, dir));
         } else if (row->id == LobbyRow::Scenario) {  // the scenarios the picked map offers (match/hsm_scenarios.h)
             c.scenario = StepScenario(s.scenarioMap, c.scenario, dir);
