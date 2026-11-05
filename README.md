@@ -9,7 +9,7 @@ The game's own distribution, launcher and supported executable requirements are 
 
 Based on Dudiebug/halfsword-multiplayer-mod commit
 `cb8c6646f361f1e1ccb81980108874bdf6fead27` (0.8.0-pre27).
-Fork version: **0.2.2**. Everyone must use this same fork and build.
+Fork version: **0.2.3**. Everyone must use this same fork and build.
 The upstream Steam mod cannot connect to it.
 
 ## Install

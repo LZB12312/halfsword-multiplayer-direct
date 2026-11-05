@@ -12,7 +12,7 @@ struct Ref {
     bool Live() const { return p && ObjectAt(index)==p && !IsGarbage(p); }
 };
 struct State {
-    Ref editor,preview,camera,light,controller,pawn,view;
+    Ref editor,preview,camera,light,controller,pawn,view,floor;
     struct HiddenMenu { Ref widget; uint8_t visibility; };
     std::vector<HiddenMenu> hiddenMenus;
     Kit kit; mp::Flat back;
@@ -64,7 +64,7 @@ void Close(game::Adapter& a,bool restoreView) {
         if(s.view.Live()) Call(s.controller.p,"SetViewTargetWithBlend").set<UObject*>("NewViewTarget",s.view.p).set<float>("BlendTime",0).invoke();
         if(s.haveControlRotation) Call(s.controller.p,"SetControlRotation").set<FRotator>("NewRotation",s.controlRotation).invoke();
     }
-    for(auto* r:{&s.preview,&s.camera,&s.light}) if(r->Live()) a.DestroyActor(r->p);
+    for(auto* r:{&s.preview,&s.camera,&s.light,&s.floor}) if(r->Live()) a.DestroyActor(r->p);
     if(restoreView) SetBool(a.GameInstance(),"Free Mode Activated",s.freeMode);
     // The stock Back button creates these; our lobby supplies their replacement.
     for(const char* cls:{"UI_Hub_Tavern_C","UI_Tevern_LowerPanel_C"})
@@ -93,6 +93,22 @@ std::string Open(game::Adapter& a,UObject* context) {
         s.haveControlRotation=rotation.invoke();
         if(s.haveControlRotation) s.controlRotation=rotation.get<FRotator>("ReturnValue");
     }
+    // DressUp pins its capsule but still simulates the skeletal body. Unlike
+    // the Tavern, the menu world has no floor at our preview location.
+    s.floor.Set(a.SpawnActorAt(FindClass("Actor"),{5000,5000,880},{}));
+    UObject* support=nullptr;
+    if(s.floor.Live()) {
+        Call add(s.floor.p,"AddComponentByClass");
+        add.set<UClass*>("Class",FindClass("BoxComponent")).set<bool>("bManualAttachment",false)
+           .set<FTransform>("RelativeTransform",FTransform{}).set<bool>("bDeferredFinish",false);
+        support=add.invoke()?add.get<UObject*>("ReturnValue"):nullptr;
+    }
+    if(!support) { Close(a); return "Could not create equipment preview floor"; }
+    Call(support,"SetBoxExtent").set<FVector>("InBoxExtent",{350,350,20}).set<bool>("bUpdateOverlaps",true).invoke();
+    Call(support,"SetCollisionObjectType").set<uint8_t>("Channel",0).invoke();
+    Call(support,"SetCollisionResponseToAllChannels").set<uint8_t>("NewResponse",2).invoke();
+    Call(support,"SetCollisionEnabled").set<uint8_t>("NewType",3).invoke();
+    Call(support,"K2_SetWorldLocation").set<FVector>("NewLocation",{5000,5000,880}).set<bool>("bSweep",false).set<bool>("bTeleport",true).invoke();
     s.preview.Set(a.SpawnActorAt(dress,{5000,5000,1000},{}));
     s.camera.Set(a.SpawnActorAt(camera,{5250,5000,1080},{0,180,0}));
     if(!s.controller.Live() || !s.preview.Live() || !s.camera.Live() || !TagInventory(s.preview.p) || !TagInventory(s.camera.p)) {
