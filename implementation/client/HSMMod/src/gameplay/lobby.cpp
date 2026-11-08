@@ -240,24 +240,24 @@ void Lobby::JoinAddress(const std::string& address) {
     SaveIniValues({{"connect",address}});
     Join(1);
 }
-void Lobby::HostIce(const std::string& token) {
+void Lobby::HostIce() {
     if (state_ != State::Idle) return;
     if (onlineBlock) if (const auto why = onlineBlock(hostPreset,hostBlock); !why.empty()) { SetStatus(why); return; }
     password_.clear(); passwordLobby_=askLobby_=0; askNote_.clear();
     type_=direct::LobbyType::Private;
     server_=false;
     state_=State::Creating;
-    SetStatus("Opening relay room...");
-    direct::CreateIceLobby(maxPlayers_,token);
+    SetStatus("Opening direct ICE room...");
+    direct::CreateIceLobby(maxPlayers_);
 }
 
-void Lobby::JoinIce(const std::string& token, const std::string& code) {
+void Lobby::JoinIce(const std::string& code) {
     if (state_ != State::Idle) return;
     password_.clear(); passwordLobby_=askLobby_=0; askNote_.clear();
     joining_=1;
     state_=State::Joining;
-    SetStatus("Connecting to relay room...");
-    direct::JoinIceLobby(token,code);
+    SetStatus("Connecting to direct ICE room...");
+    direct::JoinIceLobby(code);
 }
 
 void Lobby::Join(direct::UserId lobby, const std::string& password) {

@@ -28,17 +28,19 @@ This build includes upstream's UE4SS bundle and compatibility checks. Use `ue4ss
 under `[mod]` to disable automatic UE4SS installation and loading. Upstream lists
 crossbows as a known issue in pre40.
 
-## Relay rooms
+## Direct ICE rooms
 
-A build configured for relay rooms can host and join from **Multiplayer** using
-**Host Relay**, **Copy Room Code**, and **Join Room**. A registered relay invitation
-is needed on first use. Windows Credential Manager remembers it for that room
-service. Relay rooms send encrypted game traffic through the configured UDP TURN
-server and exchange only relay addresses. The existing **Direct IP** controls
-remain available for players choosing to share an address.
+Both players install the same build and open **Multiplayer**. Select **Host ICE**,
+then **Copy Room Code** and send the code privately. Your guest pastes it into
+the room-code field and selects **Join Room**.
 
-See [relay service setup](services/relay-signalling/README.md) for the operator
-configuration, test commands, and service limits.
+Direct ICE tries to connect the games over encrypted UDP without a port-forwarding
+step. The room service helps the two games connect, and players in the room can
+see each other's public IP addresses. Share the code with people you trust.
+Rooms expire after one hour. Some networks block direct UDP.
+
+The **Direct IP** section still supports an explicitly forwarded IPv4 address.
+See [room service setup](services/direct-rooms/README.md) for hosting details.
 
 ## Host
 

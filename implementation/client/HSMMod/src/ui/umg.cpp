@@ -492,13 +492,6 @@ EditBox Kit::MakeEditBox() {
     return e;
 }
 
-bool EditBox::Mask() {
-    if (!w_) return false;
-    if (SetBool(w_, "IsPassword", true)) return true;    // before the Slate widget is created
-    Call call(w_, "SetIsPassword");
-    return call.paramPtr("bIsPassword") && call.set<bool>("bIsPassword", true).invoke();
-}
-
 std::string EditBox::Value() const { return w_ ? ReadText(w_) : std::string(); }
 
 void EditBox::Clear() { if (w_) Call(w_, "SetText").set("InText", MakeText("")).invoke(); }

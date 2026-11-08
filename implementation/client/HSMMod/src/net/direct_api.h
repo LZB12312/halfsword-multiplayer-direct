@@ -57,8 +57,8 @@ std::string LaunchConnectLobby();        // "+connect_lobby <id>" from the comma
 // Lobbies (results arrive as Events)
 void CreateLobby(LobbyType type, int maxMembers);
 void JoinLobby(UserId lobby);
-void CreateIceLobby(int maxMembers, const std::string& token);
-void JoinIceLobby(const std::string& token, const std::string& room);
+void CreateIceLobby(int maxMembers);
+void JoinIceLobby(const std::string& room);
 bool IceActive();
 std::string IceRoomCode();
 void LeaveLobby(UserId lobby, bool keepIce = false);

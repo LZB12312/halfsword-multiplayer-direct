@@ -35,7 +35,7 @@ jobs:
       - name: Build DLL
         shell: pwsh
         env:
-          HSM_RELAY_SIGNALLING_HOST: ${{ vars.HSM_RELAY_SIGNALLING_HOST }}
+          HSM_ICE_SIGNALLING_HOST: ${{ vars.HSM_ICE_SIGNALLING_HOST }}
         run: ./implementation/client/HSMMod/build.ps1
       - name: Test direct transport, updater and sever recovery
         shell: pwsh
@@ -70,4 +70,8 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME dist/dwmapi.dll dist/dwmapi.dll.sha256 HalfSword-Direct-IP.zip --title "Half Sword Direct IP $env:GITHUB_REF_NAME" --generate-notes
+        run: |
+          $flags = @()
+          if ($env:GITHUB_REF_NAME -match '-pre\d+$') { $flags += '--prerelease' }
+          gh release create $env:GITHUB_REF_NAME dist/dwmapi.dll dist/dwmapi.dll.sha256 HalfSword-Direct-IP.zip --title "Half Sword Multiplayer $env:GITHUB_REF_NAME" --generate-notes @flags
+          exit $LASTEXITCODE

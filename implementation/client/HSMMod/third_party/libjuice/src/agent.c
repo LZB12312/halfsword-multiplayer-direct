@@ -98,8 +98,7 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 	bool alloc_failed = false;
 	agent->ice_tcp_mode = JUICE_ICE_TCP_MODE_NONE;
 	agent->config.concurrency_mode = config->concurrency_mode;
-	agent->config.relay_only = config->relay_only;
-	agent->config.stun_server_host = alloc_string_copy(config->relay_only ? NULL : config->stun_server_host, &alloc_failed);
+	agent->config.stun_server_host = alloc_string_copy(config->stun_server_host, &alloc_failed);
 	agent->config.stun_server_port = config->stun_server_port;
 	agent->config.bind_address = alloc_string_copy(config->bind_address, &alloc_failed);
 	agent->config.local_port_range_begin = config->local_port_range_begin;
@@ -243,11 +242,11 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	}
 
 	addr_record_t records[ICE_MAX_CANDIDATES_COUNT - 1];
-	int records_count = agent->config.relay_only ? 0 : conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
+	int records_count = conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
 	if (records_count < 0) {
 		JLOG_ERROR("Failed to gather local host candidates");
 		records_count = 0;
-	} else if (records_count == 0 && !agent->config.relay_only) {
+	} else if (records_count == 0) {
 		JLOG_WARN("No local host candidates gathered");
 	} else if (records_count > ICE_MAX_CANDIDATES_COUNT - 1)
 		records_count = ICE_MAX_CANDIDATES_COUNT - 1;
@@ -534,21 +533,6 @@ int agent_set_remote_description(juice_agent_t *agent, const char *sdp) {
 		}
 		conn_unlock(agent);
 		return JUICE_ERR_INVALID;
-	}
-
-	if (agent->config.relay_only) {
-		if (!remote.candidates_count) {
-			conn_unlock(agent);
-			return JUICE_ERR_INVALID;
-		}
-		for (int i = 0; i < remote.candidates_count; ++i) {
-			const ice_candidate_t *candidate = remote.candidates + i;
-			if (candidate->type != ICE_CANDIDATE_TYPE_RELAYED ||
-				candidate->transport != ICE_CANDIDATE_TRANSPORT_UDP || !candidate->resolved.len) {
-				conn_unlock(agent);
-				return JUICE_ERR_INVALID;
-			}
-		}
 	}
 
 	if (*agent->remote.ice_ufrag) {
@@ -1374,10 +1358,6 @@ int agent_verify_credentials(juice_agent_t *agent, const agent_stun_entry_t *ent
 
 int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_message_t *msg,
                         const addr_record_t *src, const addr_record_t *relayed) {
-	// A peer must never get a direct Binding response from a relay-only agent.
-	if (agent->config.relay_only && msg->msg_method == STUN_METHOD_BINDING && !relayed)
-		return -1;
-
 	if (msg->msg_method == STUN_METHOD_BINDING && msg->has_integrity) {
 		JLOG_VERBOSE("STUN message is from the remote peer");
 		// Verify the message now
@@ -1385,8 +1365,7 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 			JLOG_WARN("STUN message verification failed");
 			return -1;
 		}
-		if (!agent->config.relay_only &&
-		    agent_add_remote_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE,
+		if (agent_add_remote_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE,
 		                                         msg->priority, src)) {
 			JLOG_WARN("Failed to add remote peer reflexive candidate from STUN message");
 		}
@@ -2339,8 +2318,6 @@ int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t 
 
 int agent_add_local_reflexive_candidate(juice_agent_t *agent, ice_candidate_type_t type,
                                         const addr_record_t *record) {
-	if (agent->config.relay_only)
-		return 0;
 	if (type != ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE && type != ICE_CANDIDATE_TYPE_PEER_REFLEXIVE) {
 		JLOG_ERROR("Invalid type for local reflexive candidate");
 		return -1;
@@ -2434,12 +2411,6 @@ int agent_add_local_tcp_active_candidate(juice_agent_t *agent, addr_record_t *re
 
 int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // local may be NULL
                              ice_candidate_t *remote) {
-	if (agent->config.relay_only &&
-	    (!local || local->type != ICE_CANDIDATE_TYPE_RELAYED ||
-	     remote->type != ICE_CANDIDATE_TYPE_RELAYED ||
-	     remote->transport != ICE_CANDIDATE_TRANSPORT_UDP))
-		return 0;
-
 	ice_candidate_pair_t pair;
 	bool is_controlling = agent->mode == AGENT_MODE_CONTROLLING;
 	if (ice_create_candidate_pair(local, remote, is_controlling, &pair)) {

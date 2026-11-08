@@ -115,7 +115,6 @@ typedef struct juice_config {
 	juice_cb_recv_t cb_recv;
 
 	void *user_ptr;
-	int relay_only; // Gather and use only UDP relay-to-relay candidates.
 
 } juice_config_t;
 

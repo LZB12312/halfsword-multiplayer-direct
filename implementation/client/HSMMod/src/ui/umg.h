@@ -211,7 +211,6 @@ private:
 // EditableTextBox: a one-line text field the player types into (the game's own Slate text box).
 class EditBox : public Widget {
 public:
-    bool Mask();
     std::string Value() const;                // what is typed now (empty when it cannot be read)
     void Clear();
     void Hint(const std::string& s);          // greyed text shown while empty

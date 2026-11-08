@@ -1,9 +1,0 @@
-{
- "name":"halfsword-relay-signalling",
- "main":"worker.mjs",
- "compatibility_date":"2026-11-06",
- "durable_objects":{"bindings":[{"name":"ROOMS","class_name":"Room"},{"name":"GATE","class_name":"Gate"}]},
- "migrations":[{"tag":"v1","new_sqlite_classes":["Room","Gate"]}],
- "vars":{"ENABLED":"0","TURN_RELAY_IP":"","TURN_PORT":"3478","DAILY_CONNECTION_LIMIT":"2000","PER_IP_HOURLY_LIMIT":"60","ROOM_LIFETIME_SECONDS":"3600","MAX_MESSAGES":"512"},
- "observability":{"enabled":false}
-}

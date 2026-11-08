@@ -164,7 +164,7 @@ struct State {
     Text reportHow;                              // how to report from a fight (/bug)
     Box reportBox;
     EditBox reportText;
-    EditBox connectText, inviteToken, roomCode;
+    EditBox connectText, roomCode;
     Flat hostIce, joinIce, cancelIce;
     EditBox nameEdit;
     Box addressRow;
@@ -433,16 +433,14 @@ void BuildChat(Box& left) {
 // Not in a lobby, left: the two ways to host, big, and what comes next.
 void BuildIdleLeft() {
     Box& col = g.idleLeft;
-    Section(col, "RELAY ROOMS", 0);
-    g.inviteToken = g.kit.MakeEditBox();
-    if (!g.inviteToken.Mask()) g.inviteToken = EditBox{};
-    g.inviteToken.Hint("Relay invitation (blank uses saved token)");
+    Section(col, "DIRECT ICE", 0);
+    Text privacy = NewText("Players you connect to can see your public IP.", 15, style::kMenuDim);
+    if (privacy) { privacy.Wrap(true); AddToVerticalBox(col, privacy, 4); }
     g.roomCode = g.kit.MakeEditBox();
     g.roomCode.Hint("Room code from host");
-    AddToVerticalBox(col, g.inviteToken, 6);
     AddToVerticalBox(col, g.roomCode, 6);
     Box ice = g.kit.MakeRow();
-    g.hostIce = MakeFlat("HOST RELAY", 15);
+    g.hostIce = MakeFlat("HOST ICE", 15);
     g.joinIce = MakeFlat("JOIN ROOM", 15);
     g.cancelIce = MakeFlat("CANCEL", 15);
     AddFlatH(ice, g.hostIce, 8);
@@ -2195,7 +2193,7 @@ void HandleClicks(Session& session) {
     const auto code = direct::IceRoomCode();
     const auto share=direct::ShareAddress(), lan=direct::LanAddress();
     g.addressRow.Show(s.in);
-    g.ipLabel.Set(iceActive ? "RELAY ROOM: " + code : !share.empty()?"HOST IP: "+share:"Public IP not available yet"+ (lan.empty()?std::string():" | LAN: "+lan));
+    g.ipLabel.Set(iceActive ? "ICE ROOM: " + code : !share.empty()?"HOST IP: "+share:"Public IP not available yet"+ (lan.empty()?std::string():" | LAN: "+lan));
     g.copyIp.label.Set(iceActive ? "COPY ROOM CODE" : "COPY PUBLIC IP");
     Live(g.copyIp.card,iceActive ? !code.empty() : !share.empty()); Live(g.copyLan.card,!lan.empty());
     Paint(g.copyIp.card); Paint(g.copyLan.card); Paint(g.saveName.card); Paint(g.pasteAddress.card);
@@ -2211,7 +2209,7 @@ void HandleClicks(Session& session) {
         if(error.empty()) { ClosePage(); return; }
         g.featureNote.Set(error);
     }
-    if (s.idle && (g.connectText.Focused() || g.inviteToken.Focused() || g.roomCode.Focused())) SetLobbyTyping(true);
+    if (s.idle && (g.connectText.Focused() || g.roomCode.Focused())) SetLobbyTyping(true);
     const bool iceConnecting = iceActive && !s.in && !s.idle;
     g.cancelIce.card.button.Show(iceConnecting);
     Live(g.hostIce.card,s.idle);
@@ -2221,12 +2219,10 @@ void HandleClicks(Session& session) {
     Paint(g.cancelIce.card);
     if (act(Clicked(g.cancelIce.card),iceConnecting)) lobby.Leave();
     if (act(Clicked(g.hostIce.card),s.idle)) {
-        lobby.HostIce(g.inviteToken.Value());
-        g.inviteToken.Clear();
+        lobby.HostIce();
     }
     if (act(Clicked(g.joinIce.card),s.idle)) {
-        lobby.JoinIce(g.inviteToken.Value(),g.roomCode.Value());
-        g.inviteToken.Clear();
+        lobby.JoinIce(g.roomCode.Value());
     }
     HandlePassword(session, s.hostPassword && !g.settingsShown);
     HandleDamage(lobby, s, acted);               // after the two boxes: its own text box keeps the hotkeys off too

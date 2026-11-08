@@ -12,9 +12,9 @@ New-Item -ItemType Directory -Force build/obj | Out-Null
 $objects = @()
 $juice = 'third_party/libjuice'
 $inc += @("-I$juice/include","-I$juice/include/juice","-I$juice/src",'-DJUICE_STATIC','-DNO_SERVER')
-if ($env:HSM_RELAY_SIGNALLING_HOST) {
-    if ($env:HSM_RELAY_SIGNALLING_HOST -notmatch '^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$') { throw 'Invalid HSM_RELAY_SIGNALLING_HOST' }
-    $inc += "-DHSM_RELAY_SIGNALLING_HOST=L`"$env:HSM_RELAY_SIGNALLING_HOST`""
+if ($env:HSM_ICE_SIGNALLING_HOST) {
+    if ($env:HSM_ICE_SIGNALLING_HOST -notmatch '^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$') { throw 'Invalid HSM_ICE_SIGNALLING_HOST' }
+    $inc += "-DHSM_ICE_SIGNALLING_HOST=L`"$env:HSM_ICE_SIGNALLING_HOST`""
 }
 $sources = @('third_party/miniz/miniz.c','third_party/minhook/src/buffer.c','third_party/minhook/src/hook.c','third_party/minhook/src/trampoline.c','third_party/minhook/src/hde/hde64.c')
 $sources += @('callbacks','compress','host','list','packet','peer','protocol','win32') | ForEach-Object { "third_party/enet/$_.c" }

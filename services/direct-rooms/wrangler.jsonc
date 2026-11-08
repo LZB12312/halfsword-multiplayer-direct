@@ -1,0 +1,14 @@
+{
+  "name": "halfsword-direct-rooms",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-06",
+  "durable_objects": {
+    "bindings": [
+      {"name": "ROOMS", "class_name": "Room"},
+      {"name": "GATE", "class_name": "Gate"}
+    ]
+  },
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["Room", "Gate"]}],
+  "vars": {"ENABLED": "0"},
+  "observability": {"enabled": false}
+}

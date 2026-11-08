@@ -72,8 +72,8 @@ public:
     void Host(direct::LobbyType type, bool server = false);   // server: role=server, one member more (hsm_srv=1)
     void Join(direct::UserId lobby, const std::string& password = std::string());   // password: for a locked lobby (kept for this lobby only)
     void JoinAddress(const std::string& address);
-    void HostIce(const std::string& token);
-    void JoinIce(const std::string& token, const std::string& code);
+    void HostIce();
+    void JoinIce(const std::string& code);
     void Leave(bool keepIce = false);
     void Invite();
     bool SendChat(const std::string& text);        // to every member (Steam lobby chat); false: not in a lobby or Steam refused

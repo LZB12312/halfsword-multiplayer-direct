@@ -22,11 +22,11 @@ INC="-Isrc -I../../shared -I../../shared/protocol -Ithird_party/minhook/include 
 
 JUICE=third_party/libjuice
 INC="$INC -I$JUICE/include -I$JUICE/include/juice -I$JUICE/src -DJUICE_STATIC -DNO_SERVER"
-relay_flags=()
-if [ -n "${HSM_RELAY_SIGNALLING_HOST:-}" ]; then
-  [[ "$HSM_RELAY_SIGNALLING_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,251}[a-zA-Z0-9]$ ]] ||
-    { echo "Invalid HSM_RELAY_SIGNALLING_HOST" >&2; exit 2; }
-  relay_flags=(-DHSM_RELAY_SIGNALLING_HOST=L\"$HSM_RELAY_SIGNALLING_HOST\")
+ice_flags=()
+if [ -n "${HSM_ICE_SIGNALLING_HOST:-}" ]; then
+  [[ "$HSM_ICE_SIGNALLING_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,251}[a-zA-Z0-9]$ ]] ||
+    { echo "Invalid HSM_ICE_SIGNALLING_HOST" >&2; exit 2; }
+  ice_flags=(-DHSM_ICE_SIGNALLING_HOST=L\"$HSM_ICE_SIGNALLING_HOST\")
 fi
 JOBS=${BUILD_JOBS:-$(( ($(nproc 2>/dev/null || echo 2) + 1) / 2 ))}
 case "$JOBS" in ''|*[!0-9]*|0) echo "build: BUILD_JOBS must be a positive number" >&2; exit 2 ;; esac
@@ -59,7 +59,7 @@ for f in src/*.cpp src/*/*.cpp; do
   [ -e "$f" ] || continue
   desc=()
   if grep -q HSM_GIT_DESCRIBE "$f"; then desc=(-DHSM_GIT_DESCRIBE="\"$DESCRIBE\""); fi
-  compile "build/obj/$(echo "${f%.cpp}" | tr '/' '_').o" "$CXX" -std=c++20 $COMMON -Werror $INC "${relay_flags[@]}" "${desc[@]}" -c "$f"
+  compile "build/obj/$(echo "${f%.cpp}" | tr '/' '_').o" "$CXX" -std=c++20 $COMMON -Werror $INC "${ice_flags[@]}" "${desc[@]}" -c "$f"
 done
 wait
 failed=0

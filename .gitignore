@@ -10,6 +10,6 @@ dist/
 HalfSword-Direct-IP.zip
 
 # Local signalling configuration and Wrangler state.
-services/relay-signalling/.dev.vars*
+services/direct-rooms/.dev.vars*
 .wrangler/
-services/relay-signalling/node_modules/
+services/direct-rooms/node_modules/

@@ -17,12 +17,7 @@
 
 namespace hsm::direct {
 namespace {
-#ifndef HSM_RELAY_SIGNALLING_HOST
-#define HSM_RELAY_SIGNALLING_HOST L""
-#endif
 constexpr uint32_t kMagic = 0x48534431; // HSD1, separate from upstream Steam protocol
-// Leave room for encryption, TURN framing and UDP/IP headers.
-constexpr uint32_t kRelayMtu = 1200;
 constexpr size_t kFrameMax = 65536, kQueueMax = 4096;
 enum Op : uint8_t { Hello = 1, Snapshot, MemberUpdate, Chat, Game, Rejected };
 using Values = std::map<std::string, std::string>;
@@ -157,6 +152,10 @@ std::string Read(const wchar_t* key, const wchar_t* fallback) {
     wchar_t value[256]; GetPrivateProfileStringW(L"net",key,fallback,value,256,ModFilePath(L"HSMMod.ini").c_str());
     char out[1024]{}; WideCharToMultiByte(CP_UTF8,0,value,-1,out,sizeof out,nullptr,nullptr); return out;
 }
+#ifndef HSM_ICE_SIGNALLING_HOST
+#define HSM_ICE_SIGNALLING_HOST L"halfsword-direct-rooms.halfsword-private-signalling.workers.dev"
+#endif
+std::string IceService() { return Read(L"ice_signalling_host", HSM_ICE_SIGNALLING_HOST); }
 bool Endpoint(const std::string& s, ENetAddress& a) {
     auto colon=s.find(':'); auto name=s.substr(0,colon); std::string ps=colon==std::string::npos?std::to_string(b.port):s.substr(colon+1);
     if(name.empty() || ps.empty() || ps.find_first_not_of("0123456789")!=std::string::npos || ps.size()>5) return false;
@@ -171,7 +170,6 @@ bool BeginHost(int max, bool loopback) {
     if (loopback && enet_address_set_host_ip(&address,"127.0.0.1")) return false;
     b.host=enet_host_create(&address,16,kChanCount+1,0,0);
     if (!b.host) return false;
-    if (loopback) b.host->mtu=kRelayMtu;
     Limits(); b.hosting=true; b.members[1]={b.name,{}};
     return true;
 }
@@ -187,14 +185,13 @@ void BeginJoin(const std::string& endpoint, bool loopback) {
     if (loopback) enet_address_set_host_ip(&local,"127.0.0.1");
     b.host=enet_host_create(loopback?&local:nullptr,1,kChanCount+1,0,0);
     if (!b.host) { b.EventOf(Event::LobbyEntered,false,"Could not create UDP socket"); return; }
-    if (loopback) b.host->mtu=kRelayMtu;
     Limits();
     b.server=enet_host_connect(b.host,&address,kChanCount+1,kMagic);
     if (!b.server) { b.EventOf(Event::LobbyEntered,false,"Could not start connection"); return; }
     if (loopback) {
         ENetAddress bound{};
         if (enet_socket_get_address(b.host->socket,&bound) || !bound.port) {
-            b.Clear(); b.EventOf(Event::LobbyEntered,false,"Could not bind the relayed game connection"); return;
+            b.Clear(); b.EventOf(Event::LobbyEntered,false,"Could not bind the direct ICE game connection"); return;
         }
         net::ice::SetGamePort(bound.port);
     }
@@ -238,7 +235,7 @@ bool SetConnectAddress(const std::string& address) {
     }
     b.address=address; return true;
 }
-std::string ConnectionInfo() { if(b.iceRoom) return "Relay room " + IceRoomCode(); return "Hosting UDP " + std::to_string(b.port) + "; friends connect to your public IPv4:" + std::to_string(b.port) + ". UPnP result is in HSMMod.log."; }
+std::string ConnectionInfo() { if(b.iceRoom) return "Direct ICE room " + IceRoomCode(); return "Hosting UDP " + std::to_string(b.port) + "; friends connect to your public IPv4:" + std::to_string(b.port) + ". UPnP result is in HSMMod.log."; }
 std::string RemoteAddress(UserId user) {
     if (b.iceRoom) return {};  // the loopback hop is not a player identity
     auto* p=b.Peer(user); char addr[64]{};
@@ -287,7 +284,7 @@ void Tick() {
     for(auto it=b.pending.begin();it!=b.pending.end();) {
         if(enet_time_get()-it->second>5000) { enet_peer_disconnect_now(it->first,0); it=b.pending.erase(it); } else ++it;
     }
-    if(b.joinAt && enet_time_get()-b.joinAt>10000) { enet_peer_reset(b.server); b.server=nullptr; b.joinAt=0; b.EventOf(Event::LobbyEntered,false,b.iceRoom ? "Relay connected, but the host lobby did not respond" : "Connection timed out: check connect= address, UDP port forwarding and firewall"); }
+    if(b.joinAt && enet_time_get()-b.joinAt>10000) { enet_peer_reset(b.server); b.server=nullptr; b.joinAt=0; b.EventOf(Event::LobbyEntered,false,b.iceRoom ? "Direct ICE connected, but the host lobby did not respond" : "Connection timed out: check connect= address, UDP port forwarding and firewall"); }
     if(b.dirty) { b.dirty=false; for(auto& [p,id]:b.peers) b.StateTo(p,id); }
     enet_host_flush(b.host);
 }
@@ -310,21 +307,21 @@ void CreateLobby(LobbyType, int max) {
     HSM_LOG("direct: hosting UDP port %u (forward this UDP port manually if UPnP is unavailable)",b.port);
 }
 
-void CreateIceLobby(int max, const std::string& token) {
+void CreateIceLobby(int max) {
     b.Clear();
-    if (!BeginHost(max,true)) { b.EventOf(Event::LobbyCreated,false,"Could not bind the relay lobby port"); return; }
+    if (!BeginHost(max,true)) { b.EventOf(Event::LobbyCreated,false,"Could not bind the direct ICE lobby port"); return; }
     ENetAddress bound{};
     if (enet_socket_get_address(b.host->socket,&bound) || !bound.port) {
-        b.Clear(); b.EventOf(Event::LobbyCreated,false,"Could not bind the relay lobby port"); return;
+        b.Clear(); b.EventOf(Event::LobbyCreated,false,"Could not bind the direct ICE lobby port"); return;
     }
-    const auto error = net::ice::Start(Read(L"relay_signalling_host",HSM_RELAY_SIGNALLING_HOST),true,token,{},bound.port);
+    const auto error = net::ice::Start(IceService(),true,{},bound.port);
     if (!error.empty()) { b.Clear(); b.EventOf(Event::LobbyCreated,false,error); return; }
     b.iceRoom=b.icePending=true;
 }
 
-void JoinIceLobby(const std::string& token, const std::string& room) {
+void JoinIceLobby(const std::string& room) {
     b.Clear();
-    const auto error = net::ice::Start(Read(L"relay_signalling_host",HSM_RELAY_SIGNALLING_HOST),false,token,room,0);
+    const auto error = net::ice::Start(IceService(),false,room,0);
     if (!error.empty()) { b.EventOf(Event::LobbyEntered,false,error); return; }
     b.iceRoom=b.icePending=true;
 }
@@ -334,7 +331,7 @@ void JoinLobby(UserId) {
     const bool retry = b.iceRoom && !b.hosting && ice.phase == net::ice::Phase::Ready && ice.port;
     if (b.iceRoom && !retry) {
         b.Clear();
-        b.EventOf(Event::LobbyEntered,false,"Relay room closed. Join again with the room code");
+        b.EventOf(Event::LobbyEntered,false,"Direct ICE room closed. Join again with the room code");
         return;
     }
     b.Clear(retry);

@@ -17,7 +17,6 @@ int main(int argc,char** argv) {
     const std::string mode=argv[1];
     const bool ice=mode=="ice-host" || mode=="ice-client";
     const bool host=mode=="host" || mode=="ice-host";
-    const char* token = ice ? std::getenv("HSM_INVITE_TOKEN") : nullptr;
     if(mode=="lifecycle-host" || mode=="lifecycle-client") {
         const bool server=mode=="lifecycle-host"; int entered=0, chats=0; bool joining=!server;
         if(server) d::CreateLobby(d::LobbyType::Private,2); else d::JoinLobby(1);
@@ -52,11 +51,11 @@ int main(int argc,char** argv) {
         }
     }
     if(host) {
-        if (ice) d::CreateIceLobby(3,token ? token : "");
+        if (ice) d::CreateIceLobby(3);
         else d::CreateLobby(d::LobbyType::Private,3);
     } else if (ice) {
         CHECK(argc==3);
-        d::JoinIceLobby(token ? token : "",argv[2]);
+        d::JoinIceLobby(argv[2]);
     } else d::JoinLobby(1);
     bool joined=false, chat=false, large=false, unreliable=false, ready=false;
     std::set<d::UserId> seen, complete;
