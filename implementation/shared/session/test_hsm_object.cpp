@@ -334,6 +334,48 @@ static void TestReconcilerMotion() {
     CHECK(r8.Propose(Proposal(2, 1, kCls, 300, 0, 0), 2, 400.0).created);       // nothing moving was recorded
 }
 
+// WouldCreate decides as Propose does, motion included: the known place is carried forward to nowMs and matched with the
+// speed-grown tolerance. The spawn gate asks it before Propose, so a disagreement would gate a match as a spawn.
+static void TestWouldCreateMotion() {
+    const uint32_t kCls = 0x1111u;
+    ObjectReconciler r;
+    const uint64_t id = r.SpawnLocal(kCls, 0, 0, 0, 1);
+    r.UpdateMotion(id, 0, 0, 0, 2000.f, 0, 0, 1000.0);                       // 2000 cm/s along x, last read at t=1000
+    CHECK(!r.WouldCreate(Proposal(2, 1, kCls, 800, 0, 0), 1400.0));          // at t=1400 it is 800 cm on
+    CHECK(!r.WouldCreate(Proposal(2, 1, kCls, 1300, 0, 0), 1400.0));         // 500 off: within 100 + 0.4*2000 capped at 500
+    CHECK(r.WouldCreate(Proposal(2, 1, kCls, 1401, 0, 0), 1400.0));          // 601 off: past the grown tolerance
+    CHECK(r.WouldCreate(Proposal(2, 1, kCls, 800, 0, 0), 1000.0));           // no time passed: still at 0, 800 is out of reach
+    CHECK(r.WouldCreate(Proposal(2, 1, kCls, 800, 0, 0), -1.0));             // no clock: nothing carried forward
+    CHECK(r.WouldCreate(Proposal(2, 1, kCls, 20000, 0, 0), 11000.0));        // bounded: ten seconds on it is not 20000 cm away
+    CHECK(!r.WouldCreate(Proposal(2, 1, kCls, 1200, 0, 0), 11000.0));        // the bounded 600 ms of travel
+    CHECK(r.WouldCreate(Proposal(2, 1, 0x9999u, 800, 0, 0), 1400.0));        // another class never matches
+    // Agreement with Propose: a match is answered, not created, and an answered proposal is never a spawn again.
+    CHECK(!r.Propose(Proposal(2, 2, kCls, 1300, 0, 0), 2, 1400.0).created);
+    CHECK(!r.WouldCreate(Proposal(2, 2, kCls, 1300, 0, 0), -1.0));           // answered, whatever the clock
+    CHECK(r.Propose(Proposal(2, 3, kCls, 5000, 0, 0), 2, 1400.0).created);
+    CHECK(!r.WouldCreate(Proposal(2, 3, kCls, 5000, 0, 0), 1400.0));         // answered too
+    // A resting object keeps the plain tolerance whatever the clock.
+    ObjectReconciler r2; const uint64_t i2 = r2.SpawnLocal(kCls, 0, 0, 0, 1); r2.UpdateMotion(i2, 0, 0, 0, 0, 0, 0, 0.0);
+    CHECK(!r2.WouldCreate(Proposal(2, 1, kCls, kCensusMatchUu, 0, 0), 100.0));
+    CHECK(r2.WouldCreate(Proposal(2, 1, kCls, kCensusMatchUu + 1.f, 0, 0), 100.0));
+}
+
+static void TestSetBodyCount() {
+    ObjectReconciler r(0);
+    ObjectAnnounceMsg p = Proposal(2, 1, 0x2222u, 100, 0, 0);
+    p.bodyCount = 3;                                          // what the proposer counted
+    const auto m = r.Propose(p, 2);
+    CHECK(m.created);
+    ObjectAnnounceMsg out;
+    CHECK(r.AnnounceOf(m.objId, out) && out.bodyCount == 3);
+    r.SetBodyCount(m.objId, 22);                              // the host's actor has 22
+    CHECK(r.AnnounceOf(m.objId, out) && out.bodyCount == 22);
+    r.SetBodyCount(m.objId, 0);                               // NEGATIVE CONTROL: no count to take
+    CHECK(r.AnnounceOf(m.objId, out) && out.bodyCount == 22);
+    r.SetBodyCount(MakeSpawnedId(0, 999), 7);                 // an object it does not know: nothing happens
+    CHECK(!r.Knows(MakeSpawnedId(0, 999)));
+}
+
 static void TestAdopt() {
     const uint32_t kCls = 0x1111u;
     // An old host's canonical announces, as every machine heard them.
@@ -391,7 +433,7 @@ static void TestAdopt() {
 int main() {
     TestIdSpaces(); TestMinter(); TestBodyIndex(); TestAnnounceWire(); TestBodyStateWire(); TestBodyStateViewPerBody();
     TestReconciler(); TestGhosts();
-    TestMotionHelpers(); TestReconcilerMotion(); TestAdopt();
+    TestMotionHelpers(); TestReconcilerMotion(); TestWouldCreateMotion(); TestAdopt(); TestSetBodyCount();
     if (g_fail) { std::printf("%d FAILED\n", g_fail); return 1; }
     std::printf("all object tests passed\n");
     return 0;

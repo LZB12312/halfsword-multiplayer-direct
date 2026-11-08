@@ -1,3 +1,4 @@
+#include "log.h"
 #include "gameplay/claims.h"
 #include "sync/hsm_grab.h"
 #include "util/hsm_names.h"
@@ -146,6 +147,23 @@ bool Claims::OnDealComplexDamage(ScriptCall& c) {
     UObject* self = c.self();
     UObject* comp = nullptr;
     c.get("Collided Component", comp);
+    {
+        UObject* const by = comp ? adapter_->FighterOf(OuterOf(comp)) : nullptr;
+        const bool selfStandIn = standIns_->EntityOf(self) != 0, selfMine = env_.ownedEntity(self) != 0;
+        const bool byStandIn = by && standIns_->IsStandIn(by), byMine = by && env_.ownedEntity(by) != 0;
+        ++contacts_.all;
+        ++(selfStandIn ? contacts_.onStandIn : selfMine ? contacts_.onMine : contacts_.onOther);
+        ++(byStandIn ? contacts_.byStandIn : byMine ? contacts_.byMine : contacts_.byNobody);
+        if (contacts_.detailed < 40 && !(selfMine && byMine)) {
+            ++contacts_.detailed;
+            FVector impulse{}, velocity{};
+            double cutting = 0, rigidity = 0;
+            c.get("Hit Impulse", impulse); c.get("Hit Velocity", velocity); c.get("Cutting Power", cutting); c.get("Rigidity", rigidity);
+            HSM_LOG("contact: on %s (%s) by %s/%s (%s): impulse %.0f, velocity %.0f, cutting %.2f, rigidity %.2f", ObjectName(self).c_str(), selfStandIn ? "stand-in" : selfMine ? "mine" : "other",
+                    comp ? ObjectName(OuterOf(comp)).c_str() : "none", comp ? ObjectName(comp).c_str() : "none", byStandIn ? "stand-in" : byMine ? "mine" : "nobody",
+                    std::sqrt(impulse.x * impulse.x + impulse.y * impulse.y + impulse.z * impulse.z), std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z), cutting, rigidity);
+        }
+    }
     // A prop a hand holds is no prop here (PropOf): its blow is its holder's. A thrown weapon is a prop before it is its
     // Last Parent's (FighterOf).
     ObjectSync::Touch prop;
@@ -237,6 +255,7 @@ bool Claims::OnDealComplexDamage(ScriptCall& c) {
 // still did 700-840), so it, not the impulse, decides which contacts of one blow become claims (SendPending).
 void Claims::AfterDealComplexDamage(ScriptCall& c) {
     if (!pending_.standIn || c.self() != pending_.standIn) return;
+    ++(c.get<double>("Damage Out") > 0.0 ? contacts_.afterSome : contacts_.afterZero);
     SendPending(c);
 }
 
@@ -459,6 +478,13 @@ bool Claims::BoneXform(UObject* mesh, FName bone, Xform& out) const {
 void Claims::Replay(const HitClaim& c, double nowMs) {
     if (!active_) return;
     if (!dedupe_.Accept(c.attacker, c.claimId)) { ++n_.dupes; return; }
+    if (!ClaimValuesSane(c) || !blowGate_.Allow(c.attacker, nowMs)) {
+        if (++n_.refused <= 5 || n_.refused % 1000 == 0)
+            HSM_LOG("claims: refused #%u from e%u: %s (%llu refused so far)", c.claimId, c.attacker, ClaimValuesSane(c) ? "too many blows" : "impossible numbers", static_cast<unsigned long long>(n_.refused));
+        return;
+    }
+    // If the game crashes on this blow, the crash log names who it came from.
+    NoteLastBlow(c.attacker, static_cast<int>(c.striker), static_cast<int>(c.source), c.strikeComponent.c_str(), c.hitBone.c_str());
     int64_t ownerNow = 0;
     if (standIns_->OwnerClockNow(c.attacker, nowMs, ownerNow)) {
         const int64_t age = ownerNow - int64_t(c.attackerTsMs);
@@ -504,12 +530,20 @@ void Claims::ReplayNow(const HitClaim& c, double nowMs) {
     UObject* striker = Striker(c);
     if (!striker) ++n_.noStriker;   // the blow still lands; blood is painted on nothing
     UObject* box = in.hasHitBox ? HitBox(victim, c, in) : nullptr;
-    double damage = 0;
-    if (!CallDealComplexDamage(victim, mesh, striker, bone, in, box, &damage)) {
+    DcdOut out;
+    if (!CallDealComplexDamage(victim, mesh, striker, bone, in, box, &out)) {
         ++n_.failed;
         if (landed) ++landed->missed;
         if (n_.failed <= 3) HSM_LOG("claims: #%u from e%u: Deal Complex Damage could not be called", c.claimId, c.attacker);
         return;
+    }
+    const double damage = out.damage;
+    if (env_.armorGate) {
+        armorGate_.NoteBlow(c, out.cutRate, out.density, nowMs);
+        if (out.density > 0.0 && c.cuttingPower > 0.0 && !(out.cutRate > 0.0) && ++n_.armorStopped <= kLogFirst)
+            HSM_LOG("claims: #%u e%u -> e%u bone %s: my armour stopped the cut (cutting power %.1f, cut left 0, damage %.2f); "
+                    "a blade lodged there on e%u's screen does no stuck damage here", c.claimId, c.attacker, c.victim, c.hitBone.c_str(),
+                    c.cuttingPower, damage, c.attacker);
     }
     recent_[c.victim] = Recent{c.attacker, nowMs};
     ++n_.replayed;
@@ -536,6 +570,13 @@ void Claims::ReplayStuck(const HitClaim& c, double nowMs) {
     if (!combat::ReplayBoneOk(c.hitBone, index.get<int32_t>("ReturnValue")) || !BoneXform(mesh, bone, boneWorld)) {
         ++n_.noBone;
         if (n_.noBone <= 3) HSM_LOG("claims: #%u from e%u names bone '%s', which my fighter lacks", c.claimId, c.attacker, c.hitBone.c_str());
+        return;
+    }
+    // After the bone check: the gate keeps a key per bone name, and this one came off the wire.
+    if (env_.armorGate && armorGate_.StuckHeld(c, nowMs)) {
+        if (++n_.stuckHeld <= kLogFirst)
+            HSM_LOG("claims: #%u e%u -> e%u stuck blade '%s' in bone %s not replayed: my armour stopped that blow", c.claimId, c.attacker,
+                    c.victim, c.strikeComponent.c_str(), c.hitBone.c_str());
         return;
     }
     const DcdInputs in = combat::ReplayInputs(c, boneWorld);
@@ -668,7 +709,7 @@ bool Claims::CallGetDamage(UObject* victim, UObject* mesh, UObject* striker, FNa
 }
 
 bool Claims::CallDealComplexDamage(UObject* victim, UObject* mesh, UObject* striker, FName bone, const DcdInputs& in,
-                                   UObject* hitBox, double* damageOut) {
+                                   UObject* hitBox, DcdOut* out) {
     Call dcd(victim, "Deal Complex Damage");
     if (!dcd.valid()) return false;
     dcd.set<UObject*>("Hit Component", mesh)
@@ -693,7 +734,11 @@ bool Claims::CallDealComplexDamage(UObject* victim, UObject* mesh, UObject* stri
         ScriptHookBypass bypass;   // our own call, and the Get Damage inside it, pass the claims hooks
         ok = dcd.invoke();
     }
-    if (ok && damageOut) *damageOut = dcd.get<double>("Damage Out");
+    if (ok && out) {
+        out->damage = dcd.get<double>("Damage Out");
+        out->cutRate = dcd.get<double>("Cutting Rate Out");
+        out->density = dcd.get<double>("Material Density Out");
+    }
     return ok;
 }
 
@@ -776,19 +821,41 @@ std::string Claims::AuditLine() {
     return out;
 }
 
+// Each stand-in's collision too (0 none, 1 query, 2 physics, 3 both): hits that never arrive can't be seen any other way.
+std::string Claims::ContactLine() {
+    const ContactLog& a = contacts_;
+    const ContactLog& b = contactsReported_;
+    char line[256];
+    std::snprintf(line, sizeof line, "contacts: %llu calls: on stand-in %llu, on mine %llu, other %llu | by stand-in %llu, by mine %llu, nobody %llu | stand-in damage some %llu, zero %llu",
+                  static_cast<unsigned long long>(a.all - b.all), static_cast<unsigned long long>(a.onStandIn - b.onStandIn), static_cast<unsigned long long>(a.onMine - b.onMine),
+                  static_cast<unsigned long long>(a.onOther - b.onOther), static_cast<unsigned long long>(a.byStandIn - b.byStandIn), static_cast<unsigned long long>(a.byMine - b.byMine),
+                  static_cast<unsigned long long>(a.byNobody - b.byNobody), static_cast<unsigned long long>(a.afterSome - b.afterSome), static_cast<unsigned long long>(a.afterZero - b.afterZero));
+    std::string out = line;
+    for (uint8_t e = 1; e <= kMaxWillies; ++e) {
+        UObject* const w = standIns_->ActorOf(e);
+        UObject* const mesh = w ? adapter_->Mesh(w) : nullptr;
+        if (!mesh) continue;
+        Call g(mesh, "GetCollisionEnabled");
+        if (g.valid() && g.invoke()) out += " | e" + std::to_string(e) + " collision " + std::to_string(int(g.get<uint8_t>("ReturnValue")));
+    }
+    contactsReported_ = contacts_;
+    return out;
+}
+
 std::string Claims::HealthLine() {
     const Counters& a = n_;
     const Counters& b = reported_;
     auto d = [](uint64_t now, uint64_t before) { return static_cast<unsigned long long>(now - before); };
+    if (contacts_.all != contactsReported_.all || standIns_->ActorOf(1) || standIns_->ActorOf(2)) HSM_LOG("%s", ContactLine().c_str());
     char line[1024];
     std::snprintf(line, sizeof line,
                   "claims: sent %llu (props %llu gated %llu limited %llu friendly %llu coalesced %llu zero-impulse %llu "
-                  "capped %llu, stuck %llu limited %llu) | replayed %llu (stuck %llu props %llu queued %llu dropped %llu dupes %llu stale %llu "
+                  "capped %llu, stuck %llu limited %llu) | replayed %llu (stuck %llu armour-held %llu armour-stopped %llu props %llu queued %llu dropped %llu dupes %llu stale %llu "
                   "age? %llu parried %llu novictim %llu nobone %llu nostriker %llu failed %llu) | blocked: on stand-ins %llu, "
                   "on mine %llu, driven props on mine %llu, get damage %llu, ctf flags %llu | fx %llu (skipped %llu) clashes %llu (unmatched %llu) | bad bone names %llu",
                   d(a.sent, b.sent), d(a.propSent, b.propSent), d(a.gated, b.gated), d(a.limited, b.limited),
                   d(a.friendly, b.friendly), d(a.coalesced, b.coalesced), d(a.zeroImpulse, b.zeroImpulse), d(a.capped, b.capped),
-                  d(a.stuckSent, b.stuckSent), d(a.stuckLimited, b.stuckLimited), d(a.replayed, b.replayed), d(a.stuckReplayed, b.stuckReplayed), d(a.propReplayed, b.propReplayed), d(a.queued, b.queued), d(a.dropped, b.dropped),
+                  d(a.stuckSent, b.stuckSent), d(a.stuckLimited, b.stuckLimited), d(a.replayed, b.replayed), d(a.stuckReplayed, b.stuckReplayed), d(a.stuckHeld, b.stuckHeld), d(a.armorStopped, b.armorStopped), d(a.propReplayed, b.propReplayed), d(a.queued, b.queued), d(a.dropped, b.dropped),
                   d(a.dupes, b.dupes), d(a.stale, b.stale), d(a.ageUnknown, b.ageUnknown),
                   d(a.parried, b.parried), d(a.noVictim, b.noVictim), d(a.noBone, b.noBone), d(a.noStriker, b.noStriker),
                   d(a.failed, b.failed), d(a.blockedStandIn, b.blockedStandIn), d(a.blockedOnMine, b.blockedOnMine),

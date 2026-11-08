@@ -128,6 +128,11 @@ public:
                 for (const Link& b : bound_) if (b.steam == e.steamId) return b.peer;
         return 0;
     }
+    // The slot of a player the map names, by SteamID; 0xFF for anyone else, the host and this machine included.
+    uint8_t SlotOfSteam(uint64_t steamId) const {
+        for (const PeerMapEntry& e : map_) if (e.steamId == steamId) return e.slot;
+        return 0xFF;
+    }
     // The slot a named mesh peer holds; 0xFF for any other peer, the host included.
     uint8_t SlotOfPeer(uint32_t peer) const {
         for (const Link& b : bound_)

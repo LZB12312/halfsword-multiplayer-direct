@@ -17,8 +17,8 @@ public:
     uint64_t UserOf(uint32_t peer) const;
 
     void Stop() override;
-    void Send(uint32_t peer, uint8_t channel, std::vector<uint8_t> data, bool reliable) override;
-    void Broadcast(uint8_t channel, std::vector<uint8_t> data, bool reliable) override;
+    void Send(uint32_t peer, uint8_t channel, const std::vector<uint8_t>& data, bool reliable) override;
+    void Broadcast(uint8_t channel, const std::vector<uint8_t>& data, bool reliable) override;
     void Disconnect(uint32_t peer) override;
     bool Poll(NetEvent& out) override;
     uint32_t RoundTripMs(uint32_t peer) override;

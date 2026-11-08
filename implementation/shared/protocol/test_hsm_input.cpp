@@ -206,7 +206,47 @@ static void TestQuietAxes() {
     CHECK(!s.skip[arm] && !s.skip[tm]);                                         // no dt: nothing is ever skipped
 }
 
+static void TestInputStreamNeeded() {
+    CHECK(!InputStreamNeeded(false, false, false));   // default owner mode: no remote consumer
+    CHECK(InputStreamNeeded(true, false, false));    // host physics needs every input, regardless of hand-off
+    CHECK(InputStreamNeeded(false, true, false));    // warm before a hand-off, not just after a lease arrives
+    CHECK(InputStreamNeeded(false, false, true));    // an active lease must finish even after hand-off is disabled
+    CHECK(InputStreamNeeded(true, true, false));
+    CHECK(InputStreamNeeded(true, false, true));
+    CHECK(InputStreamNeeded(false, true, true));
+    CHECK(InputStreamNeeded(true, true, true));
+}
+
+static void TestCaptureDrainsWithoutUplink() {
+    InputCapture c;
+    c.OnAxis(Axis::MoveForward, 1.f);
+    c.OnAction(Action::GrabLeft, true);
+    for (uint32_t i = 0; i < 120; ++i) {
+        c.OnAxis(Axis::TurnMouse, 0.5f);
+        c.OnAction(Action::Jump, true); c.OnAction(Action::Jump, false);
+        const InputFrame discarded = c.Take(i * 17);
+        CHECK(!InputStreamNeeded(false, false, false));
+        CHECK(discarded.axes[size_t(Axis::TurnMouse)] == 0.5f);
+    }
+    // A fresh host-physics receiver gets the current held state, no accumulated mouse movement or old jump taps.
+    c.OnAxis(Axis::TurnMouse, 0.25f);
+    const InputFrame first = c.Take(2050);
+    InputApplier host;
+    CHECK(InputStreamNeeded(true, false, false) && host.Receive(first));
+    const auto step = host.Tick();
+    CHECK(step.axes[size_t(Axis::TurnMouse)] == 0.25f && step.axes[size_t(Axis::MoveForward)] == 1.f);
+    CHECK(Has(step.pressed, Action::GrabLeft) && !Has(step.pressed, Action::Jump));
+    CHECK(c.Take(2067).axes[size_t(Axis::TurnMouse)] == 0.f);
+    // Once the stream is needed, sub-frame taps still cross through the existing cumulative edge counters.
+    c.OnAction(Action::Jump, true); c.OnAction(Action::Jump, false);
+    CHECK(InputStreamNeeded(false, true, false) && host.Receive(c.Take(2084)));
+    CHECK(Has(host.Tick().pressed, Action::Jump));
+    CHECK(Has(host.Tick().released, Action::Jump));
+}
+
 int main() {
+    TestInputStreamNeeded();
+    TestCaptureDrainsWithoutUplink();
     TestQuietAxes();
     TestDeltaSpreadOverHostFrames();
     TestDeltaFloodBounded();

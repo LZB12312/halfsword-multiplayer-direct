@@ -215,4 +215,17 @@ std::vector<Point3> StandableSpread(const std::vector<Point3>& candidates, size_
     return out;
 }
 
+// A Progression co-op fight's start (the report: NPCs spawned right on the players in Doubles). The host keeps the place the
+// stock spawner gave the player: its Player Spawner holds nobody else (BP_LevelManager.cpp:403-413). The others spread round it
+// (StandableSpot) clear of these points: every fighter in the level, and every spawner but the player's own (the nearest one),
+// where an opponent or a hired mercenary stands, or is about to (the stock spawners can run after the mod's respawn).
+inline std::vector<Point3> CoopStartTaken(const Point3& start, const std::vector<Point3>& fighters, const std::vector<Point3>& spawners) {
+    std::vector<Point3> out = fighters;
+    size_t own = spawners.size();
+    for (size_t i = 0; i < spawners.size(); ++i)
+        if (own == spawners.size() || FlatDist2(spawners[i], start) < FlatDist2(spawners[own], start)) own = i;
+    for (size_t i = 0; i < spawners.size(); ++i) if (i != own) out.push_back(spawners[i]);
+    return out;
+}
+
 }  // namespace hsm

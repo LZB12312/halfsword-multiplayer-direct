@@ -1,5 +1,6 @@
 #include "net/update_check.h"
 #include "net/http_client.h"
+#include "file_hash.h"
 #include "gameplay/lobby.h"
 #include "log.h"
 #include "session/hsm_pe.h"
@@ -27,6 +28,7 @@ Install g_install = Install::None;
 std::string g_tag, g_installText;
 UpdateAssets g_assets;
 bool g_haveAssets = false;
+std::atomic<uint8_t> g_official{uint8_t(Official::Unknown)};
 
 // "check failed (...)" reason: what the player or a bug report can act on.
 std::string Reason(const net::HttpResponse& r, const char* host = "api.github.com") {
@@ -60,6 +62,13 @@ void Check() {
     if (r.fail != net::HttpResponse::Fail::None || r.status != 200) { HSM_LOG("update: check failed (%s)", Reason(r).c_str()); return; }
     const ReleaseList list = ParseReleases(r.body);
     if (list.releases.empty() && !list.complete) { HSM_LOG("update: check failed (the answer was not a release list)"); return; }
+    {
+        Sha256Digest release{};
+        const bool known = RunningReleaseDigest(list.releases, *running, release);
+        const Official o = OfficialOf(known, OwnBinaryDigest(), release);
+        g_official.store(uint8_t(o));
+        HSM_LOG("update: this build is %s%s", OfficialName(o), known ? "" : " (no release digest for this version)");
+    }
 
     const std::optional<UpdateOffer> offer = NewestOffer(list.releases, *running);
     if (!offer) { HSM_LOG("update: up to date (%s)", cur.c_str()); return; }
@@ -262,6 +271,8 @@ std::string InstallStatus() {
     std::lock_guard<std::mutex> lock(g_mu);
     return g_installText;
 }
+
+Official OfficialStatus() { return Official(g_official.load()); }
 
 std::string TakeChatNotice() {
     std::lock_guard<std::mutex> lock(g_mu);

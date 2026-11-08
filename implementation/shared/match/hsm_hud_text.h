@@ -132,6 +132,18 @@ inline bool InRoundGap(const MatchInfo& m) {
 
 // The bot formats' break between waves: MatchInfo carries its time left in roundGapLeftMs and the players' votes to
 // skip it in roundWinner (Duel-only fields before: older clients ignore them outside Duel).
+// A Progression co-op fight won (every opponent out) and waiting for a player to hold G, as the stock game waits for its
+// Talk key (UI_WIN). `oneFight`: a Progression fight, as GiveUpActionFor takes it.
+inline bool CoopFightWon(Format f, MatchPhase phase, int winner, bool oneFight) {
+    return oneFight && f == Format::PlayersVsBots && phase == MatchPhase::Results && winner == kHumanTeam;
+}
+inline bool CoopFightWon(const MatchInfo& m, bool oneFight) { return CoopFightWon(Format(m.format), MatchPhase(m.phase), m.winner, oneFight); }
+// Whether blows count (hits, claims, severs): while a round or wave is fought, and in a Progression fight won and waiting for
+// G, as the stock game lets the player go on hitting, stripping and killing the opponents who gave up until the Talk key is
+// held (the report: after the win they were invincible).
+inline bool BlowsCount(Format f, MatchPhase phase, int winner, bool oneFight) {
+    return CombatPhase(phase) || CoopFightWon(f, phase, winner, oneFight);
+}
 inline bool InWaveBreak(const MatchInfo& m) {
     return IsBotFormat(Format(m.format)) && m.roundGapLeftMs && (m.phase == uint8_t(MatchPhase::Live) || m.phase == uint8_t(MatchPhase::SuddenDeath));
 }
@@ -161,6 +173,7 @@ inline std::string StatusLine(const MatchInfo& m, uint8_t myEntity, bool oneFigh
         case MatchPhase::Idle: return {};
         case MatchPhase::Countdown: return "Match starts in " + Seconds(m.timeLeftMs);
         case MatchPhase::Results: {
+            if (CoopFightWon(m, oneFight)) return "FIGHT WON   hold G to go on (or in " + Seconds(m.timeLeftMs) + ")";
             std::string who;
             if (f == Format::Zombies) who = "OVERRUN - survived " + std::to_string(ScoreOf(m, kHumanTeam)) + " waves";
             else if (f == Format::PlayersVsBots) who = m.winner == kBotTeam ? "BOTS WIN" : "PLAYERS WIN";

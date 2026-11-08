@@ -13,6 +13,28 @@ static void TestBuildString() {
     CHECK(longOne.size() == kMaxModBuild && longOne.rfind("0.6.4 (", 0) == 0);
 }
 
+static void TestBinaryHash() {
+    CHECK(ModBuildString("0.8.0-pre26", "3dc8f7c", "1a2b3c4d5e6f") == "0.8.0-pre26 (3dc8f7c) #1a2b3c4d5e6f");
+    CHECK(ModBuildString("0.8.0-pre26", "", "1a2b3c4d5e6f") == "0.8.0-pre26 #1a2b3c4d5e6f");
+    CHECK(ModBuildString("0.8.0-pre26", "3dc8f7c", "") == "0.8.0-pre26 (3dc8f7c)");   // the DLL could not read itself
+    // A long describe is cut, never the hash.
+    const std::string longOne = ModBuildString("0.8.0-pre26", std::string(200, 'g'), "1a2b3c4d5e6f");
+    CHECK(longOne.size() == kMaxModBuild);
+    CHECK(longOne.size() >= 14 && longOne.substr(longOne.size() - 14) == " #1a2b3c4d5e6f");
+    // A hash longer than the whole field (a full digest, not BuildHash's 12 digits) is cut too: never over the wire cap.
+    CHECK(ModBuildString("0.8.0-pre26", "3dc8f7c", std::string(64, 'f')).size() == kMaxModBuild);
+    // Same version and commit, different binaries: different builds.
+    const std::string a = ModBuildString("0.8.0-pre26", "3dc8f7c", "1a2b3c4d5e6f");
+    const std::string b = ModBuildString("0.8.0-pre26", "3dc8f7c", "ffffffffffff");
+    CHECK(!MayStartMatch(a, {{"Bob", b}}, false));
+    CHECK(BuildWarning(a, {{"Bob", b}}) == "Bob on " + b + " - update");
+    // BuildHash: the first 12 hex digits of the digest.
+    Sha256Digest d{};
+    d[0] = 0x1a; d[1] = 0x2b; d[2] = 0x3c; d[3] = 0x4d; d[4] = 0x5e; d[5] = 0x6f; d[6] = 0x77;
+    CHECK(BuildHash(d) == "1a2b3c4d5e6f");
+    CHECK(BuildHash(Sha256Of(reinterpret_cast<const uint8_t*>("abc"), 3)) == "ba7816bf8f01");   // FIPS 180-2 "abc"
+}
+
 static void TestMatchingBuildsSayNothing() {
     const std::vector<PeerBuild> others{{"Bob", "0.6.4"}, {"Eve", "0.6.4"}};
     CHECK(BuildMismatches("0.6.4", others).empty());
@@ -49,6 +71,7 @@ int main() {
     TestMismatchIsNamed();
     TestSeveralMismatchesAndUnknowns();
     TestSameVersionOtherCommitDiffers();
+    TestBinaryHash();
     if (g_fail) { std::printf("test_hsm_build: %d failure(s)\n", g_fail); return 1; }
     std::printf("test_hsm_build: ok\n");
     return 0;

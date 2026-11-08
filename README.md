@@ -8,8 +8,8 @@ interfaces, Steam lobby, Steam account lookup or Steam relay is used by the mod.
 The game's own distribution, launcher and supported executable requirements are unchanged.
 
 Based on Dudiebug/halfsword-multiplayer-mod commit
-`cb8c6646f361f1e1ccb81980108874bdf6fead27` (0.8.0-pre27).
-Fork version: **0.3.0**. Everyone must use this same fork and build.
+`10c3fa9ad78a0c25b76c48f83336da2efb0859ad` ([0.8.0-pre40](https://github.com/Dudiebug/halfsword-multiplayer-mod/releases/tag/v0.8.0-pre40)).
+Fork version: **0.4.0**. Everyone must use this same fork and build.
 The upstream Steam mod cannot connect to it.
 
 ## Install
@@ -24,8 +24,9 @@ The upstream Steam mod cannot connect to it.
 The supported game executable is the same as upstream: Steam build 24185754
 (UE 5.4.4 CL-2705). Other executable builds are still rejected by the mod's
 existing executable fingerprint checks. This change does not change game compatibility.
-UE4SS coexistence follows the original proxy arrangement: HSMMod's DLL loads
-`ue4ss/UE4SS.dll`. See `README.upstream.md` for the underlying gameplay features.
+This build includes upstream's UE4SS bundle and compatibility checks. Use `ue4ss=0`
+under `[mod]` to disable automatic UE4SS installation and loading. Upstream lists
+crossbows as a known issue in pre40.
 
 ## Host
 

@@ -2,11 +2,13 @@
 #include "combat/hsm_handloss.h"
 #include "sync/hsm_grip.h"
 #include "sync/hsm_pose_codec.h"
+#include "sync/hsm_two_hand_update.h"
 #include "util/hsm_names.h"
 #include "log.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <string>
 
 namespace hsm::game {
@@ -52,6 +54,7 @@ constexpr const char* kGripBoolFields[] = {"L Hand In Offhand Attached", "R Alt 
                                             "R Hand Reverse Grip"};
 static_assert(sizeof(kGripBoolFields) / sizeof(kGripBoolFields[0]) == 5, "GripState has five flags");
 constexpr const char* kRootConstraints[] = {"PhysicsConstraint Main", "PhysicsConstraint_Z"};
+constexpr const char* kHiddenParts[] = {"DriverSkeleton", "CharacterMesh_Head"};   // standin_parts_off (SetStandInPartsOff)
 constexpr const char* kHandles[] = {"PhysicsHandle GetUp", "PhysicsHandle LowerBody", "PhysicsHandle UpperBody"};
 constexpr const char* kFistsPrefix = "Weapon_Fists";   // an empty hand's pseudo weapon, kinematic at the world origin
 constexpr int kHandBone[2] = {sync::kBoneHandR, sync::kBoneHandL};
@@ -68,10 +71,15 @@ constexpr double kCapsuleTeleportUu = 150.0;  // HSMP main.lua:133 TELEPORT_DIST
 // ECollisionChannel: WorldStatic 0, WorldDynamic 1, Pawn 2, Visibility 3, Camera 4, PhysicsBody 5. 0.8.0-pre7: PhysicsBody
 // was 4 (the camera channel), so a chain "through fighters' bodies" still met their armour.
 constexpr uint8_t kWorldStatic = 0, kWorldDynamic = 1, kPawn = 2, kPhysicsBody = 5;
+constexpr uint8_t kBodyCollision = 16;        // the game's BodyCollision channel (GameTraceChannel3): all Box1 still blocks
 constexpr uint8_t kIgnore = 0;                // ECollisionResponse::ECR_Ignore
 constexpr uint8_t kNoCollision = 0;           // ECollisionEnabled::NoCollision
 constexpr uint8_t kLocked = 2;                 // ELinearConstraintMotion::LCM_Locked, EAngularConstraintMotion::ACM_Locked
 bool g_gripLock = true;                        // standin_grip (SetStandInGripLock)
+bool g_partsOff = false;                       // standin_parts_off (SetStandInPartsOff)
+bool g_twoHandPose = true;                     // standin_two_hand_pose (receiver only)
+bool g_twoHandLock = true;                     // standin_two_hand_lock (receiver only)
+bool g_twoHandAudit = false;                   // Help improve only
 constexpr uint8_t kLimited = 1;               // ELinearConstraintMotion::LCM_Limited, EAngularConstraintMotion::ACM_Limited
 constexpr double kOffhandAngleDeg = 36.0;      // the game's MapRangeClamped(Soft Attach Dot 0.9, 0.5, 1, 180, 0), Willie_BP.cpp:18200
 constexpr uint8_t kFree = 0;                  // ELinearConstraintMotion::LCM_Free, EAngularConstraintMotion::ACM_Free
@@ -115,6 +123,49 @@ double SegmentDistance(const V3& p, const V3& a, const V3& b) {
 
 UObject* ObjField(UObject* o, const char* name) { UObject** p = Field<UObject*>(o, name); return p ? *p : nullptr; }
 bool Live(const UObject* o, int32_t index) { return o && index >= 0 && ObjectAt(index) == o; }
+
+bool UniformGripScale(const V3& scale) {
+    std::array<sync::GripFrame, 2> ignored;
+    return sync::ScaleGripFrames({}, scale, ignored);
+}
+
+bool ParamSize(UFunction* fn, const char* name, size_t size) {
+    const FProperty* p = fn ? FindProperty(fn, name) : nullptr;
+    return p && PropertySize(p) == static_cast<int32_t>(size);
+}
+
+// Reflected FConstraintInstance members, never native layout offsets. The hand side is a socket frame, not in
+// general the hand bone origin. Stored positions need scale conversion immediately after the adapter rebuilds a
+// joint; later reference setters store active offsets directly, so an arbitrary native snapshot is ambiguous.
+bool ReadGripFrames(UObject* joint, std::array<sync::GripFrame, 2>& frames) {
+    const FProperty* instance = FindProperty(ClassOf(joint), "ConstraintInstance");
+    UObject* definition = FindStruct("ConstraintInstance");
+    if (!instance || !definition || PropertyType(instance) != "StructProperty") return false;
+    const FProperty* members[] = {StructMember(definition, "Pos1"), StructMember(definition, "PriAxis1"),
+                                 StructMember(definition, "SecAxis1"), StructMember(definition, "Pos2"),
+                                 StructMember(definition, "PriAxis2"), StructMember(definition, "SecAxis2")};
+    const int32_t size = PropertySize(instance);
+    const auto* data = reinterpret_cast<const uint8_t*>(joint) + PropertyOffset(instance);
+    V3 values[6];
+    for (size_t i = 0; i < 6; ++i) {
+        const FProperty* p = members[i];
+        if (!p) return false;
+        const int32_t offset = PropertyOffset(p), bytes = PropertySize(p);
+        if (offset < 0 || bytes <= 0 || offset > size - bytes) return false;
+        if (bytes == sizeof(FVector)) {
+            FVector value;
+            std::memcpy(&value, data + offset, sizeof value);
+            values[i] = ToV3(value);
+        } else if (bytes == sizeof(float) * 3) {
+            float value[3];
+            std::memcpy(value, data + offset, sizeof value);
+            values[i] = {value[0], value[1], value[2]};
+        } else return false;
+    }
+    frames = {{{values[0], values[1], values[2]}, {values[3], values[4], values[5]}}};
+    Q4 rotation;
+    return sync::GripFrameRotation(frames[0], rotation) && sync::GripFrameRotation(frames[1], rotation);
+}
 
 // A Willie field of the given reflected type, or nullptr (logged) when it is missing or of another type.
 FProperty* TypedField(const UClass* cls, const char* name, const char* type) {
@@ -201,12 +252,16 @@ int ObjectType(UObject* c) {
 // ---- binding ---------------------------------------------------------------------------------------------------------
 
 bool FighterRig::Bind(UObject* willie) {
-    if (willie && willie == willie_ && StillValid()) return true;
+    if (willie && willie == willie_ && StillValid()) return RestoreDeferredTwoHandPoses(mesh_, meshIndex_);
     UObject* const quiet = failLogged_;   // a fighter that keeps failing (retried every frame) is logged once
     Unbind();
     failLogged_ = quiet;
     const bool log = willie != failLogged_;
     UObject* mesh = willie ? ObjField(willie, "Mesh") : nullptr;
+    // An old rig may have been destroyed while reflection was unavailable. Never snapshot its override as the
+    // native reference when this fighter binds again; the saved reference must be restored first.
+    const bool restored = RestoreDeferredTwoHandPoses(mesh, mesh ? ObjectIndex(mesh) : -1);
+    if (!restored) return false;
     if (!mesh) return false;
     for (int i = 0; i < sync::kPoseBones; ++i) {
         const FName n = MakeName(sync::kPoseBoneNames[i]);
@@ -262,7 +317,18 @@ bool FighterRig::Bind(UObject* willie) {
     return true;
 }
 
-void FighterRig::Unbind() { *this = FighterRig(); }   // the bind-failure log mark too: Bind keeps it itself
+void FighterRig::Unbind() {
+    if (!RestoreTwoHandPose()) {
+        auto& deferred = DeferredTwoHandRestores();
+        size_t retained = 0;
+        for (TwoHandJoint& saved : twoHandJoints_) if (saved.changed) {
+            deferred.push_back(std::move(saved));
+            ++retained;
+        }
+        if (g_twoHandAudit) HSM_LOG("rig: deferred native two-hand reference restoration for %zu joint(s)", retained);
+    }
+    *this = FighterRig();   // the bind-failure log mark too: Bind keeps it itself
+}
 
 bool FighterRig::StillValid() const { return Live(willie_, willieIndex_) && Live(mesh_, meshIndex_); }
 
@@ -275,6 +341,7 @@ void FighterRig::RefreshWeapon(int w) {
     UObject* actor = FieldAt(weaponOffset_[w]);
     if (w == 1 && actor && actor == FieldAt(weaponOffset_[0])) actor = nullptr;   // one weapon in both hands: slot 0 has it
     if (actor == wp.actor && (!actor || Live(actor, wp.index))) return;
+    RestoreTwoHandPose();   // before the old held weapon is re-armed or the new one is cached
     // Let go while neutralised (a stand-in's hand opened; my own fighter's while another machine held it): the held-weapon
     // policy (no gravity, blind to the world) would stay on it for good, floating where it was (#145, #138-#141).
     if (wp.actor && actor != wp.actor && !FieldAt(weaponOffset_[w])) CheckHandLoss(w, wp);   // the variable went null
@@ -371,6 +438,7 @@ bool FighterRig::ReadWeapon(int w, const V3& hand) {
     const FTransform t = wp.toWorld.take<FTransform>(0);
     wp.pos = ToV3(t.translation);
     wp.rot = ToQ4(t.rotation);
+    wp.scale = ToV3(t.scale);
     wp.basePos = wp.tipPos = wp.pos;
     if (Live(wp.base, wp.baseIndex) && wp.baseLoc.invoke(wp.base)) wp.basePos = ToV3(wp.baseLoc.take<FVector>(0));
     if (Live(wp.tip, wp.tipIndex) && wp.tipLoc.invoke(wp.tip)) { wp.tipPos = ToV3(wp.tipLoc.take<FVector>(0)); wp.haveTip = true; }
@@ -387,7 +455,7 @@ bool FighterRig::ReadWeapon(int w, const V3& hand) {
 bool FighterRig::ReadHead(Weapon& wp, sync::BoneSample& out) {
     if (wp.head) {   // a component chain (ScanParts)
         if (!Live(wp.head, wp.headIndex) || !Live(wp.actor, wp.index)) {   // the game made the chain again: found anew
-            wp.parts.clear(); wp.partIndex.clear(); wp.head = nullptr; wp.headIndex = -1;
+            wp.parts.clear(); wp.partIndex.clear(); wp.head = nullptr; wp.headIndex = -1; wp.linked = false;
             return false;
         }
         wp.headSim.put(0, FName{});
@@ -438,8 +506,9 @@ bool FighterRig::ReadHead(Weapon& wp, sync::BoneSample& out) {
 }
 
 // The weapon actor's simulating primitive components other than its root: a flail's links and head (Flail_A..D: 'Blade1'
-// and the links, each a body joined to the next by a constraint). Nothing on a sword, a spear or a shield. The head is
-// the 'Blade*' part, else the part farthest from the handle. On a stand-in, found parts get the chain's collision policy at once.
+// and the links 'Link 1', 'Link 2', each a body joined to the next by a constraint), and the parts of other modular weapons, which
+// are welded and no chain (a polearm's Grip and Blade, sync/hsm_two_hand_pose.h). The head is the 'Blade*' part, else the part
+// farthest from the handle. On a stand-in, found parts get the chain's collision policy at once.
 void FighterRig::ScanParts(Weapon& wp) {
     if (!primitiveClass_) primitiveClass_ = FindClass("PrimitiveComponent");
     if (!primitiveClass_ || !wp.actor || !wp.root) return;
@@ -487,7 +556,11 @@ void FighterRig::ScanParts(Weapon& wp) {
     }
     wp.parts = found;
     wp.partIndex.clear();
-    for (UObject* c : found) wp.partIndex.push_back(ObjectIndex(c));
+    wp.linked = false;
+    for (UObject* c : found) {
+        wp.partIndex.push_back(ObjectIndex(c));
+        if (StartsWithNameAscii(ObjectName(c), "Link")) wp.linked = true;
+    }
     wp.head = head;
     wp.headIndex = ObjectIndex(head);
     wp.headBone = FName{};
@@ -554,8 +627,8 @@ bool FighterRig::Read(uint32_t tsMs, uint16_t stepUs, sync::PoseFrame* frame, sy
         const V3 pos = ToV3(t.translation);
         const Q4 rot = ToQ4(t.rotation);
         if (i == sync::kBonePelvis) { pelvis_ = pos; pelvisRead_ = true; }
-        if (i == kHandBone[0]) hand[0] = pos;
-        if (i == kHandBone[1]) hand[1] = pos;
+        if (i == kHandBone[0]) { hand[0] = pos; handScale_[0] = ToV3(t.scale); }
+        if (i == kHandBone[1]) { hand[1] = pos; handScale_[1] = ToV3(t.scale); }
         const bool body = sync::kPoseHasBody[i];
         if (frame) {
             sync::BoneSample& b = frame->bones[i];
@@ -701,7 +774,7 @@ void FighterRig::LockGrip(int hand) {
     if (!c || c == gripLocked_[hand]) return;
     Call(c, "SetAngularDriveParams").set<float>("PositionStrength", 0.f).set<float>("VelocityStrength", 0.f)
         .set<float>("InForceLimit", 0.f).invoke();
-    if (hand == 1 && c == offJoint_ && HoldOffhand(c)) return;
+    if (sync::HoldFor(hand, c == offJoint_, poseHeld_[hand], g_twoHandLock) == sync::GripHold::GameOffhand && HoldOffhand(c)) return;
     Call(c, "SetLinearXLimit").set<uint8_t>("ConstraintType", kLocked).set<float>("LimitSize", 0.f).invoke();
     Call(c, "SetLinearYLimit").set<uint8_t>("ConstraintType", kLocked).set<float>("LimitSize", 0.f).invoke();
     Call(c, "SetLinearZLimit").set<uint8_t>("ConstraintType", kLocked).set<float>("LimitSize", 0.f).invoke();
@@ -804,14 +877,24 @@ void FighterRig::Drive(const sync::FighterCommand& cmd) {
         wp.setAng.put(0, ToF(cmd.weapons[w].angVelDeg)).put(1, false).put(2, FName{});
         wp.setAng.invoke(wp.root);
     }
+    const bool posed = HasTwoHandPose();
     for (int w = 0; w < sync::kPoseWeapons; ++w) {   // the flail heads, on their own chains (4b)
         Weapon& wp = weapons_[w];
         UObject* const hb = HeadBody(wp);
-        if (!cmd.headDrive[w] || !wp.read || Pinned(w) || !hb) continue;
+        if (!sync::HeadServoed(cmd.headDrive[w], posed, w) || !wp.read || Pinned(w) || !hb) continue;
         wp.headSetLin.put(0, ToF(cmd.heads[w].vel)).put(1, false).put(2, wp.headBone);   // headBone: none on a part
         wp.headSetLin.invoke(hb);
         wp.headSetAng.put(0, ToF(cmd.heads[w].angVelDeg)).put(1, false).put(2, wp.headBone);
         wp.headSetAng.invoke(hb);
+    }
+    for (int h = 0; h < 2; ++h) {   // the pose took this joint over or let it go: held again (sync::HoldFor)
+        UObject* const c = FieldAt(gripOffset_[h]);
+        const bool owned = c && twoHandJoints_[h].changed && twoHandJoints_[h].joint == c;
+        if (owned == poseHeld_[h]) continue;
+        poseHeld_[h] = owned;
+        gripLocked_[h] = nullptr;
+        if (g_twoHandLock) HSM_LOG("rig: %s: %s %s", ObjectName(willie_).c_str(), kGripFields[h],
+                                   owned ? "locked to the two-hand pose" : "back to its own hold");
     }
     for (int h = 0; h < 2; ++h) {
         if (lock[h]) LockGrip(h);
@@ -848,13 +931,20 @@ void FighterRig::Shift(const V3& d) {
         // A skeletal flail chain (wp.flail) stays behind: this build reflects no way to move a simulated chain's bodies
         // (SetAllPhysicsPosition was never in the exe; the bone setters are PoseableMeshComponent-only), so Shift moves
         // only what it can - the parts and the root below - and the joints drag the chain, as before 5d3e67f.
-        for (size_t i = 0; i < wp.parts.size(); ++i) {   // a component chain: every part by d, still (0.8.0-pre7)
+        // A component chain: every part by d, still (0.8.0-pre7). Read before the root moves and placed after it: a part welded
+        // to the root goes with it, and moving it by d as well would leave it 2d away.
+        std::vector<std::pair<UObject*, V3>> parts;
+        for (size_t i = 0; i < wp.parts.size(); ++i) {
             if (!Live(wp.parts[i], wp.partIndex[i])) continue;
-            MoveBy(wp.parts[i], d);
-            Call(wp.parts[i], "SetPhysicsLinearVelocity").set("NewVel", FVector{}).set<bool>("bAddToCurrent", false).setName("BoneName", FName{}).invoke();
-            Call(wp.parts[i], "SetPhysicsAngularVelocityInDegrees").set("NewAngVel", FVector{}).set<bool>("bAddToCurrent", false).setName("BoneName", FName{}).invoke();
+            Call at(wp.parts[i], "K2_GetComponentLocation");
+            if (at.invoke()) parts.emplace_back(wp.parts[i], ToV3(at.get<FVector>("ReturnValue")));
         }
         MoveTo(wp.root, Add(wp.pos, d));   // wp.pos is the root component's location as read this frame
+        for (const auto& [part, at] : parts) {
+            MoveTo(part, Add(at, d));
+            Call(part, "SetPhysicsLinearVelocity").set("NewVel", FVector{}).set<bool>("bAddToCurrent", false).setName("BoneName", FName{}).invoke();
+            Call(part, "SetPhysicsAngularVelocityInDegrees").set("NewAngVel", FVector{}).set<bool>("bAddToCurrent", false).setName("BoneName", FName{}).invoke();
+        }
         HoldStill(wp);
     }
     slots_.Shift(willie_, d);   // the sheathed weapons go with the body (standin_slots.h)
@@ -973,14 +1063,19 @@ void FighterRig::ApplyGrip(const sync::GripState& g) {
     const bool steady = now - offWantSinceMs_ >= (wantOff ? kOffhandAttachMs : kOffhandReleaseMs);
     if (wantOff && (!offJoint_ || FieldAt(gripOffset_[1]) != offJoint_) && (steady || offJoint_)) {
         if (now - offTryMs_ >= kOffhandRetryMs) {
+            if (!RestoreTwoHandPose()) return;
             offTryMs_ = now;
             UObject* const before = FieldAt(gripOffset_[1]);
             Call at(willie_, "Attach L Hand To Offhand Position");
             UObject* const after = at.valid() && at.invoke() ? FieldAt(gripOffset_[1]) : nullptr;
             offJoint_ = after && after != before ? after : nullptr;
+            // The attach ends in Event Slide Right Hand Along Shaft (Willie_BP.cpp:1858, :10021): on a polearm the right
+            // hand's joint is set to slide, which only the blocked ReceiveTick steers. Locked again on the next Drive.
+            gripLocked_[0] = nullptr;
             HSM_LOG("rig: %s: off hand %s", ObjectName(willie_).c_str(), offJoint_ ? "attached to the shaft" : "attach FAILED");
         }
     } else if (!wantOff && offJoint_ && (steady || !weaponR)) {
+        if (!RestoreTwoHandPose()) return;
         Call br(willie_, "Break L Constraint");
         br.set<bool>("Slide", false);
         br.invoke();
@@ -1011,6 +1106,7 @@ void FighterRig::ApplySwitch(bool on, UObject* weaponR) {
     // An off-hand joint made again while switched (a re-seat, a re-attach) starts at the unswitched spot: set it again.
     const bool offRemade = on && switchOn_ && offJoint_ && offJoint_ != switchOffJoint_ && FieldAt(gripOffset_[1]) == offJoint_;
     if (!r || !weaponR || (on == switchOn_ && !offRemade)) return;
+    if (!RestoreTwoHandPose()) return;
     switchOn_ = on;
     UObject* const grip = ObjField(weaponR, "Grip");
     UObject* const offPos = ObjField(weaponR, "Grip L Hand Off Hand");
@@ -1046,6 +1142,7 @@ bool FighterRig::ApplySeat(const sync::GripState& g, UObject* weaponR) {
     if (r != seatJoint_) { seatJoint_ = r; seatKey_ = 0; }   // the game makes a new joint at the weapon's default seat
     const uint8_t key = sync::SeatKey(g.altGrip, g.mordhau, g.reverseR);
     if (!r || !weaponR || key == seatKey_ || !GripToLock(0)) return false;
+    if (!RestoreTwoHandPose()) return false;
     seatKey_ = key;
     const auto* base = reinterpret_cast<const uint8_t*>(willie_);
     const uint8_t gripR = gripTypeOffset_[0] >= 0 ? base[gripTypeOffset_[0]] : 0;
@@ -1110,6 +1207,247 @@ bool FighterRig::MakeGripJoint(UObject* joint, UObject* root, const char* socket
     return cc.invoke();
 }
 
+bool FighterRig::HasTwoHandPose() const {
+    return twoHandJoints_[0].changed || twoHandJoints_[1].changed;
+}
+
+// A reference belongs to the saved constraint bodies, even if the Willie no longer points to that constraint.
+// Failed reflection does not prove the constraint was destroyed/rebound: keep the native snapshot for retry.
+sync::GripJointState FighterRig::TwoHandJointState(TwoHandJoint& saved) {
+    if (ObjectCount() <= 0) return sync::GripJointState::Unavailable;
+    if (!Live(saved.joint, saved.index) || !Live(saved.root, saved.rootIndex) || !Live(saved.mesh, saved.meshIndex))
+        return sync::GripJointState::Gone;
+    if (!saved.components.invoke(saved.joint)) return sync::GripJointState::Unavailable;
+    UObject* component[2] = {saved.components.take<UObject*>(0), saved.components.take<UObject*>(2)};
+    FName bone[2] = {saved.components.take<FName>(1), saved.components.take<FName>(3)};
+    const int w = saved.weaponFrame, h = 1 - w;
+    const bool same = component[w] == saved.root && bone[w].index == 0 && bone[w].number == 0 && component[h] == saved.mesh &&
+                      bone[h].index == saved.handBone.index && bone[h].number == saved.handBone.number;
+    return same ? sync::GripJointState::Same : sync::GripJointState::Gone;
+}
+
+bool FighterRig::TwoHandJointMatches(int hand, TwoHandJoint& saved) {
+    return StillValid() && FieldAt(gripOffset_[hand]) == saved.joint &&
+           TwoHandJointState(saved) == sync::GripJointState::Same;
+}
+
+bool FighterRig::BindTwoHandJoint(int hand, TwoHandJoint& out, const char*& failure) {
+    failure = "joint-unavailable";
+    UObject* const joint = FieldAt(gripOffset_[hand]);
+    const Weapon& wp = weapons_[0];
+    if (!joint || !Live(wp.root, wp.rootIndex)) return false;
+    out = TwoHandJoint{};
+    out.joint = joint; out.index = ObjectIndex(joint);
+    out.root = wp.root; out.rootIndex = wp.rootIndex;
+    out.mesh = mesh_; out.meshIndex = meshIndex_; out.handBone = bones_[kHandBone[hand]];
+    const UClass* cls = ClassOf(joint);
+    out.components = PreparedCall(cls, "GetConstrainedComponents", {"OutComponent1", "OutBoneName1", "OutComponent2", "OutBoneName2"});
+    out.broken = PreparedCall(cls, "IsBroken", {"ReturnValue"});
+    out.setFrame = PreparedCall(cls, "SetConstraintReferenceFrame", {"Frame", "RefFrame"});
+    out.toWorld = PreparedCall(cls, "K2_GetComponentToWorld", {"ReturnValue"});
+    out.rebind = PreparedCall(cls, "SetConstrainedComponents", {"Component1", "BoneName1", "Component2", "BoneName2"});
+    if (!out.components.valid() || !out.broken.valid() || !out.setFrame.valid() || !out.toWorld.valid() || !out.rebind.valid() ||
+        !ParamSize(out.components.function(), "OutComponent1", sizeof(UObject*)) ||
+        !ParamSize(out.components.function(), "OutComponent2", sizeof(UObject*)) ||
+        !ParamSize(out.components.function(), "OutBoneName1", sizeof(FName)) ||
+        !ParamSize(out.components.function(), "OutBoneName2", sizeof(FName)) ||
+        !ParamSize(out.broken.function(), "ReturnValue", sizeof(bool)) ||
+        !ParamSize(out.setFrame.function(), "Frame", sizeof(uint8_t)) ||
+        !ParamSize(out.setFrame.function(), "RefFrame", sizeof(FTransform)) ||
+        !ParamSize(out.toWorld.function(), "ReturnValue", sizeof(FTransform)) ||
+        !ParamSize(out.rebind.function(), "Component1", sizeof(UObject*)) ||
+        !ParamSize(out.rebind.function(), "Component2", sizeof(UObject*)) ||
+        !ParamSize(out.rebind.function(), "BoneName1", sizeof(FName)) ||
+        !ParamSize(out.rebind.function(), "BoneName2", sizeof(FName)) || !out.components.invoke(joint)) return false;
+    out.weaponFrame = out.components.take<UObject*>(0) == wp.root ? 0 : 1;
+    if (!TwoHandJointMatches(hand, out) || !out.broken.invoke(joint) || out.broken.take<bool>(0)) return false;
+    if (!out.toWorld.invoke(joint)) return false;
+    out.scale = ToV3(out.toWorld.take<FTransform>(0).scale);
+    if (!UniformGripScale(out.scale)) { failure = "unsupported-scale"; return false; }
+    std::array<sync::GripFrame, 2> frames;
+    // Validate reflection and frame contents without changing either joint. The caller prepares both hands before
+    // the first rebind, so missing scale/metadata cannot leave only one hand taking the new path.
+    return ReadGripFrames(joint, frames);
+}
+
+bool FighterRig::TwoHandScaleMatches(TwoHandJoint& saved) {
+    if (!saved.toWorld.invoke(saved.joint)) return false;
+    const V3 current = ToV3(saved.toWorld.take<FTransform>(0).scale);
+    return UniformGripScale(current) && std::fabs(current.x - saved.scale.x) <= 1e-6 &&
+           std::fabs(current.y - saved.scale.y) <= 1e-6 && std::fabs(current.z - saved.scale.z) <= 1e-6;
+}
+
+bool FighterRig::RebaseTwoHandJoint(int hand, TwoHandJoint& out) {
+    if (!TwoHandJointMatches(hand, out) || !TwoHandScaleMatches(out) ||
+        !out.broken.invoke(out.joint) || out.broken.take<bool>(0)) return false;
+    UObject* component[2] = {out.root, out.mesh};
+    FName bone[2] = {FName{}, out.handBone};
+    if (out.weaponFrame == 1) { std::swap(component[0], component[1]); std::swap(bone[0], bone[1]); }
+    // Same bodies/bones still rebuild the low-level physics joint. No body is moved and existing limits/drives are
+    // retained, but the engine may wake bodies. This makes scale semantics unambiguous: UpdateConstraintFrames
+    // divides positions by constraint scale; InitConstraint multiplies them into active world-unit local offsets.
+    // Teardown restores this rebuilt baseline, not the pre-takeover native sliding/alternate-grip reference.
+    out.rebind.put(0, component[0]).put(1, bone[0]).put(2, component[1]).put(3, bone[1]);
+    if (!out.rebind.invoke(out.joint) || !TwoHandJointMatches(hand, out) || !TwoHandScaleMatches(out) ||
+        !out.broken.invoke(out.joint) || out.broken.take<bool>(0)) return false;
+    std::array<sync::GripFrame, 2> stored, frames;
+    if (!ReadGripFrames(out.joint, stored) || !sync::ScaleGripFrames(stored, out.scale, frames)) return false;
+    out.original = out.current = frames[out.weaponFrame];
+    out.handFrame = frames[1 - out.weaponFrame];
+    return true;
+}
+
+bool FighterRig::WriteTwoHandFrame(TwoHandJoint& saved, const sync::GripFrame& frame) {
+    Q4 rotation;
+    if (!sync::GripFrameRotation(frame, rotation)) return false;
+    FTransform transform;
+    transform.translation = ToF(frame.pos);
+    transform.rotation = ToFQuat(rotation);
+    saved.setFrame.put(0, saved.weaponFrame).put(1, transform);
+    if (!saved.setFrame.invoke(saved.joint)) return false;
+    saved.current = frame;
+    saved.changed = true;   // even a later failed update must not lose this restoration obligation
+    return true;
+}
+
+bool FighterRig::RestoreTwoHandJoint(TwoHandJoint& saved) {
+    if (!saved.changed) { saved = TwoHandJoint{}; return true; }
+    bool changed = saved.changed;
+    const bool restored = sync::RestoreGripFrame(saved.original, changed, TwoHandJointState(saved),
+        [&](const sync::GripFrame& frame) { return WriteTwoHandFrame(saved, frame); });
+    saved.changed = changed;
+    if (restored) saved = TwoHandJoint{};
+    return restored;
+}
+
+std::vector<FighterRig::TwoHandJoint>& FighterRig::DeferredTwoHandRestores() {
+    // Actor destruction can happen during process shutdown. Keep this queue alive until the process ends so it
+    // cannot be destroyed before a session's actors, and never invoke engine calls from its own destructor.
+    static auto* deferred = new std::vector<TwoHandJoint>;
+    return *deferred;
+}
+
+bool FighterRig::RestoreDeferredTwoHandPoses(UObject* mesh, int32_t meshIndex) {
+    auto& deferred = DeferredTwoHandRestores();
+    bool clear = true;
+    for (auto it = deferred.begin(); it != deferred.end();) {
+        if (RestoreTwoHandJoint(*it)) it = deferred.erase(it);
+        else {
+            if (it->mesh == mesh && it->meshIndex == meshIndex) clear = false;
+            ++it;
+        }
+    }
+    return clear;
+}
+
+bool FighterRig::RestoreDeferredTwoHandPoseFor(UObject* willie, int32_t index) {
+    if (DeferredTwoHandRestores().empty()) return true;
+    if (ObjectCount() <= 0) return false;   // unavailable object identity cannot discharge a pending restoration
+    const bool live = Live(willie, index);
+    UObject* mesh = live ? ObjField(willie, "Mesh") : nullptr;
+    if (live && !mesh) return false;   // do not mistake unavailable mesh reflection for an unrelated mesh
+    return RestoreDeferredTwoHandPoses(mesh, mesh ? ObjectIndex(mesh) : -1);
+}
+
+bool FighterRig::RestoreTwoHandPose() {
+    bool restored = true;
+    for (TwoHandJoint& saved : twoHandJoints_) restored = RestoreTwoHandJoint(saved) && restored;
+    return restored;
+}
+
+FighterRig::TwoHandResult FighterRig::ApplyTwoHandPose(const sync::PoseFrame& target, const sync::FighterNow& now,
+                                                     uint32_t heldBones, bool stale, double nowMs) {
+    TwoHandResult result;
+    if (!StillValid()) { result.reason = "not-ready"; return result; }
+    // Pausing must not restore a different seat into a pinned blade or grabbed arm. The caller also keeps the legacy
+    // grip/re-seat writers out until the external constraint is gone. Stale streams hold their last relative pose.
+    if (Pinned(0) || (heldBones & sync::kTwoHandArmBones) || stale) {
+        result.reason = Pinned(0) ? "pinned" : (heldBones & sync::kTwoHandArmBones) ? "held-arm" : "stale";
+        return result;
+    }
+    const Weapon& wp = weapons_[0];
+    sync::TwoHandPosePolicy policy;
+    policy.enabled = g_twoHandPose;
+    policy.gripLock = g_gripLock;
+    policy.localReady = wp.read && now.weaponValid[0] && offJoint_ && FieldAt(gripOffset_[1]) == offJoint_ &&
+                        GripToLock(0) && GripToLock(1);
+    policy.localClassHash = wp.classHash;
+    policy.localFlail = wp.flail || wp.linked;
+    policy.localMultipart = wp.head || !wp.parts.empty();
+    policy.localLeftWeapon = FieldAt(weaponOffset_[1]) && FieldAt(weaponOffset_[1]) != wp.actor;
+    policy.pinnedWeapons = pinned_; policy.heldBones = heldBones;
+    for (int b = 0; b < sync::kPoseBones; ++b) if (now.valid[b]) policy.validBones |= uint32_t(1) << b;
+    sync::TwoHandPoseReason reason = sync::TwoHandPoseStatus(target, policy);
+    if (reason != sync::TwoHandPoseReason::Ready) {
+        result.reason = sync::TwoHandPoseReasonName(reason);
+        // The streamed off-hand flag can flicker during a swing. Keep the last target until ApplyGrip's existing
+        // release hysteresis actually removes its joint; do not introduce a one-frame switch to a guessed seat.
+        if (reason == sync::TwoHandPoseReason::NotTwoHanded && offJoint_ && target.weapons[0].present &&
+            target.weapons[0].classHash == wp.classHash) return result;
+        if (!RestoreTwoHandPose()) { result.reason = "restore-failed"; result.failed = true; }
+        return result;
+    }
+    // The pose uses rigid world transforms. Positive uniform body scales include ordinary fighter heights; mirrored
+    // or nonuniform bodies retain the legacy path because the packet cannot describe their altered local geometry.
+    if (!UniformGripScale(wp.scale) || !UniformGripScale(handScale_[0]) || !UniformGripScale(handScale_[1])) {
+        result.reason = "unsupported-scale";
+        if (!RestoreTwoHandPose()) { result.reason = "restore-failed"; result.failed = true; }
+        return result;
+    }
+    bool bound = true;
+    for (int h = 0; h < 2; ++h) bound = TwoHandJointMatches(h, twoHandJoints_[h]) && bound;
+    if (!bound) {
+        if (!RestoreTwoHandPose()) { result.reason = "restore-failed"; result.failed = true; return result; }
+        if (nowMs < twoHandRetryMs_) { result.reason = "joint-unavailable"; return result; }
+        twoHandRetryMs_ = nowMs + 1000.0;
+        std::array<TwoHandJoint, 2> fresh;
+        const char* failure;
+        if (!BindTwoHandJoint(0, fresh[0], failure) || !BindTwoHandJoint(1, fresh[1], failure)) {
+            result.reason = failure; result.failed = true;
+            return result;   // neither frame was changed
+        }
+        if (!RebaseTwoHandJoint(0, fresh[0]) || !RebaseTwoHandJoint(1, fresh[1])) {
+            result.reason = "baseline-failed"; result.failed = true;
+            return result;   // no pose override was applied; any rebuilt joint retains its native regenerated frames
+        }
+        twoHandJoints_ = std::move(fresh);
+        twoHandRetryMs_ = 0;
+    }
+    // A runtime resize invalidates the captured conversion. Keep the last reference instead of guessing a new scale;
+    // a new native grip starts a fresh baseline. The normal lifecycle still owns and restores the saved offsets.
+    if (!TwoHandScaleMatches(twoHandJoints_[0]) || !TwoHandScaleMatches(twoHandJoints_[1])) {
+        result.reason = "scale-changed";
+        return result;
+    }
+    const std::array<sync::GripFrame, 2> handFrames = {twoHandJoints_[0].handFrame, twoHandJoints_[1].handFrame};
+    std::array<sync::GripFrame, 2> desired;
+    if (!sync::BuildTwoHandPose(target, policy, handFrames, desired, &reason)) {
+        result.reason = sync::TwoHandPoseReasonName(reason);
+        return result;   // a malformed target must never replace a previously valid frame
+    }
+    std::array<sync::GripFrame, 2> current = {twoHandJoints_[0].current, twoHandJoints_[1].current};
+    const auto applied = sync::UpdateTwoHandFrames(current, desired, [&](size_t hand, const sync::GripFrame& frame) {
+        TwoHandJoint& saved = twoHandJoints_[hand];
+        return TwoHandJointMatches(static_cast<int>(hand), saved) && saved.broken.invoke(saved.joint) &&
+               !saved.broken.take<bool>(0) && WriteTwoHandFrame(saved, frame);
+    });
+    result.active = result.updated = applied.applied;
+    result.failed = !applied.applied;
+    result.reason = applied.applied ? "pose" : applied.rollbackFailed ? "rollback-failed" : "write-failed";
+    return result;
+}
+
+bool FighterRig::TwoHandErrors(const sync::PoseFrame& target, const sync::FighterNow& now, std::array<double, 5>& out) const {
+    const Weapon& wp = weapons_[0];
+    return wp.read && wp.haveTip && !wp.flail && !wp.linked && sync::TwoHandWeaponAccepted(wp.head || !wp.parts.empty(), wp.classHash) &&
+           sync::MeasureTwoHandPose(target, now, wp.classHash, wp.tipPos, out);
+}
+
+std::string FighterRig::HeldWeaponName() const {
+    UObject* const actor = weapons_[0].actor;
+    return actor && Live(actor, weapons_[0].index) ? ObjectName(reinterpret_cast<UObject*>(ClassOf(actor))) : std::string("none");
+}
+
 // ApplySeat guesses the seat from the owner's toggles; the owner's game does not always re-seat (an alt grip on an axe
 // slides the hand and keeps the weapon's turn), and the guess held the axe upside down (hsm_held.h). The pose says where
 // the owner's weapon sits in the owner's hand: when this stand-in's differs for long enough, the weapon goes there and
@@ -1117,6 +1455,7 @@ bool FighterRig::MakeGripJoint(UObject* joint, UObject* root, const char* socket
 // shield (grips 6, 7) is held by the forearm: neither is re-seated here.
 void FighterRig::ApplyHeld(const sync::PoseFrame& target, const sync::FighterNow& now, double nowMs) {
     if (!StillValid()) return;
+    if (HasTwoHandPose()) { heldCheck_.Reset(); return; }   // active or paused: the pose owns these references
     UObject* const r = FieldAt(gripOffset_[0]);
     UObject* const weaponR = FieldAt(weaponOffset_[0]);
     if (r != heldJoint_ || weaponR != heldWeapon_) { heldJoint_ = r; heldWeapon_ = weaponR; heldCheck_.Forget(); }
@@ -1225,6 +1564,12 @@ void FighterRig::NeutraliseFull() {
         enabled(ObjField(willie_, "BoneCore"), savedCore_);
         Call root(willie_, "K2_GetRootComponent");
         enabled(root.invoke() ? root.get<UObject*>("ReturnValue") : nullptr, savedCapsule_);
+        for (size_t i = 0; i < std::size(kHiddenParts); ++i) enabled(ObjField(willie_, kHiddenParts[i]), savedHidden_[i]);
+        if (UObject* box = ObjField(willie_, "Box1")) {
+            Call g(box, "GetCollisionResponseToChannel");
+            g.set<uint8_t>("Channel", kBodyCollision);
+            if (g.invoke()) savedBox_ = g.get<uint8_t>("ReturnValue");
+        }
     }
     SetBodyPolicy(mesh_);
     for (Weapon& wp : weapons_)   // as of the last Read (Neutralise runs before this frame's): checked live
@@ -1241,6 +1586,12 @@ void FighterRig::NeutraliseFull() {
     CollisionOff(ObjField(willie_, "BoneCore"));   // HSMP main.lua:4673
     Call rc(willie_, "K2_GetRootComponent");
     CollisionOff(rc.invoke() ? rc.get<UObject*>("ReturnValue") : nullptr);   // the capsule only marks the position
+    if (g_partsOff) {
+        for (const char* f : kHiddenParts) CollisionOff(ObjField(willie_, f));
+        // Box1 has a joint to spine_03: a response, not its collision, so its physics stay as they were.
+        if (UObject* box = ObjField(willie_, "Box1"))
+            Call(box, "SetCollisionResponseToChannel").set<uint8_t>("Channel", kBodyCollision).set<uint8_t>("NewResponse", kIgnore).invoke();
+    }
     Call mv(willie_, "GetMovementComponent");
     if (UObject* m = mv.invoke() ? mv.get<UObject*>("ReturnValue") : nullptr) Call(m, "DisableMovement").invoke();
     // Bones refreshed from physics even off screen, or the servo reads a stale pose (HSMP main.lua:4672).
@@ -1251,8 +1602,11 @@ void FighterRig::NeutraliseFull() {
     slots_.Maintain(willie_);   // the sheathed weapons: diagnosis line (standin_slots.h)
 }
 
-void FighterRig::Revive() {
-    if (!StillValid()) { Unbind(); return; }
+bool FighterRig::Revive() {
+    // No native fields or control resume until the remote pose's references have been restored. A transient read
+    // or write failure leaves this bound rig intact for the next hand-off attempt.
+    if (!RestoreTwoHandPose()) return false;
+    if (!StillValid()) { Unbind(); return true; }
     auto* base = reinterpret_cast<uint8_t*>(willie_);
     if (savedFields_) {
         for (size_t i = 0; i < zeroDoubles_.size() && i < savedDoubles_.size(); ++i) *reinterpret_cast<double*>(base + zeroDoubles_[i]) = savedDoubles_[i];
@@ -1275,6 +1629,12 @@ void FighterRig::Revive() {
     Call rc(willie_, "K2_GetRootComponent");
     UObject* capsule = rc.invoke() ? rc.get<UObject*>("ReturnValue") : nullptr;
     if (capsule) Call(capsule, "SetCollisionEnabled").set<uint8_t>("NewType", savedCapsule_).invoke();
+    if (g_partsOff)
+        for (size_t i = 0; i < std::size(kHiddenParts); ++i)
+            if (UObject* part = savedHidden_[i] != 0xff ? ObjField(willie_, kHiddenParts[i]) : nullptr)
+                Call(part, "SetCollisionEnabled").set<uint8_t>("NewType", savedHidden_[i]).invoke();
+    if (UObject* box = g_partsOff ? ObjField(willie_, "Box1") : nullptr)
+        Call(box, "SetCollisionResponseToChannel").set<uint8_t>("Channel", kBodyCollision).set<uint8_t>("NewResponse", savedBox_).invoke();
     Call mv(willie_, "GetMovementComponent");
     if (UObject* m = mv.invoke() ? mv.get<UObject*>("ReturnValue") : nullptr)
         Call(m, "SetMovementMode").set<uint8_t>("NewMovementMode", 1).set<uint8_t>("NewCustomMode", 0).invoke();   // MOVE_Walking
@@ -1285,6 +1645,7 @@ void FighterRig::Revive() {
     HSM_LOG("rig: %s revived (fields %s, %d root constraint(s) made again, capsule collision %u)", ObjectName(willie_).c_str(),
             savedFields_ ? "restored" : "never neutralised", joined, unsigned(savedCapsule_));
     Unbind();
+    return true;
 }
 
 // A weapon's bodies back to a dropped weapon's physics (ObjectSync::RestorePhysics): gravity, every channel blocked, then
@@ -1306,5 +1667,9 @@ void FighterRig::RearmDropped(const Weapon& wp) {
 }
 
 void SetStandInGripLock(bool on) { g_gripLock = on; }
+void SetStandInPartsOff(bool on) { g_partsOff = on; }
+void SetStandInTwoHandPose(bool on) { g_twoHandPose = on; }
+void SetStandInTwoHandLock(bool on) { g_twoHandLock = on; }
+void SetStandInTwoHandAudit(bool on) { g_twoHandAudit = on; }
 
 }  // namespace hsm::game

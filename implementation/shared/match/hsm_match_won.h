@@ -20,16 +20,20 @@ struct StockMatchFlags {
     bool clearPlayerDed = false;     // the fighter is alive: a Player DED the game left set is stale
 };
 
-inline MatchWonFlag MatchWonFor(const MatchInfo& m) {
+// `oneFight`: a Progression fight. Won and waiting for G (CoopFightWon), Match Won is set as the stock win sets it
+// (BP_HalfSwordGameMode Minus_Enemy, blocked in a session): without it the stock Talk key on G kneels the player in a give-up,
+// and the fight's end then keeps no kit (Override Player Character Equipment skips the kit of a fighter who gave up).
+inline MatchWonFlag MatchWonFor(const MatchInfo& m, bool oneFight = false) {
+    if (CoopFightWon(m, oneFight)) return MatchWonFlag::Set;
     const bool fought = m.phase == uint8_t(MatchPhase::Live) || m.phase == uint8_t(MatchPhase::SuddenDeath);
     if (!fought || InRoundGap(m)) return MatchWonFlag::Leave;
     return InWaveBreak(m) ? MatchWonFlag::Set : MatchWonFlag::Clear;
 }
 
 // `playerAlive`: this machine's fighter is in the fight and its body is alive here (not waiting for a respawn).
-inline StockMatchFlags StockFlagsFor(const MatchInfo& m, bool playerAlive) {
+inline StockMatchFlags StockFlagsFor(const MatchInfo& m, bool playerAlive, bool oneFight = false) {
     StockMatchFlags f;
-    f.matchWon = MatchWonFor(m);
+    f.matchWon = MatchWonFor(m, oneFight);
     f.clearPlayerDed = playerAlive;
     return f;
 }

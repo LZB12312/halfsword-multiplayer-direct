@@ -128,6 +128,7 @@ constexpr size_t QuatWireBits(unsigned bits) { return 2 + 3 * size_t(bits); }
 
 class BitWriter {
 public:
+    explicit BitWriter(std::vector<uint8_t>& out) : out_(out) {}
     void Put(uint32_t v, unsigned bits) {
         if (bits == 0) return;
         uint64_t mask = (bits >= 32) ? 0xFFFFFFFFull : ((1ull << bits) - 1);
@@ -136,13 +137,12 @@ public:
         while (n_ >= 8) { out_.push_back(uint8_t(acc_ & 0xFF)); acc_ >>= 8; n_ -= 8; }
     }
     void PutI(int32_t v, unsigned bits) { Put(uint32_t(v), bits); }
-    std::vector<uint8_t> Finish() {
+    void Finish() {
         if (n_ > 0) out_.push_back(uint8_t(acc_ & 0xFF));
-        return std::move(out_);
     }
 
 private:
-    std::vector<uint8_t> out_;
+    std::vector<uint8_t>& out_;   // append after the pose header, using its already reserved storage
     uint64_t acc_ = 0;
     unsigned n_ = 0;
 };
@@ -199,8 +199,25 @@ inline uint32_t MuEncode(double x, double max) {
     return (x < 0.0 ? 0x80u : 0u) | mi;
 }
 inline double MuDecode(uint32_t c, double max) {
-    double m = double(c & 0x7Fu) / 127.0;
-    double a = (std::pow(1.0 + kMuLaw, m) - 1.0) / kMuLaw * max;
+    // Only 128 magnitudes at each wire scale. Keep the original operation order (including the final multiply)
+    // so every decoded double, including signed zero, is identical to the formula. Other scales keep the formula.
+    static const auto table = [] {
+        std::array<std::array<double, 128>, 2> values{};
+        for (size_t i = 0; i < 128; ++i) {
+            const double m = double(i) / 127.0;
+            const double a = (std::pow(1.0 + kMuLaw, m) - 1.0) / kMuLaw;
+            values[0][i] = a * kVLinMax;
+            values[1][i] = a * kVAngMax;
+        }
+        return values;
+    }();
+    double a;
+    if (max == kVLinMax) a = table[0][c & 0x7Fu];
+    else if (max == kVAngMax) a = table[1][c & 0x7Fu];
+    else {
+        const double m = double(c & 0x7Fu) / 127.0;
+        a = (std::pow(1.0 + kMuLaw, m) - 1.0) / kMuLaw * max;
+    }
     return (c & 0x80u) ? -a : a;
 }
 inline void PutVelMu(BitWriter& w, V3 v, double max) {
@@ -391,7 +408,7 @@ inline void EncodePoseInto(const PoseFrame& f, std::vector<uint8_t>& out) {
     detail::AppendU16LE(out, kq);
     const double kRec = 0.5 + double(kq) / 65535.0;
 
-    detail::BitWriter w;
+    detail::BitWriter w(out);
     std::array<V3, kPoseBones> recPos{};
     std::array<Q4, kPoseBones> recRot{};
     recPos[0] = pelvisPos;
@@ -457,8 +474,7 @@ inline void EncodePoseInto(const PoseFrame& f, std::vector<uint8_t>& out) {
         detail::PutVelMu(w, SafeV3(h.angVelDeg), kVAngMax);
     }
 
-    std::vector<uint8_t> body = w.Finish();
-    out.insert(out.end(), body.begin(), body.end());
+    w.Finish();
 }
 
 inline std::vector<uint8_t> EncodePose(const PoseFrame& f) {

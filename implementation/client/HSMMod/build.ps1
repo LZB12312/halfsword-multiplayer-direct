@@ -5,12 +5,12 @@ if (!$Toolchain) { throw 'Set LLVM_MINGW or pass -Toolchain pointing to a Window
 $cc = Join-Path $Toolchain 'bin/x86_64-w64-mingw32-clang.exe'
 $cxx = Join-Path $Toolchain 'bin/x86_64-w64-mingw32-clang++.exe'
 $opt = if ($Configuration -eq 'Debug') { '-O0' } else { '-O2' }
-$common = @($opt, '-Wall', '-Wextra', '-D_WIN32_WINNT=0x0A00', '-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX', '-fstack-protector-strong')
-$inc = @('-Isrc','-I../../shared','-I../../shared/protocol','-Ithird_party/minhook/include','-Ithird_party/enet/include','-Ithird_party/miniupnpc/include','-iquotethird_party/miniupnpc','-DMINIUPNP_STATICLIB')
+$common = @($opt, '-Wall', '-Wextra', '-D_WIN32_WINNT=0x0A00', '-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX', '-fstack-protector-strong','-DMINIZ_NO_STDIO','-DMINIZ_NO_TIME','-DMINIZ_NO_ARCHIVE_WRITING_APIS','-DMINIZ_NO_ZLIB_COMPATIBLE_NAMES')
+$inc = @('-Isrc','-I../../shared','-I../../shared/protocol','-Ithird_party/minhook/include','-Ithird_party/miniz','-Ithird_party/enet/include','-Ithird_party/miniupnpc/include','-iquotethird_party/miniupnpc','-DMINIUPNP_STATICLIB')
 $describe = (git describe --always --dirty --exclude='*') -replace '[^A-Za-z0-9._+-]', ''
 New-Item -ItemType Directory -Force build/obj | Out-Null
 $objects = @()
-$sources = @('third_party/minhook/src/buffer.c','third_party/minhook/src/hook.c','third_party/minhook/src/trampoline.c','third_party/minhook/src/hde/hde64.c')
+$sources = @('third_party/miniz/miniz.c','third_party/minhook/src/buffer.c','third_party/minhook/src/hook.c','third_party/minhook/src/trampoline.c','third_party/minhook/src/hde/hde64.c')
 $sources += @('callbacks','compress','host','list','packet','peer','protocol','win32') | ForEach-Object { "third_party/enet/$_.c" }
 $sources += @('igd_desc_parse','miniupnpc','minixml','minisoap','minissdpc','miniwget','upnpcommands','upnpdev','upnpreplyparse','upnperrors','connecthostport','portlistingparse','receivedata','addr_is_reserved') | ForEach-Object { "third_party/miniupnpc/src/$_.c" }
 foreach ($file in $sources) {

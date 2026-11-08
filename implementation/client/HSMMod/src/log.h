@@ -8,6 +8,7 @@ void Log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 // Like Log, but gives up instead of waiting if another thread holds the log (for the fault handler).
 void LogTry(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void InstallCrashLog();   // crash_log.cpp
+void NoteLastBlow(int attacker, int striker, int source, const char* component, const char* bone);   // crash_log.cpp: named if the game then crashes
 // Called every game tick (crash_log.cpp): once the game has run kFaultSurvivedMs past the last logged fault, logs
 // "crash: the game still runs ..." (the engine's crash reporter may still end it) and re-arms the minidump.
 void NoteGameCarriedOn();

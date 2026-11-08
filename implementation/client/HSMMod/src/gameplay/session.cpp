@@ -16,12 +16,15 @@
 //   relays the streams, routes the claims and referees the match. It is the only mode: the host-simulates-all flow
 //   (sync_mode=host) was removed in 0.8.0, and a machine without the script VM hook refuses to start a session.
 #include "config.h"
+#include "util/hsm_cadence.h"
 #include "util/hsm_names.h"
 #include "util/hsm_sanitize.h"
 #include "gameplay/adapter.h"
 #include "gameplay/abyss_coop.h"
 #include "gameplay/chest_lids.h"
+#include "gameplay/fighter_boxes.h"
 #include "gameplay/claims.h"
+#include "gameplay/hit_probe.h"
 #include "gameplay/combat_sync.h"
 #include "gameplay/equip_sync.h"
 #include "gameplay/fx_sync.h"
@@ -44,6 +47,7 @@
 #include "gameplay/standin_gore.h"
 #include "gameplay/spectate.h"
 #include "gameplay/lobby.h"
+#include "gameplay/mod_rules.h"
 #include "gameplay/session.h"
 #include "gameplay/travel.h"
 #include "gameplay/voice.h"
@@ -92,6 +96,8 @@
 #include "session/hsm_blob.h"
 #include "session/hsm_budget.h"
 #include "sync/hsm_handoff.h"
+#include <thread>
+#include <mutex>
 #include "sync/hsm_lockon.h"
 #include <tuple>
 #include "session/hsm_build.h"
@@ -116,6 +122,15 @@
 #include "agent/vmhook.h"
 #include "paths.h"
 #include "test/harness.h"
+#include "ui/build_card.h"
+#include "match/hsm_online_rules.h"
+#include "gameplay/claw_mirror.h"
+#include "enhancer.h"
+#include <cstdio>
+#include <set>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include "util/hsm_sha256.h"
 #include "ui/chat.h"
 #include "ui/hud.h"
 #include "ui/menu.h"
@@ -124,6 +139,9 @@
 #include "ue/hook.h"
 #include "ue/script_hook.h"
 #include <windows.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
 #include <array>
 #include <chrono>
 #include <deque>
@@ -160,6 +178,14 @@ constexpr const char* kMenuLevel = "/Game/Maps/Menus/Map_Menu_Startup";
 
 uint32_t NowMs() { return uint32_t(GetTickCount64()); }
 bool IsMenuLevel(const std::string& level) { return level.find("/Maps/Menus/") != std::string::npos || level.find("Map_Menu_") != std::string::npos; }
+// A travel into Progression (Free Mode off: the Tavern or one of its fights), not a lobby fight or a menu: a level of the
+// multiplayer career (session/hsm_mp_career.h). Settings that say nothing of Free Mode make no career travel.
+bool CareerTravelOf(const std::string& level, const std::vector<Setting>& settings) {
+    if (IsMenuLevel(level)) return false;
+    for (const Setting& s : settings)
+        if (s.name == "Free Mode Activated") return !s.value.empty() && s.value[0] == 0;
+    return false;
+}
 // "Current Lose Condition" as a travel carried it; -1 when the settings say nothing about it.
 int LoseConditionOf(const std::vector<Setting>& settings) {
     for (const Setting& s : settings)
@@ -201,7 +227,7 @@ bool ValidateForHost(const uint8_t* d, size_t n, uint8_t) {
         case MsgType::LoadoutChange: { LoadoutChangeMsg m; return Decode(d, n, m); }   // rev 36: the chunks of a new passport; the host's answer is client-bound
         case MsgType::Chat: { ChatLine m; return Decode(d, n, m); }
         case MsgType::Ping: case MsgType::Pong: { Ping m; bool p; return DecodePing(d, n, m, p); }
-        case MsgType::Pose: { PoseMsg m; return Decode(d, n, m); }
+        case MsgType::Pose: { PoseMsg m; return DecodePoseEnvelope(d, n, m); }   // fully decoded once, after the receive budget
         case MsgType::Vitals: { VitalsMsg m; return Decode(d, n, m); }
         case MsgType::DeathReport: { DeathReport m; return Decode(d, n, m); }
         case MsgType::GiveUp: { GiveUpMsg m; return Decode(d, n, m); }
@@ -224,6 +250,8 @@ bool ValidateForHost(const uint8_t* d, size_t n, uint8_t) {
         case MsgType::HandOff: { sync::HandOffMsg m; return Decode(d, n, m) && !m.full; }   // rev 32: a client writes entries, never the table
         case MsgType::HandOffAsk: { sync::HandOffAskMsg m; return Decode(d, n, m); }
         case MsgType::ProgressionVote: { ProgVoteMsg m; return Decode(d, n, m) && m.kind == ProgVoteKind::Pick; }   // rev 36: a client only picks
+        case MsgType::ModList: { ModListMsg m; return Decode(d, n, m); }       // rev 40: the player's mods (mod rules)
+        case MsgType::ModAnswer: { ModAnswerMsg m; return Decode(d, n, m); }   // rev 40: the answer to a ModChallenge
         default: return false;
     }
 }
@@ -250,7 +278,7 @@ bool ValidateForClient(const uint8_t* d, size_t n, uint8_t) {
         case MsgType::Chat: { ChatLine m; return Decode(d, n, m); }
         case MsgType::CombatEvent: { CombatEvent m; return Decode(d, n, m); }
         case MsgType::Ping: case MsgType::Pong: { Ping m; bool p; return DecodePing(d, n, m, p); }
-        case MsgType::Pose: { PoseMsg m; return Decode(d, n, m); }
+        case MsgType::Pose: { PoseMsg m; return DecodePoseEnvelope(d, n, m); }   // session checks the skeleton before use/relay
         case MsgType::Vitals: { VitalsMsg m; return Decode(d, n, m); }
         case MsgType::HitClaim: { HitClaimMsg m; return Decode(d, n, m); }
         case MsgType::HitFx: { HitFxMsg m; return Decode(d, n, m); }
@@ -278,6 +306,9 @@ bool ValidateForClient(const uint8_t* d, size_t n, uint8_t) {
         case MsgType::RelayInput: { RelayInput m; return Decode(d, n, m); }
         case MsgType::ModeEvent: { ModeEventMsg m; return Decode(d, n, m); }   // Wave 3: host -> client only (never in ValidateForHost)
         case MsgType::ProgressionVote: { ProgVoteMsg m; return Decode(d, n, m) && m.kind != ProgVoteKind::Pick; }   // rev 36: the host's options, tally and result
+        case MsgType::SessionMods: { SessionModsMsg m; return Decode(d, n, m); }       // rev 40: host -> client only
+        case MsgType::ModChallenge: { ModChallengeMsg m; return Decode(d, n, m); }     // rev 40: host -> client only
+        case MsgType::ProgressionResult: { ProgResultMsg m; return Decode(d, n, m); }   // rev 41: host -> client only (never in ValidateForHost)
         default: return false;
     }
 }
@@ -312,6 +343,44 @@ public:
         lobby_.onMemberJoined = [this](direct::UserId id) { if (directNet_ && lobby_.IsHost()) directNet_->AllowPeer(id); };
         lobby_.onMemberLeft = [this](direct::UserId id) { lobbyGate_.Forget(id); meshPeers_.Forget(id); if (directNet_) directNet_->DropPeer(id); };
         lobby_.onChat = [this](direct::UserId from, const std::string& text) { OnLobbyChat(from, text); };
+        lobby_.onEnterCard = [] { ui::BuildCardClear(); };
+        lobby_.myCard = [this] { return MyBuildCard(); };
+        { ModPreset p = ModPreset::MapsOnly; lobby_.hostPreset = ParseModPreset(cfg_.modRule, p) ? p : ModPreset::MapsOnly; }
+        lobby_.hostBlock = LobbyBlock{cfg_.blockHse, cfg_.modBlockAll};
+        blockRule_ = lobby_.hostBlock;
+        lobby_.onlineBlock = [this](ModPreset preset, LobbyBlock rule) {
+            std::string why = OnlineBlockReason(preset, rule);
+            if (!why.empty()) { blockAttempt_ = true; blockRule_ = rule; }   // the overlay says what to do about it
+            return why;
+        };
+        lobby_.myRuleSheet = [this] { return MyRuleSheet(); };
+        lobby_.onBuildCard = [this](const std::string& name, const std::string& card) {
+            BuildCard decoded = DecodeCard(name, card);
+            if (NameHasSlur(decoded.build)) decoded.build.clear();   // the launcher's build name, in other lobbies: typed by a peer as well
+            // Checked here too, by this player's copy of the rules, so a player's own edited setup can't vouch for itself.
+            if (const std::vector<std::string> bad = lobby_.InClassesLobby() ? UnsupportedOnCard(decoded.mods) : std::vector<std::string>{}; !bad.empty()) {
+                std::string list;
+                for (size_t i = 0; i < bad.size() && i < 3; ++i) list += (i ? ", " : "") + bad[i];
+                if (warnedMods_.insert(decoded.player + "|" + list).second) ui::ShowLine("HSMMod", style::kWarn, decoded.player + " is using unsupported mods: " + list);
+            }
+            // What the class does, from the class this player reports: the name alone says nothing about a custom one.
+            if (lobby_.InClassesLobby())
+                for (const game::LobbyMember& m : lobby_.members())
+                    if (m.name == name)
+                        if (const auto sheet = DecodeClass(MemberSheet(m.id)))
+                            decoded.build = ClassNameFromPeer(decoded.build, *sheet) + ": " + ClassSummary(*sheet);
+            // Where HS Enhancer is allowed the class doesn't say what someone's running, so the card says what they report instead.
+            if (lobby_.InClassesLobby() && !lobby_.CurrentBlock().hse)
+                for (const game::LobbyMember& m : lobby_.members())
+                    if (m.name == name)
+                        if (const auto live = DecodeClass(direct::MemberData(lobby_.id(), m.id, kMemberLiveKey).substr(0, kMaxClassValue + 1))) {
+                            const bool past = LivePastLimits(*live);
+                            decoded.mods = std::string(past ? "PAST THE LIMITS: " : "Running: ") + ClassSummary(*live) + (decoded.mods.empty() ? "" : " | ") + decoded.mods;
+                            HSM_LOG("rules: %s reports %s", name.c_str(), ClassSummary(*live).c_str());
+                            if (past && warnedPast_.insert(m.id).second) ui::ShowLine("HSMMod", style::kWarn, name + "'s stats are past the limits: " + ClassSummary(*live));
+                        }
+            if (cfg_.buildCards) ui::BuildCardPush(std::move(decoded));
+        };
         lobby_.onPresence = [](const std::string& name, bool joined) { ui::ShowLine("HSMMod", style::kBone, (name.empty() ? "?" : name) + (joined ? " joined" : " left")); };
         ui::ChatSetup(cfg_.chatKey, [this](bool on) {   // in a menu level the chat closing gives the menu its cursor back
                 adapter_.CaptureInput(on); if (!on && !InFightLevel()) adapter_.ShowPauseCursor(); }, [this] { return adapter_.GamePaused() || adapter_.PauseMenuOpen(); });
@@ -430,7 +499,7 @@ public:
         pumpMs_[part] += ms;
         pumpMaxMs_[part] = std::max(pumpMaxMs_[part], ms);
     }
-    void ClearPumpCost() { pumpMs_.fill(0); pumpMaxMs_.fill(0); pumpLookups_.fill(0); driveFed_ = driveSkipped_ = 0; }
+    void ClearPumpCost() { tickPartMs_.fill(0); pumpMs_.fill(0); pumpMaxMs_.fill(0); pumpLookups_.fill(0); driveFed_ = driveSkipped_ = 0; }
 
     // " | pump ms/frame: net A streams B ... (max P x ms)": P is the part with the longest single run in the window.
     std::string PumpLine(double frames) const {
@@ -564,7 +633,10 @@ public:
             game::shareddice::Install();
         }
         if (!selfTestOk_) return;
-        if (steamMode()) { lobby_.Tick(); game::modpack::Tick(lobby_); }
+        // Where the rest of the tick goes: the pump parts cover about 1 ms a frame of a mod tick that averaged 3 to 8 ms in the
+        // 2026-11-05 playtest. Each lap adds the time since the last one to its part (only while the health line samples).
+        TickLaps laps(*this);
+        if (steamMode()) { lobby_.Tick(); game::modpack::Tick(lobby_); game::modrules::LobbyTick(lobby_); }
         game::TickSeverEase(lobby_.SeverEase());
         if(IsHost() && net_) {
             for(const auto& m:lobby_.members()) roster_.Rename(m.host?kHostKey:m.id,m.name);
@@ -575,6 +647,7 @@ public:
         if (SteamServer()) ServerLobbyTick();
         // Level change first: everything after this point must use the current world, never the old game mode.
         bool levelChanged = gameMode != lastGameMode_;
+        laps.Lap(TickPart::Lobby);
         if (levelChanged) FlushReflectionCache();     // the old level's classes are gone (again each retry: harmless)
         if (levelChanged) ShowProfilerMessage(ue::prof::StopCapture());
         if (!adapter_.Resolve(gameMode)) return;     // retried next tick, with the level change still pending
@@ -591,12 +664,18 @@ public:
             if (done) HSM_LOG("session: menu level: cursor and UI input given back");
         }
         if(ui::loadout::Tick(adapter_)) { ChangeLoadout(); ui::RequestOpen(); }
+        TickWolverineReload();
+        laps.Lap(TickPart::Setup);
         if (!inFight_) ui::Tick(*this, gameMode);   // the main menu exists only in menu levels (its scan walks every object)
         else if (FighterLevel()) ui::LeaveMenus();
+        laps.Lap(TickPart::Menu);
         if (net_ && FighterLevel()) { TickOwnBuild(); TickStockFlags(); }
+        if (FighterLevel()) { ClassStatsTick(); GuestClassTick(); ClassLookTick(); }
         EnsureLocalFighter();
         test::Tick(adapter_, InFightLevel(), dt);
+        laps.Lap(TickPart::Fighter);
         if (cfg_.record) recorder_.Tick(adapter_, gameMode, FighterLevel(), currentLevel_, adapter_.PlayerWillie(0), dt);
+        laps.Lap(TickPart::Recorder);
         ApplyHeldInput();
         if (mirror_.Active() && net_) mirror_.Command({"off"}, adapter_, true, InFightLevel());   // offline bench only
         mirror_.Tick(adapter_, dt);
@@ -629,7 +708,9 @@ public:
             if (!IsHost() || !ModerationLine(*line, 0, false)) SendChat(*line);
         if (IsServer()) ConsoleTick();   // before the no-session return: bans can be listed and lifted while idle
         if (!net_) { if (localFighter_) VoiceIdleTick(); ui::HudTick({}, {}); ui::ChatDrop("session over"); return; }
+        laps.Lap(TickPart::Guards);
         if (IsHost()) HostTick(dt); else ClientTick(dt);
+        laps.Lap(TickPart::Net);
         AbyssTick();
         VoiceTick();
         TintTick();
@@ -650,6 +731,7 @@ public:
             if (!typing) pauseMenuWas_ = menu;
         }
         if (net_) { BenchedBodyTick(); SpectateTick(); }
+        laps.Lap(TickPart::Voice);
         // Once a game run, in the first session fight: how to report a bug (the relay must be set).
         if (bugHintAt_ && NowMs() >= bugHintAt_) {
             bugHintAt_ = 0; bugHintShown_ = true;
@@ -668,10 +750,49 @@ public:
         HudScene hud = BuildHud();
         ui::HudTick(hud, NameTags(hud), Format(info_.format), CtfMarkers(hud));
         ui::ChatTick(hud);
+        if (const SHORT cardKey = GetAsyncKeyState(cfg_.buildCardKey); (cardKey & 1) && hud.visible && !ui::Typing() && cfg_.buildCards) ui::BuildCardToggle();
+        ui::BuildCardTick(hud.visible);
+        laps.Lap(TickPart::Hud);
+        CardCheckTick();
+        ClassRuleTick();
+        SelfRuleTick();
+        HostRuleTick();
+        ClawWeaponTick();
+        ClawMirrorTick();
+        laps.Lap(TickPart::Rules);
+    }
+    enum class TickPart : uint8_t { Lobby, Setup, Menu, Fighter, Recorder, Guards, Net, Voice, Hud, Rules, Count };
+    static constexpr const char* kTickPartNames[] = {"lobby", "setup", "menu", "fighter", "recorder", "guards", "net", "voice", "hud", "rules"};
+    std::array<double, size_t(TickPart::Count)> tickPartMs_{};
+    struct TickLaps {
+        SessionImpl& s; std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+        explicit TickLaps(SessionImpl& owner) : s(owner) {}
+        void Lap(TickPart p) {
+            if (!s.sampling_ || s.tickMs_.size() >= kFrameSamples) return;
+            const auto now = std::chrono::steady_clock::now();
+            s.tickPartMs_[size_t(p)] += std::chrono::duration<double, std::milli>(now - t).count();
+            t = now;
+        }
+    };
+
+    // Each Steam session's route (direct or through which Valve relay), the first time it is seen and whenever it changes:
+    // a high ping on a relayed pair is the route, not the distance (steam/hsm_steam_route.h).
+    void LogRoutes(const char* who) {
+        if (!net_) return;
+        auto note = [&](uint32_t peer, int slot) {
+            const std::string r = net_->RouteChange(peer);
+            if (r.empty()) return;
+            const std::string name = slot == kHostSlot ? std::string("host") : "slot" + std::to_string(slot);
+            HSM_LOG("%s: route: %s %s, steam rtt %u ms", who, name.c_str(), r.c_str(), net_->RoundTripMs(peer));
+        };
+        if (IsHost()) for (const auto& [peer, p] : peers_) note(peer, p.slot);
+        else if (hostPeer_) note(hostPeer_, kHostSlot);
+        if (!IsHost()) for (uint8_t s : meshPeers_.Slots()) if (const uint32_t p = meshPeers_.PeerOfSlot(s)) note(p, s);
     }
 
-    // One line every 5 s in a session fight (see LogOwnerHealth).
-    void LogHealth() { LogOwnerHealth(); }
+    // One line every 5 s in a session fight (see LogOwnerHealth). A client joining from a fight has a network before the
+    // Welcome starts owner sync, and the health lines read systems that aren't up until then: Claims' stand-ins crashed it.
+    void LogHealth() { if (streams_.Started()) LogOwnerHealth(); }
 
     // Mesh: off prints nothing. Host: what each client says it hears directly and how many relays that saved. Client: the
     // direct peers, streams that arrived and were used, anything else from a non-host peer that was dropped.
@@ -766,12 +887,17 @@ public:
         LogMeshHealth(who);
         if (staleLife_) { HSM_LOG("%s: %u claims or reports dropped for naming an old body", who, staleLife_); staleLife_ = 0; }
         HSM_LOG("%s: %s", who, FrameAndPingLine().c_str());
+        LogRoutes(who);
         HSM_LOG("%s: %s", who, CensusLine().c_str());
+        standIns_.SetAudit(cfg_.helpImprove);   // update consent before emitting or retaining detailed motion diagnostics
         if (std::string line = standIns_.HealthLine(); !line.empty()) HSM_LOG("%s: %s", who, line.c_str());
         HSM_LOG("%s: %s", who, claims_.HealthLine().c_str());
-        standIns_.SetAudit(cfg_.helpImprove);   // T2: stand-in fields written here between two Vitals
         claims_.SetAudit(cfg_.helpImprove);   // C0: the hit audit only with HELP IMPROVE THE MOD on (0.8.0-pre7)
         if (std::string line = claims_.AuditLine(); !line.empty()) HSM_LOG("%s: %s", who, line.c_str());
+        if (hitProbe_.On()) {   // raw contacts with stand-ins, with HELP IMPROVE THE MOD on
+            if (std::string line = hitProbe_.DrainLine(); !line.empty()) HSM_LOG("%s: %s", who, line.c_str());
+            ProbeCensus();
+        }
         HSM_LOG("%s: %s", who, fx_.HealthLine().c_str());
         if (std::string line = game::PaintDeferHealthLine(); !line.empty()) HSM_LOG("%s: %s", who, line.c_str());
         if (std::string line = game::shareddice::HealthLine(); !line.empty()) HSM_LOG("%s: %s", who, line.c_str());
@@ -858,6 +984,9 @@ public:
                           double(rc.misses - lookupMissesAtWindow_) / frames);
             line += b;
             line += PumpLine(frames);
+            line += " | tick parts ms/frame:";
+            for (size_t i = 0; i < tickPartMs_.size(); ++i) { std::snprintf(b, sizeof b, " %s %.2f", kTickPartNames[i], tickPartMs_[i] / frames); line += b; }
+            tickPartMs_.fill(0);
             if (driveFed_ + driveSkipped_) {   // axis events played on other players' fighters (drive_lean spares some)
                 std::snprintf(b, sizeof b, " | drive events fed %.1f skipped %.1f /frame", double(driveFed_) / frames, double(driveSkipped_) / frames);
                 line += b;
@@ -1372,13 +1501,14 @@ public:
     }
 
     // Kicked or banned: the client is told why, leaves the roster now, and its connection closes a moment later.
-    void DropMember(uint32_t peer, RejectReason why) {
+    void DropMember(uint32_t peer, RejectReason why, const std::string& detail = {}) {
         auto it = peers_.find(peer);
         if (it == peers_.end()) return;
         const uint8_t slot = it->second.slot;
         const uint64_t key = it->second.key;
         vote_.Left(key);
-        RejectPeer(peer, why);
+        RejectPeer(peer, why, detail);
+        sessionModsDirty_ = true;
         peerSilence_.Forget(peer);
         peers_.erase(it);
         MeshRosterChanged(slot);
@@ -1387,8 +1517,9 @@ public:
     }
 
     // Reject first; the disconnect follows kRejectLingerMs later so the Reject is not lost with the closed session.
-    void RejectPeer(uint32_t peer, RejectReason why) {
-        Reject r; r.reason = why;
+    // detail: what the player is told to remove or install (mod rules), printable ASCII.
+    void RejectPeer(uint32_t peer, RejectReason why, const std::string& detail = {}) {
+        Reject r; r.reason = why; r.detail = detail.substr(0, kMaxRejectDetail);
         net_->Send(peer, kChanReliable, Encode(r), true);
         for (const auto& d : pendingDrops_) if (d.first == peer) return;
         pendingDrops_.push_back({peer, NowMs() + kRejectLingerMs});
@@ -1427,7 +1558,7 @@ public:
 
     // A client the host refused (full, other version, kicked, banned): back to the menu, out of the Steam lobby, told why.
     // Without this the client sat in the lobby waiting for a Welcome that never came (N2).
-    void OnRejected(RejectReason why) {
+    void OnRejected(RejectReason why, const std::string& detail) {
         const char* msg = "The host refused the connection.";
         switch (why) {
             case RejectReason::BadRevision: msg = "The host runs another HSMMod version; everyone needs the same one."; break;
@@ -1438,16 +1569,22 @@ public:
             case RejectReason::Banned: msg = "You are banned from this lobby (by the host, an admin or a vote)."; break;
             case RejectReason::WrongPassword: msg = "Wrong password"; break;
             case RejectReason::TooManyTries: msg = "Too many wrong tries: wait 60 s"; break;
+            case RejectReason::ModBuild: msg = "The host runs another HSMMod build; everyone needs the same one."; break;
+            case RejectReason::ModsNotAllowed: msg = "The host's mod rules do not allow your mods."; break;
+            case RejectReason::ModifiedClient: msg = "Your HSMMod did not pass the host's check: reinstall the release."; break;
         }
-        HSM_LOG("client: rejected by the host (reason %d); leaving", int(why));
+        // Mod rules: the host says what to remove or install (session/hsm_mod_rules.h); that replaces the generic line.
+        const bool modReason = why == RejectReason::ModBuild || why == RejectReason::ModsNotAllowed || why == RejectReason::ModifiedClient;
+        const std::string text = modReason && !detail.empty() ? detail : std::string(msg);
+        HSM_LOG("client: rejected by the host (reason %d%s%s); leaving", int(why), detail.empty() ? "" : ": ", detail.c_str());
         const bool fight = InFightLevel();
         const direct::UserId lobbyId = lobby_.id();
         welcomed_ = false;                             // the lobby's onLeft must not open the menu a second time
         if (steamMode()) lobby_.Leave();
         ResetNetwork("rejected by the host");
-        ui::ShowLine("HSMMod", style::kBone, msg);
+        ui::ShowLine("HSMMod", style::kBone, text);
         if (why == RejectReason::WrongPassword && steamMode() && lobbyId) lobby_.AskPassword(lobbyId, msg);   // the page asks again (menu.cpp)
-        else notice_ = msg;                            // shown on the multiplayer page, which opens for it (menu.cpp)
+        else notice_ = text;                           // shown on the multiplayer page, which opens for it (menu.cpp)
         if (fight) game::OpenLevel(lastGameMode_, kMenuLevel, true, "");
     }
 
@@ -1558,6 +1695,44 @@ public:
         return out;
     }
 
+    LobbyModsLocal ModsView() override {
+        LobbyModsLocal l;
+        if (!InSession()) return l;
+        l.host = IsHost();
+        auto seat = [&](uint8_t slot) {
+            if (slot >= kModSlots) return;
+            l.names[slot] = Roster::EntityForSlot(slot) == MyEntity() ? MyName() : NameOfSlot(slot);
+            l.present = uint16_t(l.present | (1u << slot));
+        };
+        if (!l.host) {
+            for (const FighterEntry& f : info_.fighters)
+                if (f.entity >= 1 && f.entity <= kMaxFighters && !NoSuchFighter(f.entity)) seat(uint8_t(f.entity - 1));
+            l.haveList = sessionModsSeen_;
+            l.mods = sessionMods_;
+            for (const SessionModEntry& e : l.mods.entries) l.present = uint16_t(l.present | e.slots);   // a fighter not seen yet
+            return l;
+        }
+        // The host: what ModRulesTick last sent; with mod_rules=0 (nothing is sent) the same union, built here.
+        const std::vector<SlotReport> reports = SessionReports();
+        for (const SlotReport& r : reports) seat(r.slot);
+        const bool ruled = ModRulesOn() && hostRuleSet_;
+        l.mods = ruled ? sessionMods_ : BuildSessionMods(reports);
+        l.haveList = game::modrules::Own().complete || !localFighter_;
+        if (!ruled) return l;
+        const uint32_t now = NowMs();
+        for (const auto& [id, p] : peers_) {
+            ModPending q;
+            q.held = p.mods.held;
+            q.graceSeconds = GraceSecondsLeft(p.mods.grace, now);
+            if (!q.held && q.graceSeconds == 0) continue;
+            q.name = NameOfSlot(p.slot);
+            q.haveList = p.mods.haveList;
+            if (q.haveList) q.result = CheckMods(hostRule_, p.mods.report);
+            l.pending.push_back(std::move(q));
+        }
+        return l;
+    }
+
     void SetPlayerListen(uint8_t slot, bool muted, int volumePct) override {
         const std::string name = NameOfSlot(slot);
         if (name.empty()) return;
@@ -1634,10 +1809,182 @@ public:
         if (fight) game::OpenLevel(lastGameMode_, kMenuLevel, true, "");
     }
 
+    std::string ClassName() const override { return ResolveClass(cfg_.className, cfg_.classCustom) ? cfg_.className : std::string(kPlainClass); }
+    ClassSheet ClassValue() const override { return MyClass(); }
+    void SetCustomClass(const ClassSheet& sheet) override {
+        const int slot = CustomClassSlot(cfg_.className);
+        if (slot < 0) return;
+        const std::optional<ClassSheet> before = DecodeClass(cfg_.classCustom[slot]);
+        cfg_.classCustom[slot] = EncodeClass(sheet);
+        if (!SaveIniValues({{"class_custom" + std::to_string(slot + 1), cfg_.classCustom[slot]}})) HSM_LOG("classes: could not save %s", cfg_.className.c_str());
+        if (!before || ClassWolverinePartsDiffer(*before, sheet)) RefreshWolverine();   // Half Wolverine reads its file once: stats alone don't need it
+        lobby_.RepublishMyCard();
+    }
+    void SetClassName(const std::string& name) override {
+        if (!ResolveClass(name, cfg_.classCustom)) return;
+        cfg_.className = name;
+        HSM_LOG("classes: picked %s", name.c_str());
+        if (!SaveIniValues({{"class", name}})) HSM_LOG("classes: could not write class=%s to HSMMod.ini", name.c_str());
+        RefreshWolverine();
+        lobby_.RepublishMyCard();
+    }
+    bool ClassSlotUsed(const std::string& name) const override {
+        const int slot = CustomClassSlot(name);
+        return slot >= 0 && !cfg_.classCustom[slot].empty();
+    }
+    bool NewClass() override {
+        for (int i = 0; i < kCustomClassSlots; ++i) {
+            if (!cfg_.classCustom[i].empty()) continue;
+            cfg_.classCustom[i] = EncodeClass(ClassSheet{});
+            cfg_.classCustomName[i].clear();
+            if (!SaveIniValues({{"class_custom" + std::to_string(i + 1), cfg_.classCustom[i]}, {"class_custom" + std::to_string(i + 1) + "_name", ""}})) HSM_LOG("classes: could not save the new class");
+            SetClassName(CustomClassName(i));
+            return true;
+        }
+        return false;
+    }
+    // Half Wolverine reads its settings once, when UE4SS starts it. So a picked class's parts go into its file, and UE4SS is asked to reload
+    // its mods, by its own hot reload key (Ctrl+R). Only in the menus, where nothing is using what's being reloaded. It's not been wrong to
+    // skip this: the class screen still says to restart until the file and the mod agree.
+    void RefreshWolverine() {
+        game::modrules::ApplyWolverineFile(cfg_);
+        if (cfg_.wolverineRefresh && HasWolverine()) wolverineReload_.Changed(NowMs());
+    }
+    // The file's already written: this tells UE4SS to read it, once things have settled. The keys go to whichever window has focus, so only ever to the game's.
+    ClassReloadGate wolverineReload_;
+    void TickWolverineReload() {
+        if (!wolverineReload_.pending) return;
+        DWORD focusedProcess = 0;
+        const HWND focused = GetForegroundWindow();
+        if (focused) GetWindowThreadProcessId(focused, &focusedProcess);
+        if (!wolverineReload_.Due(NowMs(), focused && focusedProcess == GetCurrentProcessId() && !InFightLevel())) return;
+        INPUT keys[4] = {};
+        keys[0].type = keys[1].type = keys[2].type = keys[3].type = INPUT_KEYBOARD;
+        keys[0].ki.wVk = VK_CONTROL; keys[1].ki.wVk = 'R';
+        keys[2].ki.wVk = 'R'; keys[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        keys[3].ki.wVk = VK_CONTROL; keys[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        const UINT sent = SendInput(4, keys, sizeof(INPUT));
+        HSM_LOG("classes: asked UE4SS to reload its mods, so Half Wolverine picks up %s (%u of 4 keys)", cfg_.className.c_str(), sent);
+    }
+    void DeleteClass() override {
+        const int slot = CustomClassSlot(cfg_.className);
+        if (slot < 0) return;
+        cfg_.classCustom[slot].clear();
+        cfg_.classCustomName[slot].clear();
+        HSM_LOG("classes: deleted %s", cfg_.className.c_str());
+        if (!SaveIniValues({{"class_custom" + std::to_string(slot + 1), ""}, {"class_custom" + std::to_string(slot + 1) + "_name", ""}})) HSM_LOG("classes: could not save the deletion");
+        SetClassName(kPlainClass);
+    }
+    bool ClassesUnrestricted() const override { return UnrestrictedHere(); }
+    bool CanSetUnrestricted() const override { return !lobby_.InLobby() || lobby_.IsHost(); }
+    // The rule of this machine's lobbies, the same setting as mod_rule=. mod_rules watches the file, so a lobby it's hosting changes too.
+    void SetClassesUnrestricted(bool on) override {
+        if (!CanSetUnrestricted()) return;
+        cfg_.modRule = ModPresetKey(on ? ModPreset::Unrestricted : ModPreset::Classes);
+        lobby_.hostPreset = on ? ModPreset::Unrestricted : ModPreset::Classes;
+        HSM_LOG("classes: my lobbies are now %s", ModPresetName(lobby_.hostPreset));
+        if (!SaveIniValues({{"mod_rule", cfg_.modRule}}, "mod")) HSM_LOG("classes: could not save mod_rule");
+        if (!on && AllowHse()) SetAllowHse(false);
+        if (!on && IsHackerClass(cfg_.className)) SetClassName(kPlainClass);   // its tab is hidden now, so it can't stay picked out of sight
+    }
+    bool AllowHse() const override { return !lobby_.CurrentBlock().hse; }
+    // HS Enhancer is the true unrestricted: where it's allowed, someone using it has no class and no limits, only what HS Enhancer does.
+    bool ClassesOff() const override { return !lobby_.CurrentBlock().hse && (enhancer::Detected() || ReadRuleMods(ue4ss::ReportMods()).hse); }
+    void SetAllowHse(bool on) override {
+        if (!CanSetUnrestricted()) return;
+        cfg_.blockHse = !on;
+        lobby_.hostBlock.hse = !on;
+        blockRule_.hse = !on;
+        HSM_LOG("classes: my lobbies %s HS Enhancer", on ? "allow" : "refuse");
+        if (on && !UnrestrictedHere()) SetClassesUnrestricted(true);   // the rest of the lobby isn't held to the budget against them
+        if (!SaveIniValues({{"block_hse", on ? "0" : "1"}})) HSM_LOG("classes: could not save block_hse");
+    }
+    bool HasWolverine() const override { return ue4ss::ReportMods().find("HalfWolverine") != std::string::npos; }
+    std::vector<ModBlockLine> ModBlock() const override {
+        const RuleMods listed = ReadRuleMods(ue4ss::ReportMods());
+        const DllScan scan = ScanDlls();
+        std::vector<std::string> mods, dlls;
+        for (const std::string& n : listed.unsupported) mods.push_back(n);
+        for (const std::string& n : scan.game) {
+            const bool file = n.find(".dll") != std::string::npos || n.find(".asi") != std::string::npos || n.find(".ini") != std::string::npos || n.find(" (") != std::string::npos;
+            if (file) dlls.push_back(n);
+            else if (std::find(mods.begin(), mods.end(), n) == mods.end()) mods.push_back(n);
+        }
+        return ModBlockLines(mods, dlls, blockRule_.hse && (enhancer::Detected() || listed.hse || scan.hseLoader), scan.outsidePaths);
+    }
+    bool ModBlockAlways() const override { return blockRule_.allLobbies; }
+    bool TakeBlockAttempt() override { const bool was = blockAttempt_; blockAttempt_ = false; return was; }
+    std::string ClassLabel(const std::string& name) const override { return hsm::ClassLabel(name, cfg_.classCustomName); }
+    std::string ClassOwnName() const override {
+        const int slot = CustomClassSlot(cfg_.className);
+        return slot >= 0 && ClassNameProblem(cfg_.classCustomName[slot]).empty() ? cfg_.classCustomName[slot] : std::string();
+    }
+    std::string NameClass(const std::string& name) override {
+        const int slot = CustomClassSlot(cfg_.className);
+        if (slot < 0) return "Built-in classes keep their names.";
+        if (!name.empty()) {
+            if (std::string problem = ClassNameProblem(name); !problem.empty()) { HSM_LOG("classes: refused a name for %s", cfg_.className.c_str()); return problem; }
+            for (int i = 0; i < kCustomClassSlots; ++i)
+                if (i != slot && SameNameAnyCase(name, cfg_.classCustomName[i])) return "Another of your classes has that name.";
+        }
+        cfg_.classCustomName[slot] = name;
+        HSM_LOG("classes: %s is now called '%s'", cfg_.className.c_str(), name.c_str());
+        if (!SaveIniValues({{"class_custom" + std::to_string(slot + 1) + "_name", name}})) HSM_LOG("classes: could not save the name of %s", cfg_.className.c_str());
+        lobby_.RepublishMyCard();
+        return {};
+    }
+    std::string ClassNote() const override {
+        if (ClassesOff()) return "HS Enhancer is on, so classes are off for you here: your fighter is whatever HS Enhancer says, with no limits. Other players can see what you're running.";
+        const ClassSheet sheet = MyClass();
+        const NamedClass* named = FindClassNamed(ClassName());
+        std::string note = named ? named->note : "Your own class. Change it below.";
+        const int shownPower = ClassPowerShown(ClassPoints(sheet));
+        note += " Power " + std::string(shownPower > 0 ? "+" : "") + std::to_string(shownPower) + ".";
+        const std::vector<std::string> problems = ClassProblems(sheet, UnrestrictedHere());
+        if (!lobby_.InClassesLobby() && lobby_.InLobby()) note += " This lobby doesn't use classes, so you fight as the game's plain fighter.";
+        if (!problems.empty()) note += " Can't be used: " + problems[0] + " (the limit is +" + std::to_string(ClassPowerShown(kRuleMaxPoints)) + ").";
+        if (ClassNeedsWolverine(sheet)) {
+            if (ue4ss::ReportMods().find("HalfWolverine") == std::string::npos) note += " Needs Half Wolverine, which isn't on.";
+            else if (!WolverineFileMatches(ReadWolverineIni(), sheet)) note += " Restart the game to put on its Half Wolverine parts.";
+        }
+        if (sheet.bite) note += " Bite is on your bite key.";
+        return note;
+    }
     bool HelpImprove() const override { return cfg_.helpImprove; }
     bool HelpImproveAsked() const override { return cfg_.helpImproveAsked; }
+    // A new copy of the game, then this one quits. With modOff it gets -hsmrole=off for that launch only, so the mod is back the next
+    // time the game starts the ordinary way. It waits for this one to close (-hsmwaitfor), so the two never share the mod's files and
+    // this one's exit puts back what it set aside first. Steam's variables come with the environment.
+    bool RestartGame(bool modOff) override {
+        wchar_t exe[MAX_PATH * 2] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+        if (!n || n >= MAX_PATH * 2) return false;
+        const std::string args = RelaunchArgs(CommandLineUtf8(), GetCurrentProcessId(), modOff);
+        const char* what = modOff ? "play alone with the mod off" : "restart";
+        const int w = MultiByteToWideChar(CP_UTF8, 0, args.c_str(), -1, nullptr, 0);
+        if (w <= 0) return false;
+        std::wstring wide(size_t(w), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, args.c_str(), -1, wide.data(), w);
+        wide.pop_back();
+        std::wstring line = L"\"" + std::wstring(exe) + L"\" " + wide;
+        std::wstring dir(exe, n);
+        dir.resize(dir.find_last_of(L"\\/") + 1);
+        STARTUPINFOW si{}; si.cb = sizeof si;
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(exe, line.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi)) {
+            HSM_LOG("session: %s: could not start the game (error %lu)", what, GetLastError());
+            return false;
+        }
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        HSM_LOG("session: %s: started the game (pid %lu) with %s; quitting this one", what, pi.dwProcessId, args.c_str());
+        quitRequested_ = true;
+        quitWhy_ = modOff ? "restarting with the mod off" : "restarting";
+        return true;
+    }
     void SetHelpImprove(bool on) override {
         cfg_.helpImprove = on;
+        hitProbe_.SetOn(on);
+        standIns_.SetAudit(on);   // stop and discard motion diagnostics immediately when consent is withdrawn
         cfg_.helpImproveAsked = true;
         HSM_LOG("report: help improve the mod: %s", on ? "on" : "off");
         if (!SaveHelpImprove(on)) HSM_LOG("report: could not write help_improve=%d to HSMMod.ini", on ? 1 : 0);
@@ -1859,9 +2206,499 @@ private:
     // On a match level no blow between session fighters counts before the match is live or after it ended (from
     // CSLewin's PR #1): a fighter hit while the others were still loading or in the countdown died before it began.
     bool CombatEnabled() const {
-        return !MatchLevel() || CombatPhase(IsHost() ? match_.phase() : MatchPhase(info_.phase));
+        if (!MatchLevel()) return true;
+        return IsHost() ? BlowsCount(match_.config().format, match_.phase(), match_.winner(), oneFight_)
+                        : BlowsCount(Format(info_.format), MatchPhase(info_.phase), info_.winner, oneFight_);
     }
     std::string MyName() const { return direct::PersonaName(direct::MyUserId()); }
+    // Every DLL in the process from outside Windows, for the card. A DLL mapped by hand never appears here, and the game's
+    // own files, overlays and UE4SS C++ mods (listed by mod name already) are left out as noise.
+    // Every DLL in play: what's loaded, what's beside the exe whether it's loaded or not (a hidden proxy still has a file), and images in
+    // memory that the module list doesn't show. Hashes are kept until the file changes, because they're read from disk.
+    struct DllScan { std::vector<std::string> game, outside, outsidePaths; bool hseLoader = false; };
+    static std::string HashFile(const std::wstring& path) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return {};
+        const unsigned long long stamp = (static_cast<unsigned long long>(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+        static std::map<std::wstring, std::pair<unsigned long long, std::string>> cache;
+        auto it = cache.find(path);
+        if (it != cache.end() && it->second.first == stamp) return it->second.second;
+        std::string hex;
+        if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+            Sha256 sha;
+            std::vector<uint8_t> buf(1 << 20);
+            for (size_t n; (n = std::fread(buf.data(), 1, buf.size(), f)) > 0;) sha.Update(buf.data(), n);
+            std::fclose(f);
+            for (uint8_t b : sha.Final()) { char x[3]; std::snprintf(x, sizeof x, "%02x", b); hex += x; }
+        }
+        cache[path] = {stamp, hex};
+        return hex;
+    }
+    // The publisher on a file's Authenticode signature when Windows says it's valid, else empty. wintrust and crypt32 are loaded when first
+    // needed (the mod's imports stay what a stock system has). No revocation check: that would go online. Kept until the file changes.
+    static std::string ValidSignerOf(const std::wstring& path) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return {};
+        const unsigned long long stamp = (static_cast<unsigned long long>(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+        static std::mutex lock;
+        static std::map<std::wstring, std::pair<unsigned long long, std::string>> cache;
+        {
+            std::lock_guard<std::mutex> hold(lock);
+            auto it = cache.find(path);
+            if (it != cache.end() && it->second.first == stamp) return it->second.second;
+        }
+        using VerifyFn = LONG(WINAPI*)(HWND, GUID*, LPVOID);
+        using ProvFn = void*(WINAPI*)(HANDLE);
+        using SignerFn = void*(WINAPI*)(void*, DWORD, BOOL, DWORD);
+        using NameFn = DWORD(WINAPI*)(const void*, DWORD, DWORD, void*, LPWSTR, DWORD);
+        static const HMODULE wt = LoadLibraryW(L"wintrust.dll");
+        static const HMODULE cr = LoadLibraryW(L"crypt32.dll");
+        static const auto verify = wt ? reinterpret_cast<VerifyFn>(GetProcAddress(wt, "WinVerifyTrust")) : nullptr;
+        static const auto provData = wt ? reinterpret_cast<ProvFn>(GetProcAddress(wt, "WTHelperProvDataFromStateData")) : nullptr;
+        static const auto provSigner = wt ? reinterpret_cast<SignerFn>(GetProcAddress(wt, "WTHelperGetProvSignerFromChain")) : nullptr;
+        static const auto certName = cr ? reinterpret_cast<NameFn>(GetProcAddress(cr, "CertGetNameStringW")) : nullptr;
+        std::string signer;
+        if (verify && provData && provSigner && certName) {
+            WINTRUST_FILE_INFO file{}; file.cbStruct = sizeof file; file.pcwszFilePath = path.c_str();
+            WINTRUST_DATA data{}; data.cbStruct = sizeof data; data.dwUIChoice = WTD_UI_NONE; data.fdwRevocationChecks = WTD_REVOKE_NONE;
+            data.dwUnionChoice = WTD_CHOICE_FILE; data.pFile = &file; data.dwStateAction = WTD_STATEACTION_VERIFY;
+            data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE;
+            GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+            if (verify(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data) == 0) {
+                auto* prov = static_cast<CRYPT_PROVIDER_DATA*>(provData(data.hWVTStateData));
+                auto* sgnr = prov ? static_cast<CRYPT_PROVIDER_SGNR*>(provSigner(prov, 0, FALSE, 0)) : nullptr;
+                if (sgnr && sgnr->csCertChain && sgnr->pasCertChain && sgnr->pasCertChain[0].pCert) {
+                    wchar_t name[256] = {};
+                    certName(sgnr->pasCertChain[0].pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name, 256);
+                    signer = Utf8Of(name);
+                }
+            }
+            data.dwStateAction = WTD_STATEACTION_CLOSE;
+            verify(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+        }
+        std::lock_guard<std::mutex> hold(lock);
+        cache[path] = {stamp, signer};
+        return signer;
+    }
+    static std::string Utf8Of(const wchar_t* w) {
+        char out[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, out, sizeof out, nullptr, nullptr);
+        return out;
+    }
+    // Hashing what's loaded takes tens of milliseconds, so it runs off to the side: the game's thread takes the latest result, and never stops for it.
+    mutable std::mutex scanLock_;
+    mutable DllScan scanLatest_;
+    mutable bool scanHave_ = false;
+    mutable std::atomic<bool> scanBusy_{false};
+    mutable uint32_t scanNextAt_ = 0;
+    DllScan ScanDlls() const {
+        const uint32_t now = NowMs();
+        std::lock_guard<std::mutex> hold(scanLock_);
+        if (!scanHave_) { scanLatest_ = ScanDllsNow(); scanHave_ = true; scanNextAt_ = now + kDllScanMs; return scanLatest_; }
+        if (int32_t(now - scanNextAt_) >= 0 && !scanBusy_.exchange(true)) {
+            scanNextAt_ = now + kDllScanMs;
+            std::thread([this] {
+                const uint32_t began = NowMs();
+                DllScan fresh = ScanDllsNow();
+                { std::lock_guard<std::mutex> done(scanLock_); scanLatest_ = std::move(fresh); }
+                if (static bool logged = false; !logged) { logged = true; HSM_LOG("rules: a loaded-DLL check takes %u ms, off the game's thread", NowMs() - began); }
+                scanBusy_ = false;
+            }).detach();
+        }
+        return scanLatest_;
+    }
+    static constexpr uint32_t kDllScanMs = 5000;
+    DllScan ScanDllsNow() const {
+        DllScan scan;
+        const std::wstring exeDir = ModFilePath(L"");
+        std::wstring root = exeDir;   // from Win64 up to the game's own folder
+        for (int up = 0; up < 3 && !root.empty(); ++up) { root.pop_back(); root.resize(root.find_last_of(L"\\/") + 1); }
+        const std::string rootLower = DllPathLower(Utf8Of(root.c_str()));
+        wchar_t winDir[MAX_PATH] = {};
+        GetWindowsDirectoryW(winDir, MAX_PATH);
+        const std::string windowsLower = DllPathLower(Utf8Of(winDir)) + "\\";
+        const auto steamValue = [](const wchar_t* key, const wchar_t* name) {
+            wchar_t value[MAX_PATH] = {};
+            DWORD bytes = sizeof value;
+            return RegGetValueW(HKEY_CURRENT_USER, key, name, RRF_RT_REG_SZ, nullptr, value, &bytes) == ERROR_SUCCESS ? Utf8Of(value) : std::string();
+        };
+        const std::string steamPath = steamValue(L"Software\\Valve\\Steam", L"SteamPath");
+        const std::string steamClient = steamValue(L"Software\\Valve\\Steam\\ActiveProcess", L"SteamClientDll64");
+        const std::string steamLower = DllFolderLower(steamPath), steamClientLower = DllFolderOfLower(steamClient);
+        if (static std::string logged; logged != steamClient + "|" + steamPath) {
+            logged = steamClient + "|" + steamPath;
+            HSM_LOG("rules: steam folder: client %s, SteamPath %s", steamClient.empty() ? "(none)" : steamClient.c_str(), steamPath.empty() ? "(none)" : steamPath.c_str());
+        }
+        std::set<std::string> seen;
+        const auto judge = [&](const std::wstring& path, bool loaded) {
+            const std::string lower = DllPathLower(Utf8Of(path.c_str()));
+            if (!seen.insert(lower).second) return;
+            const size_t slash = lower.find_last_of('\\');
+            const std::string file = Utf8Of(path.c_str() + (path.find_last_of(L"\\/") + 1));
+            if (lower.rfind(rootLower, 0) != 0) {
+                if (!OutsideDllFine(lower, windowsLower, steamLower, steamClientLower)) {
+                    if (std::find(scan.outside.begin(), scan.outside.end(), file) == scan.outside.end()) scan.outside.push_back(file);   // the card: no folder names go to others
+                    scan.outsidePaths.push_back(Utf8Of(path.c_str()));
+                    if (static std::set<std::string> logged; logged.insert(lower).second) HSM_LOG("rules: loaded from outside the game: %s", scan.outsidePaths.back().c_str());
+                }
+                return;
+            }
+            const std::string rel = lower.substr(rootLower.size());
+            bool found = false;
+            const bool dxgi = rel == std::string(kWin64Dir) + "dxgi.dll";
+            DllVerdict v = JudgeGameDll(rel, DllNeedsHash(rel) ? HashFile(path) : std::string(), dxgi && LooksLikeKnownDxgi(ReadWholeFile(path, found)));
+            if (v != DllVerdict::Fine) {
+                const std::string signer = ValidSignerOf(path);
+                v = WithSigner(v, signer);
+                if (static std::set<std::string> logged; logged.insert(lower).second)
+                    HSM_LOG("rules: %s is %s (signed by %s)", file.c_str(), v == DllVerdict::Fine ? "fine" : "not allowed", signer.empty() ? "nobody valid" : signer.c_str());
+            }
+            if (v == DllVerdict::Fine) return;
+            if (loaded && v == DllVerdict::Unknown && slash != std::string::npos) {   // a copy just lying there isn't HS Enhancer running
+                // HS Enhancer's loader, under any name. It counts as HS Enhancer, and earns nothing else: a chainloader could copy the text.
+                if (LooksLikeHseLoader(ReadWholeFile(path, found))) { scan.hseLoader = true; return; }
+            }
+            scan.game.push_back(v == DllVerdict::Changed ? file + " (changed)" : file);
+        };
+        std::set<const void*> listed;
+        if (HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId()); snap != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32W m{}; m.dwSize = sizeof m;
+            for (BOOL ok = Module32FirstW(snap, &m); ok; ok = Module32NextW(snap, &m)) {
+                listed.insert(m.modBaseAddr);
+                if (reinterpret_cast<HMODULE>(m.modBaseAddr) != GetModuleHandleW(nullptr)) judge(m.szExePath, true);   // the game's exe is listed first
+            }
+            CloseHandle(snap);
+        }
+        // Beside the exe, loaded or not.
+        for (const wchar_t* pattern : {L"*.dll", L"*.asi"}) {
+            WIN32_FIND_DATAW fd{};
+            const HANDLE find = FindFirstFileW((exeDir + pattern).c_str(), &fd);
+            if (find == INVALID_HANDLE_VALUE) continue;
+            do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) judge(exeDir + fd.cFileName, false); } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        }
+        // Mods can change while the game runs, and UE4SS can reload them, so what it reported at the start isn't enough. Its settings can
+        // also point it at a mods folder nobody else would look in.
+        bool foundSettings = false;
+        if (Ue4ssSettingsMoveMods(ReadWholeFile(exeDir + L"ue4ss\\UE4SS-settings.ini", foundSettings))) scan.game.push_back("UE4SS-settings.ini (mods moved)");
+        // Only the UE4SS running from that folder reads it. A mod switched on there while another UE4SS runs isn't running, and that UE4SS is refused anyway.
+        wchar_t ue4ssPath[MAX_PATH] = {};
+        const HMODULE ue4ssModule = GetModuleHandleW(L"UE4SS.dll");
+        const bool ue4ssHere = ue4ssModule && GetModuleFileNameW(ue4ssModule, ue4ssPath, MAX_PATH) && DllPathLower(Utf8Of(ue4ssPath)) == DllPathLower(Utf8Of((exeDir + L"ue4ss\\UE4SS.dll").c_str()));
+        if (ue4ssHere) for (const std::string& name : ue4ss::EnabledModNames(exeDir + L"ue4ss\\Mods\\")) {
+            if (name == "HSEnhancer") scan.hseLoader = true;
+            else if (!IsSupportedUe4ssMod(name) && std::find(scan.game.begin(), scan.game.end(), name) == scan.game.end()) scan.game.push_back(name);
+        }
+        for (const std::string& what : game::modmaps::Unchecked()) scan.game.push_back(what);
+        // The engine also mounts paks from these, and nothing legitimate puts one there.
+        const auto paksIn = [&](const std::wstring& dir) {
+            WIN32_FIND_DATAW fd{};
+            const HANDLE find = FindFirstFileW((dir + L"*.pak").c_str(), &fd);
+            if (find == INVALID_HANDLE_VALUE) return;
+            do { scan.game.push_back(SanitizePakName(Utf8Of(fd.cFileName)) + " (pak not checked)"); } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        };
+        paksIn(root + L"Engine\\Content\\Paks\\");
+        paksIn(root + L"HalfswordUE5\\Saved\\Paks\\");
+        wchar_t localAppData[MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH)) paksIn(std::wstring(localAppData) + L"\\HalfswordUE5\\Saved\\Paks\\");
+        // An image in memory the module list doesn't name was hidden from it. Windows maps some files this way for itself, so where it's from still counts.
+        // The mapped name is a device path (\Device\HarddiskVolume3\...): with its drive letter back, the overlays that hide themselves
+        // (Discord's) pass by the same rules as when they're listed.
+        std::vector<DriveDevice> drives;
+        for (wchar_t letter = L'A'; letter <= L'Z'; ++letter) {
+            const wchar_t drive[3] = {letter, L':', 0};
+            wchar_t target[MAX_PATH] = {};
+            if (QueryDosDeviceW(drive, target, MAX_PATH)) drives.push_back({DllPathLower(Utf8Of(drive)), DllPathLower(Utf8Of(target))});
+        }
+        MEMORY_BASIC_INFORMATION mbi{};
+        for (const char* at = nullptr; VirtualQuery(at, &mbi, sizeof mbi) == sizeof mbi; at = static_cast<const char*>(mbi.BaseAddress) + mbi.RegionSize) {
+            if (mbi.Type != MEM_IMAGE || mbi.AllocationBase != mbi.BaseAddress || listed.count(mbi.BaseAddress)) continue;
+            wchar_t device[MAX_PATH * 2] = {};
+            if (!K32GetMappedFileNameW(GetCurrentProcess(), mbi.BaseAddress, device, MAX_PATH * 2)) continue;
+            const std::string lower = DllPathLower(Utf8Of(device));
+            if (lower.find("\\windows\\") != std::string::npos || lower.find("\\program files") != std::string::npos || lower.find("\\programdata\\microsoft\\") != std::string::npos) continue;
+            if (lower.find(".mui") != std::string::npos) continue;
+            const std::string dos = DosPathOfDeviceLower(lower, drives);
+            if (dos.rfind(rootLower, 0) != 0 && OutsideDllFine(dos, windowsLower, steamLower, steamClientLower)) {
+                if (static std::set<std::string> logged; logged.insert(dos).second) HSM_LOG("rules: a hidden module in memory, allowed by where it is: %s", dos.c_str());
+                continue;
+            }
+            const std::string name = Utf8Of(device + (std::wstring(device).find_last_of(L"\\/") + 1));
+            if (static std::set<std::string> logged; logged.insert(dos).second) HSM_LOG("rules: a hidden module in memory: %s (%s)", name.c_str(), dos.c_str());
+            scan.game.push_back(name + " (hidden)");
+        }
+        return scan;
+    }
+
+    static std::string ReadWholeFile(const std::wstring& path, bool& found) {
+        std::string text;
+        found = false;
+        if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+            found = true;
+            text.resize(8 * 1024 * 1024);   // HSE keeps presets in its settings: cutting the file short would lose the keys after them
+            text.resize(std::fread(text.data(), 1, text.size(), f));
+            std::fclose(f);
+        }
+        return text;
+    }
+
+    static std::string ReadHseIni() {
+        wchar_t appData[MAX_PATH] = {};
+        bool found = false;
+        if (!GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) return {};
+        return ReadWholeFile(std::wstring(appData) + L"\\Half Sword Enhancer\\config.ini", found);
+    }
+    static std::string ReadWolverineIni() {
+        bool found = false;
+        std::string text = ReadWholeFile(ModFilePath(L"ue4ss\\Mods\\HalfWolverine\\config.ini"), found);
+        return found ? text : ReadWholeFile(ModFilePath(L"Mods\\HalfWolverine\\config.ini"), found);
+    }
+
+    // The class picked in the menu; the plain fighter when nothing is picked.
+    bool UnrestrictedHere() const { return lobby_.InLobby() ? lobby_.InUnrestrictedLobby() : cfg_.modRule == ModPresetKey(ModPreset::Unrestricted); }
+    bool blockAttempt_ = false;
+    LobbyBlock blockRule_{};                     // set from the settings at the start, then by the lobby that last refused
+    ClassSheet MyClass() const { return ClassesOff() ? ClassSheet{} : ResolveClass(cfg_.className, cfg_.classCustom).value_or(ClassSheet{}); }
+    // What this machine reports under mod_rule=classes.
+    std::string MyRuleSheet() const {
+        const std::string mods = ue4ss::ReportMods();
+        const bool hse = mods.find("HSEnhancer") != std::string::npos || enhancer::Detected();
+        const bool wolverine = mods.find("HalfWolverine") != std::string::npos;
+        (void)hse; (void)wolverine;
+        return EncodeClass(MyClass());
+    }
+
+    // mod_rule=classes: a fighter with claws can't hold a weapon. Checked on this machine four times a second, so a weapon
+    // leaves the hand as soon as it is picked up. A modified client could skip this.
+    uint32_t nextClawCheck_ = 0, nextClawRead_ = 0;
+    std::string loggedClass_;
+    bool clawsOn_ = false;
+
+    // Half Wolverine's claws on other players' fighters (gameplay/claw_mirror.h), in any lobby: the hits reach them anyway.
+    game::ClawMirror clawMirror_;
+    bool clawMirrorActive_ = false, clawsAreBone_ = true;
+    uint32_t nextClawConfig_ = 0;
+    void ClawMirrorTick() {
+        const bool on = cfg_.clawMirror && net_ && lobby_.InLobby() && InFightLevel();
+        if (!on) { if (clawMirrorActive_) { clawMirror_.Clear(adapter_); clawMirrorActive_ = false; } return; }
+        clawMirrorActive_ = true;
+        const uint32_t now = NowMs();
+        if (DueAt(now, nextClawConfig_)) {
+            nextClawConfig_ = now + 10000;
+            const std::string w = ReadWolverineIni();
+            const auto material = RuleIniValue(w, "Body", "Claws");
+            clawsAreBone_ = !(material == "Adamantium" || (RuleIniValue(w, "Body", "Skeleton") == "Adamantium" && material != "Bone"));
+        }
+        clawMirror_.Tick(adapter_, lobby_, adapter_.PlayerWillie(0), clawsAreBone_, [this](direct::UserId id) -> UObject* {
+            if (IsHost()) {
+                for (const RosterMember& r : roster_.members()) if (r.key == id) return AnyActor(Roster::EntityForSlot(r.slot));
+                return nullptr;
+            }
+            // A client has no roster: the host is the lobby's owner and the others come from the host's peer map.
+            const uint8_t slot = id == hostUser_ ? kHostSlot : meshPeers_.SlotOfSteam(id);
+            return slot == 0xFF ? nullptr : AnyActor(Roster::EntityForSlot(slot));
+        });
+    }
+
+    void ClawWeaponTick() {
+        const uint32_t now = NowMs();
+        if (!lobby_.InClassesLobby() || !DueAt(now, nextClawCheck_)) return;
+        nextClawCheck_ = now + 250;
+        if (DueAt(now, nextClawRead_)) {
+            nextClawRead_ = now + 10000;
+            const std::string hseIni = enhancer::Detected() ? ReadHseIni() : std::string(), wolvIni = ReadWolverineIni();
+            char line[64];
+            std::snprintf(line, sizeof line, "power %.0f, %s", ClassPoints(hseIni, wolvIni) * 100, ClawsForbidWeapons(wolvIni) ? "claws" : "no claws");
+            if (loggedClass_ != line) { loggedClass_ = line; HSM_LOG("rules: my class: %s", line); }
+            clawsOn_ = ue4ss::ReportMods().find("HalfWolverine") != std::string::npos && ClawsForbidWeapons(ReadWolverineIni());
+        }
+        if (!ClawsDropWeapons(clawsOn_, clawMirrorActive_, clawMirror_.BladesOut())) return;
+        if (adapter_.DropHeldWeapons(adapter_.PlayerWillie(0)) > 0) {
+            HSM_LOG("rules: claws: dropped a held weapon");
+            ui::ShowLine("HSMMod", style::kWarn, "Sheathe your claws to hold a weapon.");
+        }
+    }
+
+    // mod_rule=classes, host: each player's mods and settings, by this machine's copy of the rules. A player who fails is
+    // warned and removed after a minute unless fixed. They can rejoin once they fit.
+    static constexpr uint32_t kClassGraceMs = 15000, kClassRemoveMs = 60000;
+    struct ClassWatch { uint32_t firstSeen = 0, failedAt = 0; };
+    std::map<direct::UserId, ClassWatch> classWatch_;
+    uint32_t nextClassCheck_ = 0;
+
+    // Every player checks their own settings, the host included: the host's check below only looks at other players, so an
+    // edit in HSE's menu on the host's machine went unseen. HSE saves those edits straight away, so reading the file sees them.
+    uint32_t nextSelfCheck_ = 0, selfFailedAt_ = 0;
+    bool warnedUnrestricted_ = false, warnedHse_ = false;
+    std::set<direct::UserId> warnedPast_;        // named once each, or it would repeat every few seconds
+    void SelfRuleTick() {
+        const uint32_t now = NowMs();
+        // The host can allow HS Enhancer in its own lobby, and everyone in it should know.
+        if (!lobby_.InClassesLobby() || lobby_.CurrentBlock().hse) warnedHse_ = false;
+        else if (!warnedHse_) { warnedHse_ = true; ui::ShowLine("HSMMod", style::kWarn, "This lobby's host allows HS Enhancer, which can change anything."); }
+        if (!lobby_.InUnrestrictedLobby()) warnedUnrestricted_ = false;
+        else if (!warnedUnrestricted_) {   // a guest never saw the checkbox's warning
+            warnedUnrestricted_ = true;
+            ui::ShowLine("HSMMod", style::kWarn, "This lobby is Unrestricted Classes: no class balance, and fighters past what the game was built for. Expect glitches, and possibly crashes.");
+        }
+        if (!lobby_.InClassesLobby()) { selfFailedAt_ = 0; return; }
+        if (!DueAt(now, nextSelfCheck_)) return;
+        nextSelfCheck_ = now + 5000;
+        {
+            double run = 0, strength = 0;
+            adapter_.ReadLiveStats(adapter_.PlayerWillie(0), run, strength);
+            const std::string live = EncodeClass(LiveSheet(MyClass(), enhancer::Detected() ? ReadHseIni() : std::string(), run, strength));
+            if (direct::MemberData(lobby_.id(), direct::MyUserId(), kMemberLiveKey) != live) direct::SetMemberData(lobby_.id(), kMemberLiveKey, live);
+        }
+        lobby_.RepublishMyCard();   // the host and everyone else see an edit within seconds, not at the next minute
+        const std::string why = OnlineBlockReason(lobby_.InUnrestrictedLobby() ? ModPreset::Unrestricted : ModPreset::Classes, lobby_.CurrentBlock());
+        if (why.empty()) {
+            if (selfFailedAt_) { HSM_LOG("rules: my class fits the rules again"); ui::ShowLine("HSMMod", style::kBone, "Your class fits the lobby's rules again."); }
+            selfFailedAt_ = 0;
+            return;
+        }
+        if (!selfFailedAt_) {
+            selfFailedAt_ = now | 1;
+            ui::ShowLine("HSMMod", style::kWarn, why + " Put it back within a minute or you leave the lobby.");
+        } else if (uint32_t(now - selfFailedAt_) >= kClassRemoveMs) {
+            HSM_LOG("rules: leaving the lobby: %s", why.c_str());
+            ui::ShowLine("HSMMod", style::kWarn, "You left the lobby: " + why);
+            selfFailedAt_ = 0;
+            lobby_.Leave();
+        }
+    }
+
+    // Players check the host too, by their own copy of the rules: nothing else watches the machine running the lobby. A host
+    // that fails is named, and the player leaves after a minute unless it's fixed.
+    uint32_t nextHostCheck_ = 0, hostSeenAt_ = 0, hostFailedAt_ = 0;
+    void HostRuleTick() {
+        const uint32_t now = NowMs();
+        if (!lobby_.InClassesLobby() || lobby_.IsHost()) { hostSeenAt_ = hostFailedAt_ = 0; return; }
+        if (!hostSeenAt_) hostSeenAt_ = now | 1;
+        if (uint32_t(now - hostSeenAt_) < kClassGraceMs || !DueAt(now, nextHostCheck_)) return;
+        nextHostCheck_ = now + 5000;
+        for (const game::LobbyMember& m : lobby_.members()) {
+            if (m.id != lobby_.owner()) continue;
+            std::vector<std::string> problems = CheckClassValue(MemberSheet(m.id), DecodeCard(m.name, m.card).mods, lobby_.InUnrestrictedLobby(), lobby_.CurrentBlock().hse);
+            if (problems.empty()) {
+                if (hostFailedAt_) ui::ShowLine("HSMMod", style::kBone, "The host's class fits the rules again.");
+                hostFailedAt_ = 0;
+            } else if (!hostFailedAt_) {
+                hostFailedAt_ = now | 1;
+                HSM_LOG("rules: the host breaks the class rules: %s", problems[0].c_str());
+                ui::ShowLine("HSMMod", style::kWarn, "The host breaks the class rules: " + problems[0] + ". You leave in a minute unless it's fixed.");
+            } else if (uint32_t(now - hostFailedAt_) >= kClassRemoveMs) {
+                HSM_LOG("rules: leaving the lobby: the host breaks the class rules: %s", problems[0].c_str());
+                ui::ShowLine("HSMMod", style::kWarn, "You left the lobby: the host breaks the class rules: " + problems[0]);
+                hostFailedAt_ = 0;
+                lobby_.Leave();
+            }
+            break;
+        }
+    }
+
+    void ClassRuleTick() {
+        const uint32_t now = NowMs();
+        if (!lobby_.IsHost() || !ModRulesOn() || !DueAt(now, nextClassCheck_)) return;
+        const bool classes = lobby_.InClassesLobby();
+        nextClassCheck_ = now + 5000;
+        for (const game::LobbyMember& m : lobby_.members()) {
+            if (m.id == direct::MyUserId()) continue;
+            ClassWatch& w = classWatch_[m.id];
+            if (!w.firstSeen) w.firstSeen = now;
+            if (uint32_t(now - w.firstSeen) < kClassGraceMs) continue;   // member data can arrive a moment after the player
+            const BuildCard card = DecodeCard(m.name, m.card);
+            std::vector<std::string> problems;   // the mods themselves are StepPlayerMods' to judge
+            if (classes) {
+                for (std::string& p : CheckClassValue(MemberSheet(m.id), card.mods, lobby_.InUnrestrictedLobby(), lobby_.CurrentBlock().hse)) problems.push_back(std::move(p));
+                if (m.card.empty()) problems.push_back("no class card");
+            }
+            std::optional<uint32_t> peer;
+            for (const RosterMember& r : roster_.members()) if (r.key == m.id) peer = PeerOfSlot(r.slot);
+            if (problems.empty()) {
+                if (w.failedAt) { HSM_LOG("rules: %s fits the class rules again", m.name.c_str()); if (peer) Reply(*peer, "Your class fits the lobby's rules again."); }
+                w.failedAt = 0;
+                continue;
+            }
+            if (!w.failedAt) {
+                w.failedAt = now | 1;
+                HSM_LOG("rules: %s breaks the class rules: %s", m.name.c_str(), problems[0].c_str());
+                ui::ShowLine("HSMMod", style::kWarn, m.name + " breaks the class rules: " + problems[0]);
+                if (peer) Reply(*peer, "Your class breaks this lobby's rules: " + problems[0] + ". Fix it within a minute.");
+            } else if (peer && uint32_t(now - w.failedAt) >= kClassRemoveMs) {
+                HSM_LOG("rules: removed %s: %s", m.name.c_str(), problems[0].c_str());
+                ui::ShowLine("HSMMod", style::kWarn, m.name + " was removed: " + problems[0]);
+                DropMember(*peer, RejectReason::ModsNotAllowed, "Your class breaks this lobby's rules: " + problems[0]);
+                classWatch_.erase(m.id);
+            }
+        }
+    }
+
+    // Why this machine may not go online; empty: it may. The rules are in this DLL (match/hsm_online_rules.h), not the launcher.
+    // Every lobby needs the launcher; the class rules are for mod_rule=classes.
+    mutable std::string lastBlockLog_;
+    void LogBlockOnce(const std::string& line) const { if (line != lastBlockLog_) { lastBlockLog_ = line; HSM_LOG("%s", line.c_str()); } }
+    std::string OnlineBlockReason(ModPreset preset, LobbyBlock rule) const {
+        const bool classes = IsClassesPreset(preset);
+        if (!classes && !rule.allLobbies) return {};
+        std::vector<std::string> names;
+        const std::string reported = ue4ss::ReportMods();
+        const RuleMods listed = ReadRuleMods(reported);
+        const DllScan scan = ScanDlls();
+        const bool hse = enhancer::Detected() || listed.hse || scan.hseLoader, wolverine = listed.wolverine;
+        names = scan.game;
+        for (const std::string& n : listed.unsupported) if (std::find(names.begin(), names.end(), n) == names.end()) names.push_back(n);
+        names.insert(names.end(), scan.outside.begin(), scan.outside.end());
+        if (!names.empty() && !ModListKeepsOut(preset, rule)) LogBlockOnce("rules: the lobby's mod rule is anything: not checking " + names[0] + (names.size() > 1 ? " and the rest" : ""));
+        else if (!names.empty()) {
+            std::string list;
+            for (size_t i = 0; i < names.size() && i < 3; ++i) list += (i ? ", " : "") + names[i];
+            if (names.size() > 3) list += " and " + std::to_string(names.size() - 3) + " more";
+            LogBlockOnce("rules: online blocked: " + list);
+            return list + (names.size() == 1 ? " isn't" : " aren't") + " supported online. Remove " + (names.size() == 1 ? "it" : "them") + ", or play alone.";
+        }
+        std::vector<std::string> broken;
+        const ClassSheet mine = MyClass();
+        if (hse && rule.hse) { LogBlockOnce("rules: online blocked: HS Enhancer is on"); return "HS Enhancer can't be on in a Classes lobby: its menu can change anything. Turn it off and restart. Your class gives you its stats without it."; }
+        if (!classes) return {};                     // the class rules are for lobbies that use classes
+        if (hse) return {};                          // allowed here, so classes are off for this player: there's nothing to check
+        broken = ClassProblems(mine, preset == ModPreset::Unrestricted);
+        if (ClassNeedsWolverine(mine) && !wolverine) broken.push_back("it needs Half Wolverine");
+        if (wolverine && !WolverineFileMatches(ReadWolverineIni(), mine)) broken.push_back(ClassNeedsWolverine(mine) ? "Half Wolverine hasn't picked up this class yet, so restart the game" : "this class doesn't use Half Wolverine, so turn it off and restart, or give the class some of its options");
+        if (!broken.empty()) {
+            LogBlockOnce("rules: online blocked: " + broken[0] + " (" + std::to_string(broken.size()) + " problem(s))");
+            return "Your class breaks the rules: " + broken[0] + ".";
+        }
+        return {};
+    }
+
+    // Each minute: the card again, so a DLL loaded after the first look shows, and a word about any player who sends none.
+    void CardCheckTick() {
+        const uint32_t now = NowMs();
+        if (!DueAt(now, nextCardCheck_)) return;
+        nextCardCheck_ = now + 60000;
+        lobby_.RepublishMyCard();
+        for (const game::LobbyMember& m : lobby_.members())
+            if (m.card.empty() && m.id != direct::MyUserId() && cardlessWarned_.insert(m.id).second)
+                ui::ShowLine("HSMMod", style::kWarn, (m.name.empty() ? std::string("A player") : m.name) + " isn't sending a class card.");
+    }
+    uint32_t nextCardCheck_ = 0;
+    std::set<std::string> warnedMods_;   // each player's unsupported mods are named once, not with every card
+    std::set<direct::UserId> cardlessWarned_;
+
+    // What this machine's card says: the build a launcher named, and the mods read here rather than taken from a launcher,
+    // so a custom build lists them whatever it is called. HSE started outside UE4SS shows by its loaded DLL.
+    std::string MyBuildCard() const {
+        std::string mods = CardModsFrom(ue4ss::ReportMods());
+        if (mods.find("HSEnhancer") == std::string::npos && enhancer::Detected()) mods += mods.empty() ? "HSEnhancer" : ", HSEnhancer";
+        const DllScan scan = ScanDlls();
+        if (scan.hseLoader && mods.find("HSEnhancer") == std::string::npos) mods += mods.empty() ? "HSEnhancer" : ", HSEnhancer";
+        for (const std::vector<std::string>* list : {&scan.game, &scan.outside})
+            for (const std::string& dll : *list) if (mods.find(dll) == std::string::npos) mods += (mods.empty() ? "" : ", ") + dll;
+        // A class is only in force in a Classes lobby. Elsewhere the card lists the mods and names no class.
+        return EncodeCard(!lobby_.InClassesLobby() ? cfg_.buildName : ClassesOff() ? std::string(kHseClassName) : ClassLabel(ClassName()), mods);
+    }
 
     // ------------------------------------------------------------------ agent bridge (sensors/actuators)
     static constexpr const char* kAxisNames[kAxisCount] = {"MoveForward", "MoveRight", "TurnMouse", "LookMouse", "TurnGamepad",
@@ -1932,7 +2769,7 @@ private:
             }
             return err("unknown action");
         }
-        if (c.verb == "quit") { quitRequested_ = true; return ok(); }
+        if (c.verb == "quit") { quitRequested_ = true; quitWhy_ = "agent request"; return ok(); }
         if (c.verb == "widgets") return WidgetsJson();
         if(c.verb=="uiclasses") {
             std::string j="{\"ok\":true,\"classes\":["; bool first=true;
@@ -2054,7 +2891,7 @@ private:
             }
         }
         if (quitRequested_ || (quitAfterMs_ && now - startedAt_ >= quitAfterMs_)) {
-            HSM_LOG("session: quitting (%s)", quitRequested_ ? "agent request" : "-hsmquit timer");
+            HSM_LOG("session: quitting (%s)", quitRequested_ ? quitWhy_ : "-hsmquit timer");
             quitRequested_ = false; quitAfterMs_ = 0;
             adapter_.QuitGame();
             return;
@@ -2144,14 +2981,15 @@ private:
         held_.fill(Held{});
         hostLoss_ = HostLossMonitor(NowMs());
         // owner sync
-        standIns_.Clear(); grabs_.Clear(); chests_.Clear(); abyss_.Clear(adapter_); streams_.Clear(); lives_.clear(); respawnQueue_.clear();
+        standIns_.Clear(); grabs_.Clear(); chests_.Clear(); boxes_.Clear(); abyss_.Clear(adapter_); streams_.Clear(); lives_.clear(); respawnQueue_.clear();
         // host physics: back to owner sync until a host says otherwise (Welcome, MatchInfo)
         syncMode_ = nextSync_ = clientNextSync_ = SyncMode::Owner; standIns_.SetReplica(false);
-        capture_ = InputCapture{}; sendAccum_ = 0; inputsTx_ = 0;
+        capture_ = InputCapture{}; inputCadence_.Reset(); inputsTx_ = 0; inputSending_.reset();
         ResetLeases(); ownLeased_ = false; nativeButtons_ = 0; ResetHostDelay();
         ownDeathReported_ = false; nextKeepAlive_ = 0; streamsDropped_ = claimsRejected_ = 0;
         lifeBook_.Clear(); clientLife_.fill(0); staleLife_ = 0;
-        vote_.Clear(); pendingDrops_.clear(); rejected_.reset();
+        vote_.Clear(); pendingDrops_.clear(); rejected_.reset(); rejectedDetail_.clear();
+        modListSent_ = ~0u; sessionMods_ = SessionModsMsg{}; sessionModsSeen_ = false; sessionModsDirty_ = true; hostRuleSet_ = false; nextModTick_ = 0;
     }
 
     // ------------------------------------------------------------------ travel / levels
@@ -2204,6 +3042,9 @@ private:
         }
         if(ui::loadout::IsOpen()) { ui::loadout::Close(adapter_); ChangeLoadout(); }
         RememberFoes();
+        // The multiplayer career in or out before the host's settings land: a load keeps this machine's settings and the
+        // travel's go on top; a save writes the career as Progression left it.
+        if (cfg_.progressionSave) saveGuard_.CareerTravel(adapter_, CareerTravelOf(tr.level, tr.settings), false);
         size_t applied = game::ApplyGameSettings(tr.settings);
         fightSettings_ = tr.settings;
         travelSeq_ = tr.seq; pendingLevel_ = tr.level;
@@ -2217,6 +3058,10 @@ private:
         bool joined = steamMode() ? lobby_.InLobby() : net_ != nullptr;
         if (joined && IsHost() && !IsMenuLevel(level) && adapter_.EndErrandMode())
             HSM_LOG("session: %s opened as an errand (Game Mode 2); a session plays it as a normal fight", level.c_str());
+        // The host's multiplayer career in or out, before its settings are captured for the travel: a load keeps the
+        // fight's settings (StartProgression set them) and brings the career's Day Time, which the clients then light by.
+        if (joined && IsHost() && !IsServer() && cfg_.progressionSave)
+            saveGuard_.CareerTravel(adapter_, CareerTravelOf(level, game::CaptureGameSettings()), true);
         if (!joined || IsHost()) {                     // remembered even before hosting, for late joiners
             Travel t; t.level = level; t.absolute = absolute; t.options = options; t.settings = game::CaptureGameSettings();
             lastTravel_ = t;
@@ -2255,6 +3100,8 @@ private:
         if (progressionHub_) {
             HSM_LOG("session: %s is the Progression hub; no fighters, the game keeps its own input", currentLevel_.c_str());
             progHubListSeen_ = false;   // a new hub visit: the fight list's diagnostics and refill get their one shot again (#621)
+            // The multiplayer career is written as the last fight left it (its purse paid): a crash loses that fight at most.
+            if (cfg_.progressionSave && (steamMode() ? lobby_.InLobby() : net_ != nullptr)) saveGuard_.CareerHubLoaded(adapter_);
         }
         HSM_LOG("session: level loaded (%s)", currentLevel_.c_str());
         levelLoadedAt_ = NowMs();
@@ -2295,7 +3142,7 @@ private:
         menuInputAt_ = InFightLevel() ? 0 : NowMs() + 500; menuInputRepeat_ = false;
         if (net_ && MatchLevel() && !bugHintShown_ && !bugHintAt_) bugHintAt_ = NowMs() + 8000;   // once the fight is under way
         probeSince_ = FighterLevel() ? std::max(NowMs(), 1u) : 0;
-        hitKind_.clear(); fighterOfFrame_.clear(); otherActorOffset_.clear(); normalImpulseOffset_.clear();   // the old level's classes and functions are gone
+        hitKind_.clear(); fighterOfFrame_.clear(); otherActorOffset_.clear(); normalImpulseOffset_.clear(); hitProbe_.Clear(); hitProbe_.SetOn(cfg_.helpImprove);   // the old level's classes and functions are gone
         spawnIgnore_.clear();
         // The sync mode is fixed for the level: the host's pick at the travel, which its clients heard before the Travel.
         if (net_) SetSyncMode(IsHost() ? nextSync_ : clientNextSync_);
@@ -2339,8 +3186,155 @@ private:
     // ------------------------------------------------------------------ host
     struct Fighter { ActorRef actor; InputApplier input; uint32_t inputsRx = 0, lastInputAt = 0; uint8_t lockTarget = 0; };   // input: host physics, its player's
     struct Peer { uint8_t slot = 0; uint64_t key = 0; BlobAssembler blobs, changeBlobs; LoadoutChangeLimiter changeLimit; uint32_t helloAt = 0; ChatRateLimiter chat; MsgBudget budget; std::string name, modBuild;
-                   uint32_t reportShareAt = 0; bool reportShared = false; };
+                   uint32_t reportShareAt = 0; bool reportShared = false;
+                   PlayerMods mods; bool sameBuild = false; ChallengeTracker challenge; bool heldDropLogged = false; };   // mod rules: held until its ModList passes
     static constexpr uint32_t kHelloRepeatMs = 5000;
+
+    // ------------------------------------------------------------------ mod rules (gameplay/mod_rules.h, docs/PLAN_MOD_RULES.md)
+    // Host: a joiner is held (no fighter) until its ModList passes the lobby's rule; afterwards each new ModList and each
+    // rule change is checked again, with kModRuleGraceMs to fix it. Same HSMMod build as the host: code challenges every
+    // 60..180 s (session/hsm_mod_challenge.h). Steam sessions only: the mod scans run there (ui/menu.cpp Tick).
+    bool ModRulesOn() const { return game::modrules::Enabled() && steamMode(); }
+
+    bool ModHeld(uint8_t slot) const {
+        const std::optional<uint32_t> id = PeerOfSlot(slot);
+        if (!id) return false;
+        auto it = peers_.find(*id);
+        return it != peers_.end() && it->second.mods.held;
+    }
+
+    void OnModList(Peer& p, const ModListMsg& m) {
+        p.mods.haveList = true;
+        p.mods.report = m.report;
+        NormalizeReport(p.mods.report);
+        p.mods.official = m.official;
+        sessionModsDirty_ = true;
+        HSM_LOG("host: slot %u mods (%s build, %s): %s", p.slot, p.sameBuild ? "same" : "other", OfficialName(m.official), ReportLogLine(p.mods.report).c_str());
+        nextModTick_ = NowMs();   // decide on the next tick
+    }
+
+    void ModRulesTick() {
+        if (!net_ || !ModRulesOn()) return;
+        const uint32_t now = NowMs();
+        if (!DueAt(now, nextModTick_)) return;
+        nextModTick_ = now + 250;
+        const ModReport& own = game::modrules::Own();
+        const ModRule rule = game::modrules::HostRule(lobby_);
+        // The rule applies at once: the host's own report and build only loosen it (its cheats allowed; official-only off
+        // once the update check finds this build unofficial), so nothing still running here admits a player the finished
+        // checks would refuse. The chat line about a change waits for the scan.
+        if (!hostRuleSet_ || !(rule == hostRule_)) {
+            if (hostRuleSet_ && own.complete) ServerSay("Mod rules now: " + RuleSummary(rule) + ".");
+            HSM_LOG("host: mod rules %s: %s", hostRuleSet_ ? "changed" : "in force", RuleSummary(rule).c_str());
+            hostRule_ = rule; hostRuleSet_ = true;
+            lobby_.hostPreset = rule.preset;
+        }
+        std::vector<std::pair<uint32_t, PlayerModVerdict>> removes;
+        for (auto& [id, p] : peers_) {
+            const PlayerModVerdict v = StepPlayerMods(p.mods, hostRule_, p.sameBuild, now);
+            switch (v.step) {
+                case PlayerModStep::Wait: break;
+                case PlayerModStep::Admit:
+                    HSM_LOG("host: slot %u passed the mod rules (%s) after %u ms", p.slot, RuleSummary(hostRule_).c_str(), unsigned(now - p.mods.heldSinceMs));
+                    if (game::modrules::ChallengeEnabled() && p.sameBuild && game::modrules::CodeSize()) p.challenge.Start(now);
+                    else HSM_LOG("host: slot %u: no code challenges (%s)", p.slot, !game::modrules::ChallengeEnabled() ? "mod_challenge=0" : !p.sameBuild ? "another HSMMod build" : "own code unreadable");
+                    net_->Send(id, kChanReliable, Encode(sessionMods_), true);
+                    break;
+                case PlayerModStep::Warn:
+                    HSM_LOG("host: slot %u no longer fits the mod rules: %s (removed in %llu s unless fixed)", p.slot, v.detail.c_str(), (unsigned long long)(kModRuleGraceMs / 1000));
+                    Reply(id, v.detail + " Fix it within " + std::to_string(kModRuleGraceMs / 1000) + " s or you leave the lobby.");
+                    break;
+                case PlayerModStep::Clear:
+                    HSM_LOG("host: slot %u fits the mod rules again", p.slot);
+                    Reply(id, "Your mods fit the lobby's rules again.");
+                    break;
+                case PlayerModStep::Remove: removes.push_back({id, v}); continue;
+            }
+            if (!p.challenge.active()) continue;
+            if (p.challenge.Tick(now) == ChallengeOutcome::Timeout) HSM_LOG("host: slot %u: code challenge %u unanswered (%u failure(s))", p.slot, p.challenge.id(), p.challenge.fails());
+            if (p.challenge.ShouldRemove()) {
+                PlayerModVerdict r; r.step = PlayerModStep::Remove; r.reason = RejectReason::ModifiedClient;
+                r.detail = "Your HSMMod failed the host's code check. Reinstall the release and join again.";
+                removes.push_back({id, r});
+                continue;
+            }
+            if (p.challenge.Due(now)) SendChallenge(id, p, now);
+        }
+        for (const auto& [id, v] : removes) {
+            auto it = peers_.find(id);
+            if (it == peers_.end()) continue;
+            HSM_LOG("host: removing slot %u (reason %d, %s): %s", it->second.slot, int(v.reason), it->second.mods.held ? "before its fighter" : "mid-lobby", v.detail.c_str());
+            DropMember(id, v.reason, v.detail);
+        }
+        if (game::modrules::OwnVersion() != sessionModsOwnVersion_) { sessionModsOwnVersion_ = game::modrules::OwnVersion(); sessionModsDirty_ = true; }
+        if (sessionModsDirty_) {
+            sessionModsDirty_ = false;
+            SessionModsMsg m = BuildSessionMods(SessionReports());
+            if (!(m.entries == sessionMods_.entries) || m.truncated != sessionMods_.truncated) {
+                sessionMods_ = std::move(m);
+                for (const auto& [id, p] : peers_) if (!p.mods.held) net_->Send(id, kChanReliable, Encode(sessionMods_), true);
+                HSM_LOG("host: session mods: %zu item(s)%s", sessionMods_.entries.size(), sessionMods_.truncated ? " (cut)" : "");
+            }
+        }
+    }
+
+    // The reports SessionMods unites: every admitted player's, and the host's own when it plays (a role=server host is
+    // not a player: its mods are its own business).
+    std::vector<SlotReport> SessionReports() const {
+        std::vector<SlotReport> reports;
+        const ModReport& own = game::modrules::Own();
+        if (own.complete && localFighter_) reports.push_back({kHostSlot, &own});
+        for (const auto& [id, p] : peers_) if (p.mods.haveList && !p.mods.held) reports.push_back({p.slot, &p.mods.report});
+        return reports;
+    }
+
+    void SendChallenge(uint32_t id, Peer& p, uint32_t now) {
+        ModChallengeMsg m; m.id = ++challengeSeq_;
+        SecureRandom(m.nonce, sizeof m.nonce);
+        uint8_t r[16]; SecureRandom(r, sizeof r);
+        uint64_t seed = 0, gap = 0;
+        for (int i = 0; i < 8; ++i) { seed = seed << 8 | r[i]; gap = gap << 8 | r[8 + i]; }
+        m.ranges = PickRanges(seed, game::modrules::CodeSize());
+        Sha256Digest expect{};
+        if (m.ranges.empty() || !game::modrules::Answer(m, expect)) { HSM_LOG("host: code challenges off for slot %u (own answer failed)", p.slot); p.challenge.Stop(); return; }
+        p.challenge.Sent(m.id, expect, now, gap);
+        net_->Send(id, kChanReliable, Encode(m), true);
+    }
+
+    void OnModAnswer(uint32_t id, Peer& p, const ModAnswerMsg& a) {
+        const ChallengeOutcome o = p.challenge.OnAnswer(a, NowMs(), net_->RoundTripMs(id));
+        if (o == ChallengeOutcome::Ok && p.challenge.passes() > 1) return;   // the first pass is logged, then only trouble
+        HSM_LOG("host: slot %u: code challenge %u %s%s (%u pass(es), %u failure(s))", p.slot, a.id, ChallengeOutcomeName(o),
+                a.status == AnswerStatus::Unable ? " (it could not read its own code)" : "", p.challenge.passes(), p.challenge.fails());
+    }
+
+    // Client: the host's code challenge, answered over this DLL as it is mapped (Unable when it cannot be read).
+    void AnswerChallenge(const ModChallengeMsg& m) {
+        if (!hostPeer_) return;
+        ModAnswerMsg a; a.id = m.id;
+        if (!game::modrules::Answer(m, a.digest)) { a.status = AnswerStatus::Unable; a.digest = Sha256Digest{}; HSM_LOG("client: code challenge %u: could not read my own code", m.id); }
+        net_->Send(hostPeer_, kChanReliable, Encode(a), true);
+    }
+
+    void SendModList() {
+        modListSent_ = game::modrules::OwnVersion();
+        ModListMsg m; m.official = modListOfficial_ = game::modrules::OwnOfficial(); m.report = game::modrules::Own();
+        net_->Send(hostPeer_, kChanReliable, Encode(m), true);
+        HSM_LOG("client: sent my mod list (%s build): %s", OfficialName(m.official), ReportLogLine(m.report).c_str());
+    }
+
+    void OnSessionMods(const SessionModsMsg& m) {
+        sessionModsSeen_ = true;
+        if (m.entries == sessionMods_.entries && m.truncated == sessionMods_.truncated) return;
+        sessionMods_ = m;
+        std::string names;
+        for (const SessionModEntry& e : m.entries) {
+            if (e.item.kind == ModKind::Ue4ssStock) continue;
+            if (!names.empty()) names += ", ";
+            names += e.item.name;
+        }
+        HSM_LOG("client: session mods (%zu): %s%s", m.entries.size(), names.empty() ? "none" : names.c_str(), m.truncated ? " (cut)" : "");
+    }
 
     void BecomeHost() {
         roster_.ReserveHostSlot(!localFighter_);
@@ -2402,6 +3396,7 @@ private:
         env.propActor = [this](uint64_t id) { return props_.ActorOf(id); };
         env.myEntity = [this]() { return IsHost() ? HostEntity() : world_.myEntity(); };
         env.sendRemote = [this](const sync::RemoteWriteMsg& m) { SendRemote(m); };
+        env.armorGate = cfg_.stuckArmorGate;
         if (!claims_.Start(adapter_, standIns_, streams_, std::move(env)))
             HSM_LOG("session: WARNING owner sync without the script VM hook: blows between this machine and stand-ins do nothing");
         // Blood and wounds on fighters simulated here, shown on every other machine's stand-in of them.
@@ -2473,6 +3468,7 @@ private:
         genv.standInEntity = [this](const UObject* w) { return standIns_.EntityOf(w); };
         genv.standInActor = [this](uint8_t e) { return standIns_.ActorOf(e); };
         genv.dead = [this](uint8_t e) { const VitalsMsg* v = standIns_.Vitals(e); return v && (v->flags & 1); };
+        genv.grappler = [this](uint8_t e) { return EntityHasGrappler(e); };
         genv.down = [this](uint8_t e) { const VitalsMsg* v = standIns_.Vitals(e); return v && ((v->flags & 7) || v->health <= 0.f); };
         genv.send = [this](const std::vector<uint8_t>& b, bool reliable) {
             const uint8_t chan = reliable ? kChanReliable : kChanUnreliable;
@@ -2510,6 +3506,13 @@ private:
         penv.handsChanged = [this](uint8_t e) { equip_.Replan(e); RetintEntity(e); };   // a pickup or drop on a stand-in
         // Level props: the host censuses a fight level from its first tick in it; a client matches once its level gate is open.
         penv.syncStructures = cfg_.syncStructures;
+        penv.structureFollowBroken = cfg_.structureFollowBroken;
+        penv.structureShareHeld = cfg_.structureShareHeld;
+        penv.structureFollowMoving = cfg_.structureFollowMoving;
+        penv.censusSnapshot = cfg_.propCensusSnapshot;
+        penv.structureRestLock = cfg_.structureRestLock;
+        penv.structureBridgesFollow = cfg_.structureBridgesFollow;
+        penv.structureGameBreak = cfg_.structureGameBreak;
         penv.fightLevel = [this] { return FighterLevel() && (IsHost() || levelGate_.Open()); };
         const bool hostNow = penv.host;
         props_.Start(adapter_, standIns_, std::move(penv));
@@ -2602,16 +3605,17 @@ private:
     // machine holds too; my own not while another machine holds it (a client holding nothing then).
     uint8_t OwnedEntityOf(const UObject* w) {
         if (!w) return 0;
-        if (!IsHost() && (HostPhysics() || MyFighterHanded())) return 0;
-        if (w == myWillie_.load()) return MyFighterHanded() ? 0 : MyEntity();
+        if (!IsHost() && (HostPhysics() || MyFighterHanded() || ownLeased_)) return 0;
+        if (w == myWillie_.load()) return MyFighterHanded() || ownLeased_ ? 0 : MyEntity();
         if (IsHost())
             for (auto& [e, ref] : bots_) if (ref.obj == w && adapter_.StillValid(ref.obj, ref.index)) return e;
         if (IsHost() && (HostPhysics() || leases_.Any()))
             for (uint8_t slot = 1; slot < kMaxFighters; ++slot)
-                if (const ActorRef& a = fighters_[slot].actor; a.obj == w && HostDrives(Roster::EntityForSlot(slot)) && adapter_.StillValid(a.obj, a.index))
+                if (const ActorRef& a = fighters_[slot].actor; a.obj == w && HostDrives(Roster::EntityForSlot(slot)) &&
+                    (HostPhysics() || taken_[Roster::EntityForSlot(slot)]) && adapter_.StillValid(a.obj, a.index))
                     return Roster::EntityForSlot(slot);
         if (!IsHost() && leases_.Any())
-            for (auto& [e, ref] : puppets_) if (ref.obj == w && HeldHere(e) && adapter_.StillValid(ref.obj, ref.index)) return e;
+            for (auto& [e, ref] : puppets_) if (ref.obj == w && HeldHere(e) && taken_[e] && adapter_.StillValid(ref.obj, ref.index)) return e;
         return 0;
     }
     // My own fighter as an (object, index) pair, so a level change that frees it (the menu after a fight) is seen as stale
@@ -2632,19 +3636,151 @@ private:
         UObject* own = adapter_.PlayerWillie(0);
         const bool alive = own && !adapter_.IsDead(own) && !ownDeadPending_ && EntityAlive(MyEntity());
         const MatchInfo mi = Extrapolate(info_, infoAt_, NowMs());
-        const StockMatchFlags want = StockFlagsFor(mi, alive);
+        const StockMatchFlags want = StockFlagsFor(mi, alive, oneFight_);
         bool now = false;
         if (want.matchWon != MatchWonFlag::Leave) {
             const bool set = want.matchWon == MatchWonFlag::Set;
             if (GetBool(lastGameMode_, "Match Won", now) && now != set) {
                 SetBool(lastGameMode_, "Match Won", set);
-                HSM_LOG("session: game mode Match Won %d -> %d (%s, format %u) (%u)", int(now), int(set), set ? "break between waves" : "round or wave being fought",
+                HSM_LOG("session: game mode Match Won %d -> %d (%s, format %u) (%u)", int(now), int(set),
+                        set ? (CoopFightWon(mi, oneFight_) ? "fight won, waiting for G" : "break between waves") : "round or wave being fought",
                         unsigned(mi.format), ++wonSet_);
             }
         }
         if (want.clearPlayerDed && GetBool(lastGameMode_, "Player DED", now) && now) {
             SetBool(lastGameMode_, "Player DED", false);
             HSM_LOG("session: the game mode still had Player DED set with my fighter alive; cleared (%u)", ++dedCleared_);
+        }
+    }
+    // Under host physics the fighters of the guests are real here, and here's the only place their classes can run.
+    struct GuestClass { game::Adapter::ClassTracks tracks; std::optional<ClassSheet> sheet; uint32_t readAt = 0; bool read = false; std::string logged; };
+    std::array<GuestClass, kMaxFighters> guestClasses_{};
+    uint32_t nextGuestStats_ = 0;
+    // What a player reports as their class, cut to the longest a class can be: it's untrusted.
+    std::string MemberSheet(uint64_t id) const { return direct::MemberData(lobby_.id(), id, "hsm_sheet").substr(0, kMaxClassValue + 1); }
+    std::string ReportedSheet(uint8_t e) {
+        for (const game::LobbyMember& m : lobby_.members()) {
+            uint8_t slot = 0xFF;
+            if (IsHost()) { for (const RosterMember& r : roster_.members()) if (r.key == m.id) slot = uint8_t(r.slot); }
+            else slot = m.id == hostUser_ ? kHostSlot : meshPeers_.SlotOfSteam(m.id);
+            if (slot != 0xFF && Roster::EntityForSlot(slot) == e) return MemberSheet(m.id);
+        }
+        return {};
+    }
+    void GuestClassTick() {
+        if (!IsHost() || !HostPhysics() || !lobby_.InClassesLobby() || ClassesOff()) return;
+        const uint32_t now = NowMs();
+        const bool statsDue = DueAt(now, nextGuestStats_);
+        if (statsDue) nextGuestStats_ = now + 100;
+        for (uint8_t slot = 1; slot < kMaxFighters; ++slot) {
+            const uint8_t e = Roster::EntityForSlot(slot);
+            UObject* const w = EntityActor(e);
+            if (!w) continue;
+            GuestClass& g = guestClasses_[slot];
+            if (!g.read || now - g.readAt >= 1000) {
+                g.read = true; g.readAt = now;
+                g.sheet = GuestClassOnHost(ReportedSheet(e), true, UnrestrictedHere());
+            }
+            if (g.sheet && g.sheet->noPain) adapter_.ClearPain(w);
+            if (!statsDue || (!g.sheet && !g.tracks.who)) continue;
+            g.tracks.lightenHeld = true;
+            adapter_.ApplyClassStats(w, g.sheet ? *g.sheet : ClassSheet{}, g.tracks);
+            if (g.sheet) adapter_.ApplyClassWeight(w, adapter_.BuildOn() ? adapter_.ForcedBuild() : kDefaultWeight, *g.sheet, g.tracks);
+            const std::string line = (g.sheet ? ClassSummary(*g.sheet) : std::string("plain")) + " on " + ObjectName(w);
+            if (line != g.logged) { g.logged = line; HSM_LOG("classes: host physics: e%u's class: %s", e, line.c_str()); }
+        }
+    }
+    // Every player's class as everyone sees it, from what each one reports, which is held to the rules here. Once a second: the game sets the
+    // look again at each spawn and reset. Bots have no class. A sheet that isn't here yet or breaks the rules shows nothing: no class to go by.
+    std::array<std::string, kMaxWillies + 1> classTags_{}, classLookLogged_{};
+    uint32_t nextClassLook_ = 0;
+    void ClassLookTick() {
+        const uint32_t now = NowMs();
+        if (!DueAt(now, nextClassLook_)) return;
+        nextClassLook_ = now + 1000;
+        classTags_ = {};
+        if (!MatchLevel() || !lobby_.InClassesLobby() || (!cfg_.classTags && !cfg_.classLook)) return;
+        const uint64_t hostPlayer = IsHost() ? direct::MyUserId() : hostUser_;
+        for (const FighterEntry& f : info_.fighters) {
+            if (!f.steamId || f.entity == 0 || f.entity > kMaxWillies) continue;
+            const auto member = std::find_if(lobby_.members().begin(), lobby_.members().end(), [&](const game::LobbyMember& m) { return m.id == f.steamId; });
+            if (member == lobby_.members().end()) continue;
+            const std::optional<ClassSheet> sheet = GuestClassOnHost(MemberSheet(member->id), true, lobby_.InUnrestrictedLobby());
+            if (!sheet) continue;
+            const std::string tag = ClassTagLine(ClassNameFromPeer(DecodeCard(member->name, member->card).build, *sheet), *sheet);
+            classTags_[f.entity] = tag;
+            UObject* const w = IsHost() ? EntityActor(f.entity) : ClientActor(f.entity);
+            if (!cfg_.classLook || !w || !ClassLookApplies(adapter_.BuildOn(), RoleOf(f.entity).weight >= 0.0, adapter_.IsZombieBody(w))) continue;
+            const double muscles = ClassLookMuscles(*sheet, !HostPhysics() || f.steamId == hostPlayer);
+            if (!adapter_.SetMusclesLook(w, muscles)) continue;
+            const std::string line = tag + " on " + ObjectName(w);
+            if (line != classLookLogged_[f.entity]) { classLookLogged_[f.entity] = line; HSM_LOG("classes: look: e%u muscles %.2f: %s", f.entity, muscles, line.c_str()); }
+        }
+    }
+    // Whether a fighter's class has Grappler, from what its player reports, which the host holds to the rules. Read once a second: this is asked every step of a hold.
+    struct GrapplerSeen { bool has = false; uint32_t readAt = 0; bool read = false; };
+    std::array<GrapplerSeen, kMaxWillies + 1> grapplerSeen_{};
+    bool EntityHasGrappler(uint8_t e) {
+        if (e == 0 || e > kMaxWillies || !lobby_.InClassesLobby() || lobby_.InUnrestrictedLobby()) return false;
+        GrapplerSeen& seen = grapplerSeen_[e];
+        const uint32_t now = NowMs();
+        if (seen.read && now - seen.readAt < 1000) return seen.has;
+        seen.read = true; seen.readAt = now; seen.has = false;
+        const auto sheet = GuestClassOnHost(ReportedSheet(e), true, false);
+        seen.has = sheet && sheet->grappler;
+        return seen.has;
+    }
+    // The picked class on this machine's own fighter, fighting alone or in a Classes lobby.
+    game::Adapter::ClassTracks classTracks_;
+    uint32_t nextClassStats_ = 0;
+    std::string loggedClassStats_;
+    bool warnedClassReplica_ = false;
+    void ClassStatsTick() {
+        const uint32_t now = NowMs();
+        if (!ClassRunsOnMyFighter(HostPhysics(), IsHost(), MyFighterHanded())) {
+            if (!warnedClassReplica_) {
+                warnedClassReplica_ = true;
+                HSM_LOG("classes: my fighter is simulated elsewhere (host physics or held): the host applies my class's stats, and they aren't checked here");
+                const std::optional<ClassSheet> mine = ResolveClass(cfg_.className, cfg_.classCustom);
+                if (lobby_.InClassesLobby() && HostPhysics() && mine && ClassLosesPartsOnGuest(*mine)) ui::ShowLine("HSMMod", style::kWarn, "This lobby is on Host Physics: the host runs your class's stats, but Half Wolverine's parts and Bite don't work here. Use Owner Sync for them.");
+            }
+            return;
+        }
+        warnedClassReplica_ = false;
+        const std::optional<ClassSheet> picked = ResolveClass(cfg_.className, cfg_.classCustom);
+        const bool applies = picked && !ClassesOff() && ClassProblems(*picked, UnrestrictedHere()).empty() && ClassAppliesHere(lobby_.InLobby(), lobby_.InClassesLobby());
+        UObject* const me = adapter_.PlayerWillie(0);
+        if (applies && picked->noPain) adapter_.ClearPain(me);
+        // The game's own bite: one press starts it and the next ends it (Willie_BP Bite Event).
+        if (const SHORT key = GetAsyncKeyState(cfg_.classBiteKey); (key & 1) && applies && picked->bite && me && !ui::Typing()) {
+            Call(me, "Bite Event").invoke();
+            HSM_LOG("classes: bite");
+        }
+        if (!DueAt(now, nextClassStats_)) return;
+        nextClassStats_ = now + 100;
+        if (!applies && !classTracks_.who) return;                   // nothing was ever changed: the game's fighter, untouched
+        if (!me) return;
+        classTracks_.lightenHeld = HostPhysics() && IsHost();
+        adapter_.ApplyClassStats(me, applies ? *picked : ClassSheet{}, classTracks_);
+        if (applies) {
+            adapter_.ApplyClassWeight(me, adapter_.BuildOn() ? adapter_.ForcedBuild() : kDefaultWeight, *picked, classTracks_);   // the lobby's fair build is the base
+        }
+        const std::string line = std::string(applies ? cfg_.className : "none") + " on " + ObjectName(me);
+        if (line != loggedClassStats_) {
+            loggedClassStats_ = line;
+            HSM_LOG("classes: applied %s (the game's own: strength %.2f, run %.2f, bone snapping %.2f)", line.c_str(), classTracks_.strength.base, classTracks_.run.base, classTracks_.bones.base);
+        }
+        // Nothing in the game changes these two, so something else did. HS Enhancer is already refused here: this is for anything else.
+        if (BaseStatCheckApplies(lobby_.InClassesLobby(), lobby_.CurrentBlock()) && classTracks_.strength.seen && classTracks_.run.seen && !ClassBasesFair(classTracks_.strength.base, classTracks_.run.base)) {
+            HSM_LOG("rules: leaving the lobby: fighter base stats changed (strength %.3f, run %.3f)", classTracks_.strength.base, classTracks_.run.base);
+            const std::string line2 = "Your fighter's base stats aren't the game's, so you left the lobby. Something other than your class changed them.";
+            const bool fight = InFightLevel();
+            welcomed_ = false;
+            ui::ShowLine("HSMMod", style::kWarn, line2);
+            lobby_.Leave();
+            ResetNetwork("base stats changed");
+            notice_ = line2;
+            if (fight) game::OpenLevel(lastGameMode_, kMenuLevel, true, "");
         }
     }
     void TickOwnBuild() {
@@ -2666,10 +3802,10 @@ private:
     }
     bool FightMsgsOpen() const { return hsm::FightMsgsOpen(IsHost(), welcomed_, FighterLevel()); }
     UObject* OwnedActorOf(uint8_t e) {
-        if (!e || (!IsHost() && (HostPhysics() || MyFighterHanded()))) return nullptr;
-        if (e == MyEntity()) return MyFighterHanded() ? nullptr : MyWillieLive();
-        if (IsHost() && e >= 2 && e <= kMaxFighters && HostDrives(e)) return EntityActor(e);   // a client's fighter, simulated here
-        if (!IsHost() && HeldHere(e)) return ClientActor(e);                                   // another's fighter, held here
+        if (!e || (!IsHost() && (HostPhysics() || MyFighterHanded() || ownLeased_))) return nullptr;
+        if (e == MyEntity()) return MyFighterHanded() || ownLeased_ ? nullptr : MyWillieLive();
+        if (IsHost() && e >= 2 && e <= kMaxFighters && HostDrives(e) && (HostPhysics() || taken_[e])) return EntityActor(e);
+        if (!IsHost() && HeldHere(e) && taken_[e]) return ClientActor(e);
         return IsHost() && e >= kFirstBotEntity ? EntityActor(e) : nullptr;
     }
 
@@ -2829,7 +3965,11 @@ private:
             const sync::Lease l = leases_.Of(e);
             UObject* v = HeldActor(e);
             UObject* b = AnyActor(l.by);
-            if (!v || !taken_[e]) { WriteLease(e, kNoSlot, 0, 0, "no body here"); continue; }
+            if (!v) { WriteLease(e, kNoSlot, 0, 0, "no body here"); continue; }
+            if (!taken_[e]) {
+                TakeFighter(e);   // a saved grip reference may have been unavailable when the lease arrived
+                if (!taken_[e]) continue;   // keep the stand-in neutralised and retry before driving native input
+            }
             if (adapter_.IsDead(v)) { ReportHeldDeath(e, v, now); continue; }   // kept until its respawn
             if (!b) { WriteLease(e, kNoSlot, 0, 0, "no grabber here"); continue; }
             if (!StillCoupled(b, v, now, e)) WriteLease(e, kNoSlot, 0, 0, "they parted");
@@ -2946,7 +4086,7 @@ private:
     void TakeFighter(uint8_t e) {
         UObject* w = HeldActor(e);
         if (!w) { HSM_LOG("hand-off: entity %u is held here but has no body here", e); return; }
-        standIns_.Release(e);
+        if (!standIns_.Release(e)) return;
         adapter_.EnsureBrain(w);
         if (IsHost()) fighters_[e - 1].input.DropDeltas(); else heldInput_[e] = InputApplier{};
         grabs_.Forget(e);
@@ -2982,8 +4122,8 @@ private:
                                      leases_.Holder(mine), leases_.Epoch(mine));
             ownLeased_ = true;
         } else if (!leased && ownLeased_) {
+            if (!standIns_.Release(mine)) return;
             ownLeased_ = false;
-            const bool revived = standIns_.Release(mine);
             // What I pressed while it was held never reached my fighter: the difference is played now.
             const uint32_t held = capture_.buttons(), diff = held ^ nativeButtons_;
             int fired = 0;
@@ -2994,8 +4134,8 @@ private:
                 ++fired;
             }
             nativeButtons_ = held;
-            HSM_LOG("%s: my fighter is mine again (hand-off over, epoch %u; %s, %d button(s) caught up)", who, leases_.Epoch(mine),
-                    revived ? "revived" : "was not neutralised", fired);
+            HSM_LOG("%s: my fighter is mine again (hand-off over, epoch %u; native state restored, %d button(s) caught up)", who,
+                    leases_.Epoch(mine), fired);
         }
     }
     // Client holder: a held fighter died here; the host referees it (once per lease).
@@ -3056,7 +4196,9 @@ private:
                     return true;
                 }
                 if (replayingDelayed_) return false;   // the host's own delayed input, played again (HostInputDelayTick)
-                const bool hostPlays = (HostPhysics() && !IsHost()) || MyFighterHanded();
+                // ownLeased_ stays true while restoring a hand-off's native grip references, even after its wire
+                // lease ends. Keep capturing input without playing it on that still-neutralised stand-in.
+                const bool hostPlays = (HostPhysics() && !IsHost()) || MyFighterHanded() || ownLeased_;
                 if (bind.isAxis) {
                     const Axis a = Axis(bind.index);
                     const float value = game::Adapter::ReadAxisParam(f, params);
@@ -3116,17 +4258,22 @@ private:
         replayingDelayed_ = false;
     }
     void SendInputs(float dt) {
-        sendAccum_ += dt;
-        if (!hostPeer_ || sendAccum_ < 1.f / float(cfg_.inputHz)) return;
-        sendAccum_ = 0;
-        net_->Send(hostPeer_, kChanUnreliable, Encode(TakeInputFrame()), false);
+        if (!inputCadence_.Due(dt, cfg_.inputHz) || !hostPeer_) return;
+        const InputFrame frame = TakeInputFrame();   // always drain mouse deltas, including while no input is sent
+        const bool sending = !cfg_.inputOnDemand || InputStreamNeeded(HostPhysics(), cfg_.handOff, MyFighterHanded());
+        if (!inputSending_ || *inputSending_ != sending) {
+            HSM_LOG("input: stream %s (host_physics=%d hand_off=%d handed=%d input_on_demand=%d); capture drained",
+                    sending ? "active" : "suppressed", HostPhysics() ? 1 : 0, cfg_.handOff ? 1 : 0,
+                    MyFighterHanded() ? 1 : 0, cfg_.inputOnDemand ? 1 : 0);
+            inputSending_ = sending;
+        }
+        if (!sending) return;
+        net_->Send(hostPeer_, kChanUnreliable, Encode(frame), false);
         ++inputsTx_;
     }
     // Host: while a client holds my fighter, what I press is played there, as a client's Input is on the host.
     void HostSendOwnInput(float dt) {
-        sendAccum_ += dt;
-        if (sendAccum_ < 1.f / float(cfg_.inputHz)) return;
-        sendAccum_ = 0;
+        if (!inputCadence_.Due(dt, cfg_.inputHz)) return;
         RelayInput r; r.entity = HostEntity(); r.frame = TakeInputFrame();   // taken always: no deltas pile up meanwhile
         if (!MyFighterHanded() || !net_) return;
         if (std::optional<uint32_t> to = PeerOfSlot(leases_.Holder(r.entity))) { net_->Send(*to, kChanUnreliable, Encode(r), false); ++inputsTx_; }
@@ -3212,6 +4359,7 @@ private:
         Timed(kPumpGore, [&] { gore_.Tick(now); });
         Timed(kPumpGrabs, [&] { grabs_.Tick(now, dt, none); });
         chests_.Tick(now, StandInActors());
+        boxes_.Tick(now, StandInActors(), none);
         Timed(kPumpProps, [&] { props_.Tick(now, none); });
         Timed(kPumpEquip, [&] { equip_.Tick(now, none); });
         fx_.Tick();
@@ -3265,6 +4413,7 @@ private:
             if (const RosterMember* m = roster_.BySlot(slot); m && !back) { HSM_LOG("host: slot %u did not rejoin in time", slot); RemoveMember(slot, m->key); }
         }
         ModerationTick();
+        ModRulesTick();
         ProgVoteTick();
         if (IsServer()) { ServerFlowTick(); ServerAnchorTick(); }
         if (director_.fight()) SpawnDue();
@@ -3292,7 +4441,8 @@ private:
         if (HostPhysics() || leases_.Any()) {
             Timed(kPumpDrive, [&] {
                 for (uint8_t slot = 1; slot < kMaxFighters; ++slot)
-                    if (UObject* w = HostDrives(Roster::EntityForSlot(slot)) ? FighterActor(slot) : nullptr) {
+                    if (UObject* w = HostDrives(Roster::EntityForSlot(slot)) &&
+                                     (HostPhysics() || taken_[Roster::EntityForSlot(slot)]) ? FighterActor(slot) : nullptr) {
                         DriveFighter(fighters_[slot].input, w, dt);
                         owned.push_back({Roster::EntityForSlot(slot), w});
                         if (!HostPhysics()) ++heldDrives_[Roster::EntityForSlot(slot)];
@@ -3315,6 +4465,7 @@ private:
         Timed(kPumpGore, [&] { gore_.Tick(now); });
         Timed(kPumpGrabs, [&] { grabs_.Tick(now, dt, owned); });
         chests_.Tick(now, StandInActors());
+        boxes_.Tick(now, StandInActors(), owned);
         Timed(kPumpProps, [&] { props_.Tick(now, owned); });
         Timed(kPumpEquip, [&] { equip_.Tick(now, owned); });
         fx_.Tick();
@@ -3375,7 +4526,7 @@ private:
         if (t == MsgType::Pose) {
             PoseMsg m; sync::PoseFrame frame;
             // A hand-off: a stream of another epoch than the lease's for that fighter is a straggler from before a switch.
-            if (!Decode(d, n, m, &frame) || !MayStream(peer.slot, m.entity, leases_.holders()) || m.epoch != leases_.Epoch(m.entity)) { ++streamsDropped_; return; }
+            if (!DecodePoseFrame(d, n, m, frame) || !MayStream(peer.slot, m.entity, leases_.holders()) || m.epoch != leases_.Epoch(m.entity)) { ++streamsDropped_; return; }
             standIns_.OnPose(m, frame, ArrivalMs(ev));
         } else {
             VitalsMsg v;
@@ -3816,6 +4967,7 @@ private:
         if (localFighter_ && !host) return;             // the stock spawner has not placed the host yet
         if (!localFighter_) { FVector ap; AnchorKind ak; if (!HostAnchor(ap, ak)) return; }   // role=server: wait for the anchor
         for (uint8_t slot : due) {
+            if (slot != 0 && ModHeld(slot)) continue;   // mod rules: its ModList has not passed yet
             // K1/K2: a rejoiner the match counts down gets its body from the match's respawn (RespawnEntity), not at once:
             // it was invulnerable (hits on a fighter the match counts dead are ignored) for the rest of the round.
             // A third player joining a fought Duel is added to the match here, down: Match::AddFighter benches it, so it gets no body
@@ -4013,6 +5165,13 @@ private:
         if (it == peers_.end()) return;                // nothing but Hello/Ping before Welcome
         Peer& peer = it->second;
         if (!peer.budget.Allow(t, NowMs())) { BudgetDropped(peer.budget, t, "host", peer.slot); return; }   // M3: a flood ends here, unrelayed
+        if (t == MsgType::ModList) { ModListMsg m; if (Decode(d, n, m)) OnModList(peer, m); return; }
+        if (t == MsgType::ModAnswer) { ModAnswerMsg m; if (Decode(d, n, m)) OnModAnswer(ev.peer, peer, m); return; }
+        if (peer.mods.held && HeldPlayerIgnores(t)) {   // mod rules: no say in the session before its ModList passes
+            ++streamsDropped_;
+            if (!peer.heldDropLogged) { peer.heldDropLogged = true; HSM_LOG("host: slot %u is waiting for its mod check: ignoring its message %u (and any more)", peer.slot, unsigned(t)); }
+            return;
+        }
         if (IsFightMsg(t) && !FightMsgsOpen()) { ++streamsDropped_; return; }   // a straggler from the last fight, in a menu
         // Host physics: no client simulates anything; a hand-off: that client's fighter is held elsewhere for now (and a
         // machine whose fighter is held holds nothing).
@@ -4148,6 +5307,7 @@ private:
         } else if (t == MsgType::Chat) {
             ChatLine c; Decode(d, n, c);
             if (!peer.chat.Allow(NowMs())) return;
+            if (peer.mods.held && ParseModCommand(c.text).kind != ModCommandKind::None) { Reply(ev.peer, "Wait until the host has checked your mods."); return; }   // mod rules: no votes yet
             if (ModerationLine(c.text, ev.peer, false)) return;   // /kick, /ban, /votekick, /yes...: answered, not chat
             c.fromSlot = peer.slot;
             net_->Broadcast(kChanReliable, Encode(c), true);
@@ -4202,6 +5362,10 @@ private:
         uint64_t key = ev.steamId ? ev.steamId : (uint64_t(1) << 63) | ev.peer;
         if (h.revision != kProtocolRevision) r.reason = RejectReason::BadRevision;
         else if (h.buildKey != BuildKey()) r.reason = RejectReason::BuildMismatch;
+        else if (const BuildGate bg = ModRulesOn() ? CheckJoinBuild(game::ModBuild(), h.modBuild, game::AllowBuildMismatch()) : BuildGate::Ok; bg != BuildGate::Ok) {
+            r.reason = RejectReason::ModBuild;   // mod rules 4a: the same HSMMod build hash (PR #9), unless allow_build_mismatch=1
+            r.detail = BuildGateText(bg, game::ModBuild(), h.modBuild);
+        }
         else if (const BanEntry* b = BannedEntry(ev)) r.reason = b->kick ? RejectReason::Kicked : RejectReason::Banned;
         else if (const PasswordVerdict pv = passwordGate_.Check(key, CleanPassword(h.password), lobby_.Password(), game::SteadyNowMs()); pv != PasswordVerdict::Ok)
             r.reason = pv == PasswordVerdict::TooManyTries ? RejectReason::TooManyTries : RejectReason::WrongPassword;   // a locked lobby; rejoins need it too
@@ -4220,15 +5384,19 @@ private:
                 if (peer != ev.peer && p.key != key) net_->Send(peer, kChanReliable, Encode(dp), true);
         }
         if (!slot) {
-            HSM_LOG("host: rejecting peer %u (reason %d; its revision %u build %016llx, ours %u build %016llx)", ev.peer, int(r.reason),
-                    h.revision, (unsigned long long)h.buildKey, kProtocolRevision, (unsigned long long)BuildKey());
-            RejectPeer(ev.peer, r.reason);
+            HSM_LOG("host: rejecting peer %u (reason %d; its revision %u build %016llx mod build '%s', ours %u build %016llx mod build '%s')%s%s", ev.peer, int(r.reason),
+                    h.revision, (unsigned long long)h.buildKey, h.modBuild.c_str(), kProtocolRevision, (unsigned long long)BuildKey(), game::ModBuild().c_str(),
+                    r.detail.empty() ? "" : ": ", r.detail.c_str());
+            RejectPeer(ev.peer, r.reason, r.detail);
             return;
         }
         // A reconnect can arrive before the old connection's Disconnected: forget the stale peer so its late
         // disconnect does not remove the member's fighter.
         std::erase_if(peers_, [&](const auto& kv) { return kv.first != ev.peer && kv.second.key == key; });
         Peer& p = peers_[ev.peer]; p = Peer{}; p.slot = *slot; p.key = key; p.helloAt = NowMs(); p.name = util::StripControlChars(h.name); p.modBuild = h.modBuild;
+        p.sameBuild = !h.modBuild.empty() && h.modBuild == game::ModBuild();
+        p.mods.held = ModRulesOn(); p.mods.heldSinceMs = NowMs();   // no fighter until its ModList passes (ModRulesTick)
+        sessionModsDirty_ = true;
         MeshRosterChanged(*slot);
         if (h.modBuild != game::ModBuild())
             HSM_LOG("host: slot %u (%s) runs mod build '%s', ours '%s'", *slot, h.name.c_str(), h.modBuild.c_str(), game::ModBuild().c_str());
@@ -4259,6 +5427,7 @@ private:
     // A Steam member who drops mid-match keeps slot, fighter and score for ReservationTable's window.
     void OnClientLeft(uint32_t peer) {
         peerSilence_.Forget(peer);
+        sessionModsDirty_ = true;
         auto it = peers_.find(peer);
         if (it == peers_.end()) return;
         uint8_t slot = it->second.slot;
@@ -4339,6 +5508,7 @@ private:
         if (off < 0) return false;
         UObject* other = *reinterpret_cast<UObject**>(static_cast<uint8_t*>(params) + off);
         props_.NoteContact(obj, other);
+        if (hitProbe_.On()) ProbeContact(obj, other, fn, params);
         // Cheap first (test 5: bodies against the ground were most of the 8970 calls of one Abyss frame): a contact
         // with no weapon on either side has no attacker, so it is never blocked or credited; what a class
         // is gets looked up once per class, whom an actor belongs to once per frame.
@@ -4359,6 +5529,28 @@ private:
         if (ae && ae != ve && IsHost()) { kills_.OnHit(ve, ae, NowMs()); TagNoteHit(ae, ve); }
         else if (ae && ae != ve && ve <= kMaxFighters) nativeHits_[ve] = {ae, game::SteadyNowMs()};   // a hand-off: two fighters simulated here
         return false;
+    }
+
+    // A contact between my side and a stand-in's, for the log: here, before the weapon rule below, because a blocker on a
+    // stand-in may never reach it. A fighter's worn gear is no weapon, so what a side belongs to is asked of every actor.
+    void ProbeContact(UObject* obj, UObject* other, UFunction* fn, void* params) {
+        UObject* a = HitKindOf(obj) == HitKind::Willie ? obj : FighterOfThisFrame(obj);
+        UObject* b = HitKindOf(other) == HitKind::Willie ? other : FighterOfThisFrame(other);
+        if (!a || !b || a == b) return;
+        const uint8_t sa = standIns_.EntityOf(a), sb = standIns_.EntityOf(b);
+        if (!sa == !sb || !OwnedEntityOf(sa ? b : a)) return;   // two of mine, two stand-ins, or a stranger
+        const uint8_t entity = sa ? sa : sb;
+        UObject* willie = sa ? a : b;
+        const VitalsMsg* v = standIns_.Vitals(entity);
+        hitProbe_.OnHit(entity, willie, adapter_.Mesh(willie), sa != 0, v && (v->flags & 7), fn, params, game::SteadyNowMs());
+    }
+
+    // One stand-in per health report: a census walks every component it has.
+    void ProbeCensus() {
+        for (size_t i = 0; i < kMaxWillies; ++i) {
+            probeCursor_ = uint8_t(probeCursor_ % kMaxWillies + 1);
+            if (UObject* w = standIns_.ActorOf(probeCursor_)) { hitProbe_.Census(probeCursor_, w, adapter_.Mesh(w)); return; }
+        }
     }
 
     // The recorder's Hit events, single player too: a weapon against a fighter or another weapon, or fighter against
@@ -4430,7 +5622,7 @@ private:
     }
 
     int8_t KnownTeam(uint8_t e) {
-        if (IsHost()) return match_.TeamOf(e);
+        if (IsHost()) return bots_.count(e) ? HitTeamOf(BotSide(e)) : match_.TeamOf(e);   // a Carnage bot is on no team
         for (const FighterEntry& f : info_.fighters) if (f.entity == e) return f.team;
         return kNoTeam;
     }
@@ -4608,7 +5800,12 @@ private:
         adapter_.SetBuild(ForcedWeight(match_.config()), cfg_.forceStrength && !progression, int(match_.config().tier));   // and in the tier's build
         progression_ = progression; oneFight_ = progression;
         progressionPaidThisFight_ = false;   // the next fight's purse starts undecided (#620)
-        match_.SetResultsMs(progression ? 3000 : Match::kResultsMs);   // a Progression fight goes back to the Tavern after 3 s
+        coopOutcome_ = CoopOutcome{};
+        outLatch_.Clear();
+        coopStart_.reset();                             // a Progression start: the place the stock spawner gave the host's player
+        if (UObject* own = progression && localFighter_ ? adapter_.PlayerWillie(0) : nullptr)
+            coopStart_ = CoopStart{adapter_.ActorLocation(own), adapter_.ActorYaw(own)};
+        match_.SetResultsMs(progression ? kCoopResultsMs : Match::kResultsMs);   // a loss goes back after 3 s; a win waits for G
         sidesValid_ = false;
         HSM_LOG("host: match started (format %d, limit %u, time %us, friendly fire %s)%s", int(cfg.format), cfg.scoreLimit, cfg.timeLimitS,
                 cfg.friendlyFire ? "on" : "off", progression ? " - Progression co-op" : "");
@@ -4622,33 +5819,128 @@ private:
         CtfStart();     // Capture the flag: the bases from the team sides RespawnAll just built
     }
 
-    // A Progression fight's effect on the host's career money, in-session (#620, session/hsm_career.h): the stock win
-    // screen's Claim Reward adds Due Reward to Player Funds (and half of it to the reputation); the mod suppresses that
-    // screen, so here a win pays the same purse and a loss keeps the bet lost (stock) — and either way the pending Due
-    // Reward is spent, so the hub cannot pay it out twice. Host only, once per fight; the SaveGuard still restores the
-    // saved career when the session ends.
-    void ProgressionPayout() {
-        if (!cfg_.progressionPayout || progressionPaidThisFight_) return;   // off, or this fight already decided its payout
-        progressionPaidThisFight_ = true;                   // the rematch event can tick again before the travel to the hub
-        UObject* gi = adapter_.GameInstance();
-        FProperty* fundsProp = gi ? FindProperty(ClassOf(gi), "Player Funds") : nullptr;
-        FProperty* dueProp = gi ? FindProperty(ClassOf(gi), "Due Reward") : nullptr;
-        // Career money is Kismet Int64 in this build: an 8-byte read needs the reflected size to say so, or nothing moves.
-        const char* skip = !gi ? "no game instance" : !fundsProp ? "Player Funds missing" : !dueProp ? "Due Reward missing"
-                        : PropertySize(fundsProp) != 8 ? "Player Funds is not 8 bytes"
-                        : PropertySize(dueProp) != 8 ? "Due Reward is not 8 bytes" : nullptr;
-        if (skip) { HSM_LOG("progression: payout skipped (%s)", skip); return; }
-        uint8_t* base = reinterpret_cast<uint8_t*>(gi);
-        int64_t funds = 0, due = 0;
-        std::memcpy(&funds, base + PropertyOffset(fundsProp), sizeof funds);
-        std::memcpy(&due, base + PropertyOffset(dueProp), sizeof due);
-        const bool won = match_.winner() == kHumanTeam;     // PlayersVsBots: the human side is the purse's winner
-        const ProgPayout pay = ProgPayoutFor(won, due);
-        funds += pay.fundsDelta;
-        std::memcpy(base + PropertyOffset(fundsProp), &funds, sizeof funds);
-        std::memcpy(base + PropertyOffset(dueProp), &pay.dueAfter, sizeof pay.dueAfter);
-        if (won) HSM_LOG("progression: fight won, paid %lld (funds now %lld)", static_cast<long long>(pay.fundsDelta), static_cast<long long>(funds));
-        else HSM_LOG("progression: fight lost, the bet stays lost (stock)");
+    // A Progression co-op fight's end (session/hsm_career.h). The host decides it: won (the human side won), the purse (its
+    // pending Due Reward, #620: paid on a win, a loss keeps the bet lost, spent either way so the Tavern cannot pay it twice)
+    // and whether it was a Tourney. Every client hears it (ProgressionResult 69, ahead of the Travel back to the Tavern, so
+    // its own fighter is still there) and each machine applies it to its own career (ApplyFightEnd). Once per fight; the
+    // host's time step lands before the Travel, which carries the host's Day Time and Day Count to every career.
+    // Tester logs up to pre27 showed the purse never paid ("payout skipped (Player Funds is not 8 bytes)"): Player Funds is
+    // 4 bytes in this build. GetCareerInt and SetCareerInt go by the reflected size.
+    // Returns true when the contest goes on: a round won with more to come (ContestAfterFight), played in the same arena.
+    bool ProgressionFightEnd() {
+        if (progressionPaidThisFight_) return false;      // the rematch event can tick again before the travel
+        progressionPaidThisFight_ = true;
+        const bool won = coopOutcome_.TakeWon();           // kept at the match's end: by this rematch event the match has cleared its winner
+        const int combatMode = adapter_.CareerCombatMode();
+        // The contest's rounds (the stock UI_WinScreen counts them; it is kept off the screen in a session, so the mod does).
+        int64_t roundsWon = -1, roundsToWin = -1;
+        const bool roundsRead = adapter_.GetCareerInt("Rounds Won", roundsWon) && adapter_.GetCareerInt("Rounds to WIn", roundsToWin);
+        const int left = adapter_.CareerArrayNum("Available Combatants");
+        const ContestAfter contest = ContestAfterFight(won, roundsRead ? int(roundsWon) : -1, roundsRead ? int(roundsToWin) : -1,
+                                                       adapter_.CareerGameMode(), combatMode, left);
+        const bool next = cfg_.progressionRounds && contest.step == ContestStep::NextRound;
+        if (roundsRead && contest.roundsWonAfter != roundsWon) adapter_.SetCareerInt("Rounds Won", contest.roundsWonAfter);
+        int64_t due = 0;
+        uint32_t purse = 0;
+        if (next) {}                                       // the purse stays due until the contest's last round
+        else if (!cfg_.progressionPayout) HSM_LOG("progression: payout off (progression_payout=0): no purse for anyone");
+        else if (!adapter_.GetCareerInt("Due Reward", due)) HSM_LOG("progression: payout skipped (Due Reward unreadable)");
+        else {
+            const ProgPayout pay = ProgPayoutFor(won, due);
+            purse = uint32_t(std::clamp<int64_t>(pay.fundsDelta, 0, int64_t(kMaxPurse)));
+            adapter_.SetCareerInt("Due Reward", pay.dueAfter);
+        }
+        ProgResultMsg r;
+        r.fight = travelSeq_;
+        r.flags = uint8_t((won ? kResultWon : 0) | (combatMode == kTourneyCombatMode ? kResultTourney : 0) |
+                          (next ? kResultNextRound | (contest.timeStep ? kResultTimeStep : 0) : 0));
+        r.purse = won && !next ? purse : 0;
+        if (net_) net_->Broadcast(kChanReliable, Encode(r), true);
+        if (next)
+            HSM_LOG("progression: fight #%u won: round %d of %lld%s; the next round in this arena (%d opponent(s) left to draw)", r.fight,
+                    contest.roundsWonAfter, static_cast<long long>(roundsToWin), r.tourney() ? " (Tourney)" : "", left);
+        else
+            HSM_LOG("progression: fight #%u %s%s, purse %u for every player (rounds %lld of %lld)", r.fight, won ? "won" : "lost", r.tourney() ? " (Tourney)" : "",
+                    r.purse, static_cast<long long>(contest.roundsWonAfter), static_cast<long long>(roundsToWin));
+        if (next && contest.tourneyFinal) {               // the Tourney's last round: its champion joins the draw (UI_NextFIght NF:85-98)
+            CareerRank rank;
+            const int tier = adapter_.ReadCareerRank(rank) ? int(rank.tier) : 0;
+            const bool made = adapter_.GenerateTourneyChampion(tier);
+            HSM_LOG("progression: the Tourney's final round: champion %s (tier %d, budget %.0f); %d opponent(s) to draw", made ? "generated" : "could NOT be generated",
+                    tier, TourneyChampionBudget(tier), adapter_.CareerArrayNum("Available Combatants"));
+        }
+        if (cfg_.progressionFightEnd) { ApplyFightEnd(r); return next; }
+        int64_t funds = 0;   // progression_fight_end=0: the host's purse only, as up to pre27
+        if (r.purse && adapter_.GetCareerInt("Player Funds", funds) && adapter_.SetCareerInt("Player Funds", std::min<int64_t>(funds + r.purse, kMaxCareerMoney)))
+            HSM_LOG("progression: fight won, paid %u (funds now %lld)", r.purse, static_cast<long long>(std::min<int64_t>(funds + r.purse, kMaxCareerMoney)));
+        return next;
+    }
+
+    // Host: a Progression co-op fight is over (a player held G after the win, or the results ran out): its end on every career,
+    // then the next round in the same arena or everyone back to the Tavern. Once per fight.
+    void ProgressionAdvance(const char* why) {
+        if (progressionPaidThisFight_) return;
+        const bool next = ProgressionFightEnd();
+        const std::string level = next && lastTravel_ ? lastTravel_->level : std::string(kHubLevel);
+        HSM_LOG("host: Progression fight over (%s); %s", why, next ? "the next round, same arena" : "returning everyone to the hub");
+        HostTravel(level);
+    }
+
+    // Client: the host's word on the Progression fight just over. This machine's own career takes it, once.
+    void OnProgResult(const ProgResultMsg& m) {
+        if (!progResultOnce_.Take(m.fight)) return;
+        if (!FighterLevel() || adapter_.FreeModeActive() || m.fight != travelSeq_) {
+            HSM_LOG("progression: the host's result of fight #%u is not for this level (#%u %s); ignored", m.fight, travelSeq_, currentLevel_.c_str());
+            return;
+        }
+        if (!cfg_.progressionFightEnd) {
+            HSM_LOG("progression: fight #%u %s; progression_fight_end=0 here, so this career takes nothing from it", m.fight, m.won() ? "won" : "lost");
+            return;
+        }
+        ApplyFightEnd(m);
+    }
+
+    // A Progression co-op fight's end on this machine's own career (session/hsm_career.h): what the stock claim, lose and death
+    // screens would have done. The money and rank first, then the game's own capture (the body: each limb +10, 25..100; the
+    // kit of a clean win), then one time step. The fighter's body as it ended goes to the log: the next fight starts from it.
+    void ApplyFightEnd(const ProgResultMsg& r) {
+        if (adapter_.CareerGameMode() == kSparringGameMode) {   // stock sparring keeps no body and moves no time (UI_NextFIght NF:72-81)
+            HSM_LOG("progression: fight #%u was sparring; the career takes nothing from it", r.fight);
+            return;
+        }
+        VitalsMsg body;
+        const bool sawBody = adapter_.ReadVitals(adapter_.PlayerWillie(0), 0, body);
+        if (r.nextRound()) {                              // a round won with more to come: the stock between-rounds capture, no pay
+            const bool captured = saveGuard_.CaptureFightEnd(adapter_);
+            const bool stepped = r.timeStep() && adapter_.SkipTimeStep();
+            if (sawBody) {
+                const auto& h = body.partHealth;
+                HSM_LOG("progression: your fighter ended round #%u with head %.0f, body %.0f/%.0f, arms %.0f/%.0f, legs %.0f/%.0f", r.fight, h[0], h[1], h[2], h[3], h[4], h[5], h[6]);
+            }
+            HSM_LOG("progression: round #%u won, the contest goes on: nothing paid yet; the game's capture %s; the time %s", r.fight,
+                    captured ? "ran (body and kit)" : "could NOT be called", !r.timeStep() ? "stays" : stepped ? "moved one step" : "could NOT move");
+            return;
+        }
+        CareerRank before;
+        const bool read = adapter_.ReadCareerRank(before);
+        const CareerChange ch = CareerAfterFight(before, r.won(), r.purse, r.tourney());
+        const bool wrote = read && (!r.won() || adapter_.WriteCareerRank(ch));
+        const bool captured = saveGuard_.CaptureFightEnd(adapter_);
+        const bool stepped = adapter_.SkipTimeStep();
+        if (sawBody) {
+            const auto& h = body.partHealth;   // head, upper body, lower body, arm R, arm L, leg R, leg L
+            HSM_LOG("progression: your fighter ended fight #%u with head %.0f, body %.0f/%.0f, arms %.0f/%.0f, legs %.0f/%.0f", r.fight, h[0], h[1], h[2], h[3], h[4], h[5], h[6]);
+        } else {
+            HSM_LOG("progression: fight #%u: no fighter of yours to read (the body stays as the career had it)", r.fight);
+        }
+        if (!wrote) HSM_LOG("progression: the career's money and rank could not be %s; nothing paid", read ? "written" : "read");
+        else if (r.won())
+            HSM_LOG("progression: fight #%u won%s: paid %lld, reputation +%lld (funds %lld, reputation %lld, rank %d%s)", r.fight, ch.tourneyWon ? " (Tourney)" : "",
+                    static_cast<long long>(ch.purse), static_cast<long long>(ch.purse / 2), static_cast<long long>(ch.after.funds),
+                    static_cast<long long>(ch.after.reputation), ch.after.tier, ch.rankedUp ? ", ranked up" : "");
+        else HSM_LOG("progression: fight #%u lost: the bet stays lost (funds %lld)", r.fight, static_cast<long long>(before.funds));
+        HSM_LOG("progression: the game's fight-end capture %s; the time %s", captured ? "ran (body and kit)" : "could NOT be called",
+                stepped ? "moved one step" : "could NOT move");
     }
 
     // role=server: the lobby-less loop (session/hsm_autoflow.h). Announcements are SERVER chat lines (ServerSay).
@@ -4705,7 +5997,7 @@ private:
         if (!MatchLevel()) return;
         if (serverTravelling_) return;                   // role=server: the next map is on its way; no new match on this one
         uint32_t now = NowMs();
-        bool wanted = roster_.size() >= 2 || (steamMode() && IsBotFormat(lobby_.config().format));
+        bool wanted = HostMatchWanted(roster_.size(), steamMode() && IsBotFormat(lobby_.config().format), steamMode() && !adapter_.FreeModeActive());
         if (IsServer()) wanted = roster_.size() >= (IsBotFormat(ServerFormat()) ? size_t(1) : size_t(cfg_.serverMinPlayers));
         if (match_.phase() == MatchPhase::Idle) {
             // Start once every member's fighter is in (the director's ready/loadout timeouts bound the wait).
@@ -4745,17 +6037,18 @@ private:
                 HostMapReset(ev.rematch || !IsRoundFormat(match_.config().format));
         }
         GroundClearTick(now);
-        if (ev.ended) HSM_LOG("host: match over, winner key %d", match_.winner());
+        if (ev.ended) {
+            HSM_LOG("host: match over, winner key %d", match_.winner());
+            coopOutcome_.Ended(match_.winner());         // a Progression fight's end reads it at the rematch (session/hsm_career.h)
+        }
         MakeGearAhead(now);
         if (ev.rematch && IsServer()) {                  // role=server: the results are over, the flow picks the next map
             serverTravelling_ = true;
             if (flow_) flow_->ResultsOver();
             return;
         }
-        if (ev.rematch && progression_) {                // Progression fights end back in the Tavern, like the stock game
-            ProgressionPayout();                         // the purse (#620): the suppressed win screen's claim, paid here
-            HSM_LOG("host: Progression fight over; returning everyone to the hub");
-            HostTravel(kHubLevel);
+        if (ev.rematch && progression_) {                // the results ran out (a loss, or nobody held G after the win)
+            ProgressionAdvance("the results are over");  // the suppressed end screens' work, on every player's career (#620)
             return;
         }
         if (ev.rematch && HasRoles(match_.config().format)) { ++roleRematch_; DealRoles(match_.config()); infoDirty_ = true; }   // the Knight / Juggernauts move on
@@ -4775,9 +6068,26 @@ private:
         if (ev.rematch) { LogPairing("rematch"); RespawnAll(); }
         if (!respawnQueue_.empty()) { const uint8_t e = respawnQueue_.front(); respawnQueue_.pop_front(); RespawnEntity(e); }
         if (progression_ && !bots_.empty() && match_.phase() == MatchPhase::Live) {
-            bool anyBot = false;
-            for (auto& [e, ref] : bots_) anyBot = anyBot || match_.Alive(e);
-            if (!anyBot) { match_.Finish(kHumanTeam, now); infoDirty_ = true; }
+            // Every opponent out, as the stock Enemy Count takes it: dead, given up or downed (Willie_BP Event Lose Match), and
+            // out for good (OutLatch). A hired mercenary need not fall. The fight then waits for G (CoopResultsMs).
+            std::vector<CoopFighter> sides;
+            int dead = 0, yielded = 0;
+            for (auto& [e, ref] : bots_) {
+                const bool alive = match_.Alive(e);
+                bool gaveUp = false, downed = false;
+                if (alive && adapter_.StillValid(ref.obj, ref.index)) { GetBool(ref.obj, "Give Up", gaveUp); GetBool(ref.obj, "Downed", downed); }
+                const bool out = !alive || outLatch_.Note(e, gaveUp || downed);
+                const StockSide side = BotSide(e);
+                if (side != StockSide::Ally) { dead += !alive; yielded += alive && out; }
+                sides.push_back({side, out});
+            }
+            if (CoopFoesDown(sides)) {
+                match_.SetResultsMs(CoopResultsMs(true, cfg_.progressionClaimG));
+                HSM_LOG("host: every opponent is out (%d dead, %d gave up or down): the fight is won%s", dead, yielded,
+                        cfg_.progressionClaimG ? "; a player holds G to go on" : "");
+                match_.Finish(kHumanTeam, now);
+                infoDirty_ = true;
+            }
         }
         if (wavesEnabled_ && ev.spawnBots) SpawnWaveBots(ev.spawnBots, ev.botRank);
         if (wavesEnabled_ && DueAt(now, nextCorpseSweep_)) {
@@ -4992,6 +6302,12 @@ private:
         if (UObject* w = EntityActor(e)) adapter_.TriggerDeath(w);
     }
     void HandleGiveUp(uint8_t e, uint32_t now) {
+        if (progression_ && match_.phase() == MatchPhase::Results && match_.winner() == kHumanTeam) {   // won: G goes on (ClaimWin)
+            coopOutcome_.Ended(match_.winner());          // the G may beat the match's ended event to here
+            HSM_LOG("match: #%u held G after the win", e);
+            ProgressionAdvance("G held after the win");
+            return;
+        }
         if (progression_ && !InWaveBreak(info_) && match_.GiveUpFight(e, now)) {
             HSM_LOG("match: #%u gave up the Progression fight", e);
             Kill k; k.victim = e; k.flags = 8;
@@ -5207,6 +6523,7 @@ private:
         const bool pvp = act == GiveUpAction::GiveUp;
         const bool skip = act == GiveUpAction::SkipBreak;
         const bool coop = act == GiveUpAction::GiveUpFight;
+        const bool claim = act == GiveUpAction::ClaimWin;   // a Progression fight won: G goes on (the next round or the Tavern)
         const bool waiting = act == GiveUpAction::Waiting;
         if (MatchLevel() && act != GiveUpAction::None && !ui::Typing()) {
             if (GetAsyncKeyState('G') & 0x8000) {   // the key first: asking whose window is in front is the dearer call
@@ -5225,7 +6542,7 @@ private:
         if (!giveUp_.Update(down, now)) return;
         const uint8_t me = MyEntity();
         HSM_LOG("match: G held %u ms: %s (#%u)", unsigned(GiveUpHold::kHoldMs),
-                skip ? "voting to skip the break" : coop ? "giving up the fight"
+                skip ? "voting to skip the break" : claim ? "going on after the win" : coop ? "giving up the fight"
                 : IsBotFormat(Format(mi.format)) ? "giving up the wave" : "giving up", me);
         if (IsHost()) HandleGiveUp(me, now);
         else if (hostPeer_) { GiveUpMsg g; g.entity = me; net_->Send(hostPeer_, kChanReliable, Encode(g), true); }
@@ -5254,6 +6571,26 @@ private:
         sidesArea_ = AreaOf(sidePoints_);
         sidesValid_ = true;
     }
+    // A Progression co-op start (session/hsm_spawn.h CoopStartTaken): the host where the stock spawner put the player, the
+    // others round it, clear of every fighter in the level and of every other spawner (an opponent's or the mercenary's).
+    FVector CoopStartPoint(uint8_t e, double& yawDeg) {
+        yawDeg = coopStart_->yaw;
+        const Point3 c{coopStart_->at.x, coopStart_->at.y, coopStart_->at.z};
+        if (e == HostEntity()) { HSM_LOG("host: Progression start: #%u where the stock spawner put the player (%.0f, %.0f, %.0f)", e, c.x, c.y, c.z); return coopStart_->at; }
+        const std::vector<UObject*>& ignore = SpawnIgnore();
+        EnsureSides(ignore);
+        std::vector<Point3> fighters = BodiesExcept(e);
+        for (UObject* w : adapter_.AllWillies()) { const FVector v = adapter_.ActorLocation(w); fighters.push_back({v.x, v.y, v.z}); }
+        const std::vector<Point3> taken = CoopStartTaken(c, fighters, SpawnerPoints(ignore));
+        size_t skipped = 0;
+        const Point3 p = StandableSpot(c, taken, e, kMinFighterGapCm, sidesArea_, [&](const Point3& a, const Point3& b) { return Stands(a, b, ignore); }, &skipped);
+        double nearest = 1e12;
+        for (const Point3& t : taken) nearest = std::min(nearest, std::sqrt(FlatDist2(p, t)));
+        HSM_LOG("host: Progression start: #%u at (%.0f, %.0f) by the player's spot, %.0f cm from the nearest fighter or other spawner (%zu slot(s) passed over)",
+                e, p.x, p.y, taken.empty() ? 0.0 : nearest, skipped);
+        return Grounded({p.x, p.y, p.z}, ignore);
+    }
+
     FVector SidePoint(int8_t team, uint8_t entity, double& yawDeg, int pitSide = -1) {
         const std::vector<UObject*>& ignore = SpawnIgnore();
         EnsureSides(ignore);
@@ -5379,7 +6716,7 @@ private:
         int8_t team = match_.TeamOf(e);
         double yaw = 0;
         const int pitSide = match_.config().format == Format::PitBridgeDuel ? PitSideOf(e == match_.PairA() ? 0 : 1) : -1;   // a side of the bridge, not a team
-        FVector at = SidePoint(team, e, yaw, pitSide);
+        FVector at = progression_ && coopStart_ ? CoopStartPoint(e, yaw) : SidePoint(team, e, yaw, pitSide);
         FlushRoles();
         game::Adapter::SpawnOptions o; o.at = at; o.yawDeg = yaw; o.teamInt = slot == 0 ? 1 : TeamIntFor(team, e);
         o.fighterClass = FighterClassFor(match_.config().format == Format::Zombies, slot != 0 && team == kBotTeam,
@@ -5474,6 +6811,8 @@ private:
             director_.Forget(e); match_.RemoveFighter(e); kills_.Forget(e); kills_.ForgetAttacker(e); severs_.Forget(e); gore_.Forget(e); claims_.Forget(e); fx_.Forget(e); equip_.Forget(e); grabs_.Forget(e); props_.ForgetEntity(e);
         }
         bots_.clear();
+        botSide_.clear();
+        outLatch_.Clear();
     }
 
     uint8_t FreeBotEntity() const {
@@ -5481,19 +6820,22 @@ private:
         return 0;
     }
 
-    void AnnounceBot(uint8_t e, UObject* w) {
+    // side: the stock fighter's own side in a career fight (session/hsm_career.h StockSideOf); the mod's wave bots are foes.
+    void AnnounceBot(uint8_t e, UObject* w, StockSide side = StockSide::Foe) {
         bots_[e].Set(w);
+        botSide_[e] = side;
         std::vector<uint8_t> bytes;
         if (adapter_.ExportPassportOf(w, bytes)) StoreAndRelay(uint8_t(e - 1), std::move(bytes), 0);
         FVector at = adapter_.ActorLocation(w);
-        Spawn sp; sp.entity = e; sp.ownerSlot = 0xFF; sp.kind = EntityKind::Bot; sp.team = kBotTeam; sp.blobId = hostBlobs_.LatestFor(uint8_t(e - 1)); sp.life = lifeBook_.Bump(uint8_t(e));
+        Spawn sp; sp.entity = e; sp.ownerSlot = 0xFF; sp.kind = EntityKind::Bot; sp.team = MatchTeamOf(side); sp.blobId = hostBlobs_.LatestFor(uint8_t(e - 1)); sp.life = lifeBook_.Bump(uint8_t(e));
         sp.x = float(at.x); sp.y = float(at.y); sp.z = float(at.z); sp.yaw = float(adapter_.ActorYaw(w));
         if (adapter_.IsZombieBody(w)) sp.flags |= kSpawnZombie;   // rev 38: the Abyss's own zombies, as built
         director_.MarkSpawned(sp);
         net_->Broadcast(kChanReliable, Encode(sp), true);
-        match_.AddFighter({e, kBotTeam, false});
+        match_.AddFighter({e, MatchTeamOf(side), false});
         infoDirty_ = true;
     }
+    StockSide BotSide(uint8_t e) const { auto it = botSide_.find(e); return it == botSide_.end() ? StockSide::Foe : it->second; }
 
     // Stock NPCs: adopted as synced bots in players-vs-bots / Progression, removed otherwise.
     void ScanStockWillies() {
@@ -5504,7 +6846,16 @@ private:
             // The Abyss's own spawner is held shut in a session (AbyssTick), so what it spawned before that goes too: the
             // zombies are the host's waves alone (adopting them kept the level's tier-sized pack on the host, over the cap).
             uint8_t e = adoptStock_ && !adapter_.IsDead(w) ? FreeBotEntity() : 0;
-            if (e) { AnnounceBot(e, w); ++adopted; HSM_LOG("host: stock fighter adopted as bot entity %u", e); }
+            if (e) {
+                // A career fight keeps the stock sides: the hired mercenary on the players' side, Carnage's everyone-for-himself.
+                const int32_t* teamInt = Field<int32_t>(w, "Team Int");
+                const int combatMode = adapter_.CareerCombatMode();
+                const StockSide side = StockSideOf(!adapter_.FreeModeActive(), teamInt ? *teamInt : -1, combatMode);
+                AnnounceBot(e, w, side); ++adopted;
+                FVector at = adapter_.ActorLocation(w);
+                HSM_LOG("host: stock fighter adopted as bot entity %u at (%.0f, %.0f, %.0f): Team Int %d, combat mode %d, %s", e, at.x, at.y, at.z,
+                        teamInt ? *teamInt : -1, combatMode, side == StockSide::Ally ? "an ally" : side == StockSide::FreeForAll ? "on its own (Carnage)" : "a foe");
+            }
             else { adapter_.DestroyActor(w); ++purged; }
         }
         if (seen && (adopted || purged)) HSM_LOG("host: stock scan: %d stock fighter(s) seen, %d adopted, %d purged (adopt %s)", seen, adopted, purged, adoptStock_ ? "on" : "off");
@@ -5537,6 +6888,8 @@ private:
         Despawn dp; dp.entity = e; net_->Broadcast(kChanReliable, Encode(dp), true);
         director_.Forget(e); match_.RemoveFighter(e); kills_.Forget(e); kills_.ForgetAttacker(e); severs_.Forget(e); gore_.Forget(e); claims_.Forget(e); fx_.Forget(e); equip_.Forget(e); grabs_.Forget(e); props_.ForgetEntity(e);
         bots_.erase(it);
+        botSide_.erase(e);
+        outLatch_.Forget(e);
         infoDirty_ = true;
     }
 
@@ -5666,7 +7019,8 @@ private:
                                   PingOfSlot(r.slot), match_.Alive(r.entity), DownInRound(r.entity), ScoreId(r.entity), RoleIdOf(r.entity)});
         for (auto& [e, ref] : bots_)
             if (m.fighters.size() < kMaxWillies)
-                m.fighters.push_back({e, kBotTeam, int16_t(match_.Kills(e)), int16_t(match_.Deaths(e)), "Bot", 0, match_.Alive(e), false});
+                m.fighters.push_back({e, match_.TeamOf(e), int16_t(match_.Kills(e)), int16_t(match_.Deaths(e)), BotSide(e) == StockSide::Ally ? "Ally" : "Bot", 0,
+                                      match_.Alive(e), outLatch_.Out(e)});   // down: out of the fight (gave up or downed)
         net_->Broadcast(kChanReliable, Encode(m), true);
         info_ = std::move(m); infoAt_ = now;
         banner_.Observe(info_, MyEntity(), now);
@@ -5794,6 +7148,7 @@ private:
             }
             NameTagSrc t;
             t.name = voice_.Talking(f.entity, now) ? "> " + f.name : f.name;   // talking (proximity voice)
+            if (cfg_.classTags && f.entity <= kMaxWillies && !classTags_[f.entity].empty()) t.name += "\n" + classTags_[f.entity];
             t.wx = head.x; t.wy = head.y; t.wz = head.z + 25.0; t.team = f.team; t.alive = f.alive; t.it = info_.tagIt == f.entity;
             t.seen = tagSight_.Seen(f.entity);
             out.push_back(std::move(t));
@@ -6571,11 +7926,13 @@ private:
             if (a == HostLossAction::ShowReconnecting) HSM_LOG("client: host silent; waiting for it to come back");
             hostGone = hostGone || a == HostLossAction::ReturnToMenu;
         } else hostLoss_.OnPacket(NowMs());
-        if (rejected_) { const RejectReason why = *rejected_; rejected_.reset(); OnRejected(why); return; }
+        if (rejected_) { const RejectReason why = *rejected_; rejected_.reset(); std::string detail; detail.swap(rejectedDetail_); OnRejected(why, detail); return; }
         if (modMapHost_ && !modMapChecked_) { ModMapTick(); if (!net_) return; }   // modded maps: the scan or a hash finished
         if (refuseNoHook_) { refuseNoHook_ = false; if (!ScriptHookMissing()) { HSM_LOG("client: refusing a host whose sync mode this build removed"); LeaveSession(); } return; }
         if (hostGone) { if (!MigrateAfterHostLoss()) ReturnToMenuAfterHostLoss(); return; }
         if (!welcomed_ && hostPeer_ && NowMs() >= nextHello_) SendHello();   // the first message of a Steam session can be lost
+        // Again when the report changes, or when the update check answers after the join (official-only lobbies need it).
+        if (welcomed_ && hostPeer_ && (game::modrules::OwnVersion() != modListSent_ || game::modrules::OwnOfficial() != modListOfficial_)) SendModList();
         if (welcomed_ && hostPeer_ && DueAt(NowMs(), nextKeepAlive_)) {   // in every level: the host's silence check (public #9)
             const uint32_t now = NowMs();
             nextKeepAlive_ = now + kKeepAliveMs;
@@ -6674,7 +8031,7 @@ private:
         OwnHandOffTick(me, mine);
         if (me && ownLeased_) adapter_.TickLookSensitivity(me, dt);   // a replica while held elsewhere: its tick is blocked
         if (me && !hooksBound_ && adapter_.BindInputs(me)) BindClientInputHooks();
-        SendInputs(dt);   // rev 32: always, so a machine can take my fighter over mid-grab with what I hold
+        SendInputs(dt);   // warm for hand-off when enabled; otherwise only host physics or an active lease needs input
         Timed(kPumpHandOff, [&] { HandOffTick(now); });
         std::vector<std::pair<uint8_t, UObject*>> owned;
         if (me && mine && snappedOwn_ && !ownLeased_) owned.push_back({mine, me});
@@ -6700,6 +8057,7 @@ private:
         Timed(kPumpGore, [&] { gore_.Tick(now); });
         Timed(kPumpGrabs, [&] { grabs_.Tick(now, dt, owned); });
         chests_.Tick(now, StandInActors());
+        boxes_.Tick(now, StandInActors(), owned);
         Timed(kPumpProps, [&] { props_.Tick(now, owned); });
         Timed(kPumpEquip, [&] { equip_.Tick(now, owned); });
         fx_.Tick();
@@ -6880,7 +8238,7 @@ private:
     bool MeshStreamIn(MsgType t, const uint8_t* d, size_t n, uint8_t fromSlot, double arrivalMs) {
         if (t == MsgType::Pose) {
             PoseMsg m; sync::PoseFrame frame;
-            if (!Decode(d, n, m, &frame) || !MayStream(fromSlot, m.entity, leases_.holders()) || !ClientStreamGate(m.entity, m.epoch)) return false;
+            if (!DecodePoseFrame(d, n, m, frame) || !MayStream(fromSlot, m.entity, leases_.holders()) || !ClientStreamGate(m.entity, m.epoch)) return false;
             standIns_.OnPose(m, frame, arrivalMs);
         } else if (t == MsgType::Vitals) {
             VitalsMsg v;
@@ -7181,6 +8539,7 @@ private:
                 if (meshOn_ || peerPingOn_) HSM_LOG("client: mesh %s, per-player pings %s", meshOn_ ? "on" : "off", peerPingOn_ ? "on" : "off");
                 meshHearing_.Invalidate();                                              // a new host-side mask table: report again
                 UploadLoadout();
+                modListSent_ = ~0u;                                                    // a (new) host: send the mod list again
                 break;
             }
             case MsgType::PeerMap: { PeerMapMsg m; if ((meshOn_ || peerPingOn_) && Decode(d, n, m)) ApplyPeerMap(m); break; }
@@ -7188,7 +8547,9 @@ private:
             case MsgType::VoteState: { VoteStateMsg m; if (Decode(d, n, m)) voteState_ = m; break; }
             case MsgType::RouteTable: { RouteTableMsg m; if (Decode(d, n, m)) ApplyRouteTable(m); break; }
             case MsgType::Pong: { Ping p; bool pong = false; if (DecodePing(d, n, p, pong) && pong) pings_.OnPong(kHostSlot, p.timeMs, NowMs()); break; }
-            case MsgType::Reject: { Reject r; Decode(d, n, r); rejected_ = r.reason; bodyWork_ = true; break; }   // handled after the poll loop
+            case MsgType::Reject: { Reject r; Decode(d, n, r); rejected_ = r.reason; rejectedDetail_ = r.detail; bodyWork_ = true; break; }   // handled after the poll loop
+            case MsgType::ModChallenge: { ModChallengeMsg m; if (Decode(d, n, m)) AnswerChallenge(m); break; }
+            case MsgType::SessionMods: { SessionModsMsg m; if (Decode(d, n, m)) OnSessionMods(m); break; }
             case MsgType::Travel: {
                 Travel tr; Decode(d, n, tr);
                 if (!TravelAllowedWithModMap(tr.level, tr.options, modMapApproved_)) {   // H2: only catalog/menu levels (or the host's checked modded map), no options
@@ -7204,6 +8565,7 @@ private:
             }
             case MsgType::LoadoutChange: { LoadoutChangeResult m; if (Decode(d, n, m)) OnLoadoutResult(m.verdict); break; }
             case MsgType::ProgressionVote: { ProgVoteMsg m; if (Decode(d, n, m) && m.kind != ProgVoteKind::Pick) OnProgVoteMsg(m); break; }
+            case MsgType::ProgressionResult: { ProgResultMsg m; if (Decode(d, n, m)) OnProgResult(m); break; }   // rev 40: the fight just over, on this career
             case MsgType::LobbySecret: { LobbySecretMsg m; if (Decode(d, n, m)) lobby_.RememberPassword(m.password); break; }   // the host's latest password
             case MsgType::LevelSeed: { dice::LevelSeedMsg m; if (Decode(d, n, m)) game::shareddice::SetSeed(m.seed); break; }   // the host's dice for the level it sent us to
             case MsgType::ModMap: {
@@ -7299,7 +8661,7 @@ private:
             }
             case MsgType::Pose: {
                 PoseMsg m; sync::PoseFrame frame;
-                if (Decode(d, n, m, &frame) && m.entity != ClientOwnEntity() && ClientStreamGate(m.entity, m.epoch)) standIns_.OnPose(m, frame, ArrivalMs(ev));
+                if (DecodePoseFrame(d, n, m, frame) && m.entity != ClientOwnEntity() && ClientStreamGate(m.entity, m.epoch)) standIns_.OnPose(m, frame, ArrivalMs(ev));
                 break;
             }
             case MsgType::Vitals: {
@@ -7408,10 +8770,16 @@ private:
     KillLog kills_;
     std::map<uint8_t, int8_t> slotTeam_;
     std::map<uint8_t, ActorRef> bots_;
+    std::map<uint8_t, StockSide> botSide_;            // host: each bot's stock side in a career fight (session/hsm_career.h)
+    OutLatch outLatch_;                               // host: the opponents out of this Progression fight (gave up, downed)
+    struct CoopStart { FVector at; double yaw = 0; };
+    std::optional<CoopStart> coopStart_;              // host: a Progression fight's start, where the stock spawner put the player
     UObject* hostWillie_ = nullptr;
     bool adoptStock_ = false, wavesEnabled_ = false, sidesValid_ = false, infoDirty_ = false, progression_ = false;
     bool oneFight_ = false;                          // this level holds a Progression fight: the HUD shows one fight, no waves
     bool progressionPaidThisFight_ = false;          // host: this Progression fight's purse has been decided (#620)
+    ResultOnce progResultOnce_;                      // client: the Progression fights whose result this career took (ProgressionResult 69)
+    CoopOutcome coopOutcome_;                        // host: the human side won the match just ended (read at its rematch)
     int wave_ = 0;
     uint32_t nextCorpseSweep_ = 0;
     uint32_t nextScan_ = 0, nextInfo_ = 0, nextDraw_ = 0, nextIdleLog_ = 0;
@@ -7432,8 +8800,9 @@ private:
     // (client); the client's input uplink.
     SyncMode syncMode_ = SyncMode::Owner, nextSync_ = SyncMode::Owner, clientNextSync_ = SyncMode::Owner;
     InputCapture capture_;
-    float sendAccum_ = 0;
+    util::SendCadence inputCadence_;   // Input / RelayInput at input_hz, remainder carried (util/hsm_cadence.h)
     uint32_t inputsTx_ = 0;
+    std::optional<bool> inputSending_;   // log the input gate once and on mode/lease changes
     bool hooksBound_ = false;
     // Hand-off (rev 32, sync/hsm_handoff.h): the leases, what is held here, my asks; the buttons my fighter itself last got.
     sync::LeaseTable leases_;                                   // rev 32: hand-offs, every machine's view
@@ -7577,6 +8946,18 @@ private:
     static constexpr uint32_t kRejectLingerMs = 1000;
     uint32_t nextConsolePoll_ = 0, nextBanPrune_ = 0;
     std::optional<RejectReason> rejected_;
+    std::string rejectedDetail_;               // the Reject's detail (mod rules: what to remove or install)
+    // Mod rules (gameplay/mod_rules.h). Client: the report version last sent as ModList. Host: the rule in force, the last
+    // SessionMods sent, the challenge ids. Both: the last SessionMods seen (logged).
+    uint32_t modListSent_ = ~0u;
+    Official modListOfficial_ = Official::Unknown;   // the official-build status that list carried
+    SessionModsMsg sessionMods_;
+    bool sessionModsSeen_ = false;   // client: a SessionMods came this session (the MODS tab)
+    bool sessionModsDirty_ = true;
+    uint32_t sessionModsOwnVersion_ = ~0u;
+    ModRule hostRule_;
+    bool hostRuleSet_ = false;
+    uint32_t nextModTick_ = 0, challengeSeq_ = 0;
     std::optional<ModMapMsg> modMapHost_;      // client: the host's modded map (empty path for a stock one) and its pak
     bool modMapChecked_ = false;
     std::string modMapApproved_;               // the host's map path once this machine has the pak: the one non-catalog level a Travel may open
@@ -7675,6 +9056,7 @@ private:
     // agent bridge / auto-run
     std::array<Held, kAxisCount> held_{};
     bool quitRequested_ = false, automated_ = false;
+    const char* quitWhy_ = "agent request";
     uint32_t startedAt_ = 0, quitAfterMs_ = 0, nextAuto_ = 0, lastModeTick_ = 0, lastEarlyPump_ = 0, lastPauseCheck_ = 0, noPawnSince_ = 0;
     std::string autoLevel_;
     std::vector<std::string> mirrorArgs_;           // -hsmmirror as a "mirror on ..." command; empty when not given
@@ -7684,10 +9066,13 @@ private:
     game::OwnerStreams streams_;
     game::StandIns standIns_;
     game::Claims claims_;
+    game::HitProbe hitProbe_;
+    uint8_t probeCursor_ = 0;
     game::FxSync fx_;
     game::EquipSync equip_;
     game::GrabSync grabs_;
     game::ChestLids chests_;   // sync audit item 43
+    game::FighterBoxes boxes_;   // #1679
     game::AbyssCoop abyss_;    // sync audit items 36, 37
     game::ObjectSync props_;
     game::Severs severs_;
@@ -7724,8 +9109,13 @@ UClass* g_gameModeClass = nullptr;
 bool StartMod(const Config& cfg) {
     if (!Init()) return false;
     game::SetStandInGripLock(cfg.standInGripLock);
+    game::SetStandInTwoHandPose(cfg.standInTwoHandPose);
+    game::SetStandInTwoHandLock(cfg.standInTwoHandLock);
     game::SetStandInScabbardFix(cfg.scabbardFix);
+    game::SetStandInPartsOff(cfg.standInPartsOff);
+    game::SetFighterBoxFix(cfg.standInBoxFix);
     game::SetAllowBuildMismatch(cfg.allowBuildMismatch);
+    game::modrules::Configure(cfg);
     report::Configure(cfg.reports, cfg.reportUrl);
     game::modpack::SetConfigured(cfg.modPack);
     update::Start(cfg.updateCheck);   // a worker thread; the menu page and UpdateNoticeTick show the result
@@ -7741,6 +9131,7 @@ bool StartMod(const Config& cfg) {
         return false;
     });
     HookFunctionsMatching([](const std::string& n) { return n == "ReceiveTick"; }, [](UObject* obj, UFunction* fn, void* params) {
+        NoteGameThread();   // before anything that checks the thread
         if (g_session->IsTickBlocked(obj)) return true;   // a stand-in: never ticks
         static int seenClasses = 0;
         if (!g_gameModeClass && seenClasses < 12) {     // startup diagnostics: which Blueprints tick before the game mode

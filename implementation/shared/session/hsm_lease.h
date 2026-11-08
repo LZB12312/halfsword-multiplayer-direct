@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 #include <map>
 #include <vector>
 
@@ -217,13 +218,13 @@ struct BodyStateMsg {
 };
 
 inline std::vector<uint8_t> Encode(const BodyStateMsg& m) {
-    Writer w; w.header(MsgType::BodyState);
+    Writer w; w.buf.reserve(62); w.header(MsgType::BodyState);
     w.u64(m.objId); w.u8(m.body); w.u8(m.lessee); w.u32(m.senderTimeMs);
     w.f32(m.px); w.f32(m.py); w.f32(m.pz);
     w.i16(m.rot.x); w.i16(m.rot.y); w.i16(m.rot.z); w.i16(m.rot.w);
     w.f32(m.vx); w.f32(m.vy); w.f32(m.vz);
     w.f32(m.wx); w.f32(m.wy); w.f32(m.wz);
-    return w.buf;
+    return std::move(w.buf);
 }
 inline bool Decode(const uint8_t* d, size_t n, BodyStateMsg& m) {
     Reader r(d, n); MsgType t; if (!r.header(t) || t != MsgType::BodyState) return false;
@@ -246,18 +247,31 @@ inline bool PropAtRest(const BodyStateMsg& m) {
 }
 
 // The host streams a FREE prop (nobody leases it) when this is true; lastSentMs far in the past means never sent.
+inline double FreeStreamPeriodMs(bool atRest) { return atRest ? kFreeIdleMs : kFreeStreamMs; }
 inline bool FreeStreamDue(double lastSentMs, bool atRest, double nowMs) {
-    return nowMs - lastSentMs >= (atRest ? kFreeIdleMs : kFreeStreamMs);
+    return nowMs - lastSentMs >= FreeStreamPeriodMs(atRest);
 }
 
 // The streamer of a prop sends its state when this is true. A lessee streams at the pose rate while the prop is
 // held (a held weapon swings even when its speed reads low) or moving (a throw, a push); a touched prop at rest once a
 // second; a FREE prop on the host's schedule (FreeStreamDue).
 constexpr double kLeaseStreamMs = 16.0;
-inline bool PropStreamDue(LeaseLevel level, double lastSentMs, bool atRest, double nowMs) {
-    if (level == LeaseLevel::Free) return FreeStreamDue(lastSentMs, atRest, nowMs);
+inline double PropStreamPeriodMs(LeaseLevel level, bool atRest) {
+    if (level == LeaseLevel::Free) return FreeStreamPeriodMs(atRest);
     const bool fast = level == LeaseLevel::Hold || !atRest;
-    return nowMs - lastSentMs >= (fast ? kLeaseStreamMs : kFreeIdleMs);
+    return fast ? kLeaseStreamMs : kFreeIdleMs;
+}
+inline bool PropStreamDue(LeaseLevel level, double lastSentMs, bool atRest, double nowMs) {
+    return nowMs - lastSentMs >= PropStreamPeriodMs(level, atRest);
+}
+
+// The lastSentMs to keep after a send that was due by periodMs: one period on from the last send, so the part of a frame
+// past the period carries into the next one (as util/hsm_cadence.h SendCadence does for poses), but never more than one
+// period behind now, so a hitch or a long wait sends one extra state, never a burst. Until 0.8.0-pre29 it was nowMs: every
+// send waited for the next whole frame past the period, so a 16 ms stream ran at about 45 Hz at 90 fps and 48 Hz at 144 fps
+// (and flipped between 60 and 30 Hz at 60 fps), and a 50 ms structure at about 18 Hz.
+inline double NextSentMs(double lastSentMs, double periodMs, double nowMs) {
+    return std::max(lastSentMs + periodMs, nowMs - periodMs);
 }
 
 // ---------------------------------------------------------------- PropLease (reliable)

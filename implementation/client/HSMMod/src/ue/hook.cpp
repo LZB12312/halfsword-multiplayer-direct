@@ -179,6 +179,13 @@ void ClearHooks() {
 
 unsigned long GameThreadId() { return g_gameThreadId.load(); }
 
+void NoteGameThread() {
+    const unsigned long me = GetCurrentThreadId();
+    if (g_gameThreadId.load(std::memory_order_relaxed) == me) return;
+    const unsigned long was = g_gameThreadId.exchange(me);
+    if (was != me) HSM_LOG("hook: game thread is %lu; the first ProcessEvent call came from thread %lu", me, was);
+}
+
 void DiscountHookTime(uint64_t ns) { t_discountNs += ns; }
 
 std::string TopHookFunctions(int n, double frames) {

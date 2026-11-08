@@ -3,7 +3,8 @@
 // truncation, trailing bytes, another type or revision), SplitCensus (part sizes, the empty census, the cap), the
 // client's CensusAssembler (in and out of order, duplicate and contradicting parts, an index in two parts, newer and
 // stale censuses, wrap), MatchCensus (nearest, same class, the reach boundary, no candidate twice, nearest pairs
-// first, ties) and the host's CensusBook (stable indices, homes kept, gone props, never reused, left-out keys, cap).
+// first, ties), CensusMatchPlace and the measured Alley case (the early place), and the host's CensusBook (stable indices,
+// homes kept, gone props, never reused, left-out keys, cap).
 #include "session/hsm_prop_census.h"
 #include <cstdio>
 #include <limits>
@@ -230,6 +231,33 @@ static void TestMatchCensus() {
     CHECK(all);
 }
 
+// The early place: a candidate with a snapshot of its own class is compared where it lay early, else where it is now.
+static void TestCensusMatchPlace() {
+    const CensusCandidate now = C(1, -438, -14, 194);
+    CensusCandidate got = CensusMatchPlace(now, nullptr);
+    CHECK(got.classHash == 1 && got.px == -438 && got.py == -14 && got.pz == 194);       // no snapshot: where it is now
+    const CensusCandidate early = C(1, -344, 214, 224);
+    got = CensusMatchPlace(now, &early);
+    CHECK(got.classHash == 1 && got.px == -344 && got.py == 214 && got.pz == 224);       // all three axes: the snapshot
+    const CensusCandidate other = C(2, -344, 214, 224);
+    got = CensusMatchPlace(now, &other);
+    CHECK(got.classHash == 1 && got.px == -438 && got.py == -14 && got.pz == 194);       // another class: not its place
+}
+
+// The measured case (Alley, 2026-11-05, machine c): two physics props of one class whose homes are 57 cm apart, with the
+// census tolerance at 100 cm. Early in the level the copies lay 1 cm and 10 cm from their homes. At the first match one
+// had rolled 250 cm away and the other had crossed to 32 cm from the first home. Matched on where they are then, home A
+// takes the crossing copy and home B is left open; matched on the early places, each home takes its own copy.
+static void TestCensusSnapshotMatch() {
+    const std::vector<CensusEntry> census = {E(0, 7, -344, 215, 223), E(1, 7, -287, 210, 219)};   // host: _200, _202
+    const CensusCandidate nowA = C(7, -438, -14, 194), nowB = C(7, -320, 199, 209);              // at the first match
+    const CensusCandidate earlyA = C(7, -344, 214, 224), earlyB = C(7, -280, 205, 225);          // early in the level
+    std::vector<int> r = MatchCensus(census, {CensusMatchPlace(nowA, nullptr), CensusMatchPlace(nowB, nullptr)});
+    CHECK(r.size() == 2 && r[0] == 1 && r[1] == -1);          // home A takes copy B (crossed, 32 cm off it); home B is open
+    r = MatchCensus(census, {CensusMatchPlace(nowA, &earlyA), CensusMatchPlace(nowB, &earlyB)});
+    CHECK(r.size() == 2 && r[0] == 0 && r[1] == 1);           // each home takes its own copy
+}
+
 // ---------------------------------------------------------------- the host names its props
 using Book = CensusBook<int>;
 static Book::Seen S(int key, uint32_t cls, float x, float y = 0, float z = 0) { Book::Seen s; s.key = key; s.classHash = cls; s.px = x; s.py = y; s.pz = z; return s; }
@@ -305,6 +333,8 @@ int main() {
     TestAssemblerOutOfOrder();
     TestAssemblerNewerAndStale();
     TestMatchCensus();
+    TestCensusMatchPlace();
+    TestCensusSnapshotMatch();
     TestCensusBook();
     TestCensusBookCaps();
     TestCensusPlaceOk();

@@ -10,11 +10,12 @@
 // proxy DLL, writes dwmapi.dll.new beside the running DLL, renames the running one to dwmapi.dll.old and the new one
 // into place (any failure puts the old one back). The player restarts the game; the next start deletes the .old file.
 #pragma once
+#include "session/hsm_mod_rules.h"
 #include <string>
 
 namespace hsm::update {
 // Starts the check (a no-op when disabled or already started). Returns at once; the worker logs the outcome.
-void Start(bool enabled);
+void Start(bool enabled);   // devUrl: report_url, for a dev build's dev releases
 // Game thread: "HSMMod 0.7.0-pre3 is out (you have 0.7.0-pre2). Get it from GitHub: Dudiebug/halfsword-multiplayer-mod"
 // once a newer release is known, else empty.
 std::string Notice();
@@ -27,4 +28,8 @@ void StartInstall();
 std::string InstallStatus();
 // Notice() the first time it is non-empty, then empty: for the one chat line.
 std::string TakeChatNotice();
+// Whether this DLL is its release's dwmapi.dll (the check compares its SHA-256 with GitHub's digest of the asset of the
+// release tagged with this version). Unknown until the check answers, and for good when it is off, fails, or the
+// version has no release on the first page (session/hsm_mod_rules.h OfficialOf). Any thread.
+Official OfficialStatus();
 }  // namespace hsm::update

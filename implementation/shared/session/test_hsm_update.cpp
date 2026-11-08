@@ -222,6 +222,24 @@ static void TestSwap() {
         CHECK(SwapOutcomeText(o)[0] != '\0');
 }
 
+static void TestRunningRelease() {
+    Sha256Digest want{}, out{};
+    CHECK(Sha256FromHex(kHex, want));
+    const Version running = *ParseVersion("0.8.0-pre25");
+    ReleaseList l = ParseReleases("[" + Good("v0.8.0-pre26") + "," + Good("v0.8.0-pre25") + "]");
+    CHECK(l.releases.size() == 2 && RunningReleaseDigest(l.releases, running, out) && out == want);
+    CHECK(!RunningReleaseDigest(l.releases, *ParseVersion("0.8.0-pre24"), out));         // not on the page
+    l = ParseReleases("[" + Good("v0.8.0-pre25", "null") + "]");
+    CHECK(!RunningReleaseDigest(l.releases, running, out));                                // no digest
+    l = ParseReleases("[" + Good("v0.8.0-pre25", "\"sha1:abc\"") + "]");
+    CHECK(!RunningReleaseDigest(l.releases, running, out));                                // not sha256
+    l = ParseReleases("[" + ReleaseJson("v0.8.0-pre25", AssetJson("other.zip", Base("v0.8.0-pre25") + "other.zip", "5", "\"sha256:" + kHex + "\"")) + "]");
+    CHECK(!RunningReleaseDigest(l.releases, running, out));                                // no dwmapi.dll
+    l = ParseReleases("[" + Good("v0.8.0-pre25") + "]");
+    l.releases[0].draft = true;
+    CHECK(!RunningReleaseDigest(l.releases, running, out));
+}
+
 int main() {
     TestScan();
     TestSelect();
@@ -230,6 +248,7 @@ int main() {
     TestDigests();
     TestDownload();
     TestSwap();
+    TestRunningRelease();
     if (g_fail) { std::printf("test_hsm_update: %d failure(s)\n", g_fail); return 1; }
     std::printf("test_hsm_update: ok\n");
     return 0;

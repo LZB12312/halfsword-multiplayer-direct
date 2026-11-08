@@ -44,6 +44,24 @@ inline int CmdArgInt(const std::string& cl, const std::string& name, int fallbac
     return end && *end == 0 && n >= lo && n <= hi ? int(n) : fallback;
 }
 
+// The arguments for a new copy of the game when the mod restarts it: "play alone, mod off", or after turning unsupported mods off.
+// This game's own arguments go along (its exe is started by path, so not that), except an earlier -hsmrole, -hsmwaitfor or a Steam
+// join. The new game waits for this one (pid) to close. -hsmrole=off only lives on that launch, so the next ordinary start has the
+// mod again and nothing has to be put back.
+inline std::string RelaunchArgs(const std::string& cl, unsigned long pid, bool modOff) {
+    const std::vector<std::string> tokens = SplitCommandLine(cl);
+    std::string out;
+    for (size_t i = 1; i < tokens.size(); ++i) {
+        const std::string& t = tokens[i];
+        if (t.rfind("-hsmrole=", 0) == 0 || t.rfind("-hsmwaitfor=", 0) == 0) continue;
+        if (t == "+connect_lobby") { ++i; continue; }   // and the lobby id after it
+        if (!out.empty()) out += ' ';
+        out += t.find_first_of(" \t") == std::string::npos ? t : '"' + t + '"';
+    }
+    if (!out.empty()) out += ' ';
+    return out + (modOff ? "-hsmrole=off " : "") + "-hsmwaitfor=" + std::to_string(pid);
+}
+
 struct AgentCommand { std::string verb; std::vector<std::string> args; };
 constexpr size_t kMaxCommandLine = 1024;
 

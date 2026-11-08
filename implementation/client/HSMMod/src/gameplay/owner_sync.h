@@ -68,7 +68,7 @@ public:
     void Attach(uint8_t entity, ue::UObject* willie, bool replica = false);
     void Detach(uint8_t entity);                        // unbinds; the session destroys the actor
     // Hand-off: the stand-in becomes a live fighter again (FighterRig::Revive) and is unbound; the actor stays. False
-    // when entity had no bound stand-in (nothing was neutralised: nothing to undo).
+    // keeps the stand-in attached for retry while a saved grip reference cannot be restored. No bound rig is success.
     bool Release(uint8_t entity);
     // Hand-off: entity's stream comes from another machine now (its clock and its jitter differ): the feed starts again
     // from that source's next pose. The actor stays as it is until then.
@@ -118,7 +118,7 @@ public:
     // Host physics, client (0.9.0): stand-ins attached from now on are exact replicas of the host's fighters
     // (sync::ReplicaServoParams: full gain, no caps, no contact yield). Off: the owner-sync servo.
     void SetReplica(bool on) { replica_ = on; }
-    void SetAudit(bool on) { audit_ = on; }   // T2: log stand-in fields changed here between two Vitals (help-improve)
+    void SetAudit(bool on);   // opt-in field audit and two-handed motion measurements (help-improve)
     bool Replica() const { return replica_; }
     std::string HealthLine();                            // since the previous call; empty with no stand-in
     int Count() const;
@@ -140,12 +140,13 @@ private:
         bool slowSet = false;
     };
     struct Actor {
+        ~Actor() { rig.Unbind(); }
         ue::UObject* willie = nullptr;
         int32_t index = -1;
         FighterRig rig;
         sync::StandInDriver driver;
         double bindDeadlineMs = 0, nextBindMs = 0;
-        bool bindLogged = false, haveTarget = false;
+        bool bindLogged = false, haveTarget = false, releaseBlockedLogged = false;
         bool deadShown = false;   // DED set on the stand-in from the owner's vitals
         bool downShown = false;   // the owner is dead, fallen, knocked out or at 0 health: the capsule follows the body, the beacon is off
         sync::V3 lastTargetPelvis{};
@@ -156,11 +157,18 @@ private:
         bool haveApplied = false;
         std::array<uint32_t, 9> drift{};
         double nextDriftLogMs = 0;
+        const char* twoHandReason = nullptr;
+        double nextTwoHandLogMs = 0;
     };
     struct Window {
         sync::ErrorStats pelvis, hands;
         uint64_t frames = 0, targeted = 0, extrapolated = 0, stale = 0, cuts = 0, snaps = 0, placed = 0, struck = 0, grabNoSnap = 0;
         double delaySum = 0, j95Max = 0;
+        // Complete same-frame samples only; mean/max suffice, so this adds no per-metric histogram or allocation.
+        struct TwoHand {
+            std::array<double, 5> sum{}, max{};   // R hand, L hand, weapon root, weapon tip, weapon angle
+            uint64_t samples = 0, active = 0, suspended = 0, updates = 0, failures = 0;
+        } twoHand;
     };
     struct Slot {
         std::unique_ptr<Feed> feed;

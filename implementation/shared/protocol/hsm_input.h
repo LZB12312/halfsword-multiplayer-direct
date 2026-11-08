@@ -6,6 +6,12 @@
 
 namespace hsm {
 
+// Keep the input stream warm before a possible hand-off, and until an active hand-off has returned even if the
+// option was disabled meanwhile. Owner mode without hand-off has no remote consumer; capture still drains locally.
+inline bool InputStreamNeeded(bool hostPhysics, bool handOffEnabled, bool handed) {
+    return hostPhysics || handOffEnabled || handed;
+}
+
 // Mouse axes are per-frame deltas and must be summed between sends; the rest are levels.
 inline bool IsDeltaAxis(Axis a) { return a == Axis::TurnMouse || a == Axis::LookMouse; }
 constexpr float kMaxDeltaPerTick = 4 * kAxisLimit;   // a few client frames per host frame; bounds a flood

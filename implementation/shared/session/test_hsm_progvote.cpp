@@ -223,8 +223,18 @@ static void TestOwnKit() {
     CHECK(Sanitize(ProgressionConfig(riot)).gear == Gear::Own);
 }
 
+// The match on a fight level: a host alone in a Progression lobby gets one (it stalled after the fight with none).
+static void TestMatchWanted() {
+    CHECK(HostMatchWanted(1, false, true));                  // the reported stall: alone, Free Fight in the lobby's rows, Progression
+    CHECK(!HostMatchWanted(1, false, false));                // alone in a PvP format: nobody to fight
+    CHECK(!HostMatchWanted(0, false, false));
+    CHECK(HostMatchWanted(1, true, false));                  // alone against bots (Survival, Zombies)
+    CHECK(HostMatchWanted(2, false, false) && HostMatchWanted(2, false, true) && HostMatchWanted(8, true, true));
+}
+
 int main() {
     TestBegin(); TestCast(); TestMajority(); TestTies(); TestLeaveJoin(); TestWire(); TestCommand(); TestText(); TestOwnKit();
+    TestMatchWanted();
     if (g_fail == 0) std::printf("hsm_progvote: all checks passed\n");
     return g_fail ? 1 : 0;
 }

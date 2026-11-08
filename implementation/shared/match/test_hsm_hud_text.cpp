@@ -29,7 +29,9 @@ static void TestStatus() {
     m.phase = uint8_t(MatchPhase::Idle); CHECK(StatusLine(m, 1).empty());
     MatchInfo p; p.format = uint8_t(Format::PlayersVsBots); p.phase = uint8_t(MatchPhase::Results); p.winner = kHumanTeam; p.timeLeftMs = 2100;
     CHECK(Has(StatusLine(p, 1), "rematch in 3") && !Has(StatusLine(p, 1), "Tavern"));
-    s = StatusLine(p, 1, true); CHECK(Has(s, "PLAYERS WIN") && Has(s, "back to the Tavern in 3") && !Has(s, "rematch"));
+    s = StatusLine(p, 1, true); CHECK(Has(s, "FIGHT WON") && Has(s, "hold G to go on (or in 3)") && !Has(s, "rematch"));   // won: waits for G
+    p.winner = kBotTeam;
+    s = StatusLine(p, 1, true); CHECK(Has(s, "BOTS WIN") && Has(s, "back to the Tavern in 3") && !Has(s, "rematch"));      // lost: back by itself
     MatchInfo f; f.format = uint8_t(Format::FreeForAll); f.scoreLimit = 5; f.phase = uint8_t(MatchPhase::Live);
     f.scores = {{1, 2}, {2, 4}}; f.fighters = {{1, -1, 2, 0, "Host"}, {2, -1, 4, 1, "Ann"}};
     s = StatusLine(f, 1); CHECK(Has(s, "You 2") && Has(s, "Ann 4") && Has(s, "first to 5"));

@@ -142,6 +142,21 @@ inline bool ExpectedDllDigest(const Sha256Digest& fromFile, const UpdateAssets& 
     return true;
 }
 
+// Official builds (session/hsm_mod_rules.h OfficialOf): GitHub's digest of the dwmapi.dll of the release whose tag is
+// exactly the running version (not a draft). False when the list does not hold that release (older than the page, or
+// a build with no release) or its asset carries no well formed digest.
+inline bool RunningReleaseDigest(const std::vector<ReleaseInfo>& releases, const Version& running, Sha256Digest& out) {
+    for (const ReleaseInfo& r : releases) {
+        if (r.draft) continue;
+        const std::optional<Version> v = ParseVersion(r.tag);
+        if (!v || CompareVersion(*v, running) != 0) continue;
+        for (const ReleaseAsset& a : r.assets)
+            if (a.name == kUpdateDllAsset) return ParseApiDigest(a.digest, out);
+        return false;
+    }
+    return false;
+}
+
 // ------------------------------------------------------------------ the bytes
 
 enum class DownloadVerdict : uint8_t { Ok, Empty, TooBig, SizeMismatch, HashMismatch };

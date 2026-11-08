@@ -92,8 +92,12 @@ bool ApplyBodyPose(UObject* comp, float px, float py, float pz, const Quat16& ro
 constexpr double kHeardLiveMs = 3000.0;       // an id heard this recently is live somewhere (the host re-sends FREE ones every second)
 constexpr double kCensusFirstMs = 3000.0;     // a fight level's first census walk (and a client's first match) waits this
                                               // long: past the level manager's purge (0.1 s) and its first respawns (2.5 s)
+constexpr double kCensusSnapMs = 1500.0;     // a client records where each free prop lies this long into a fight level, before its match
 constexpr size_t kStartsPerTick = 8;          // level props whose start transform is read per tick at most (map reset)
 constexpr size_t kLevelReadsPerTick = 16;     // level props read (and so streamed) per tick at most, the moving ones first
+// While several move: an object goes whole and a barrel is 19 bodies, so at 16 Alley fell behind (5% deferred on 0.8.0-pre30,
+// 0.1% on pre27, which sent late-found barrels another way). Idle props stay within kLevelReadsPerTick.
+constexpr size_t kMovingReadsPerTick = 48;
 constexpr uint8_t kMovable = 2;               // EComponentMobility::Movable: only a movable root can simulate
 constexpr double kIdleCheckMs = 1000.0;       // DespawnIdle: how often the FREE weapons are checked
 
@@ -118,7 +122,7 @@ void ObjectSync::Start(Adapter& adapter, StandIns& standIns, Env env) {
     standIns_ = &standIns;
     env_ = std::move(env);
     active_ = true;
-    reconciler_ = ObjectReconciler(kHostSlot);
+    reconciler_ = ObjectReconciler(kHostSlot); spawnGate_.Reset();
     minter_ = SpawnedIdMinter(MySlot());
     HSM_LOG("props: on (%s): dropped weapons are leased FREE/TOUCH/HOLD; level props by the host's census and spawned objects by "
             "announce, FREE/TOUCH, every simulating body streamed",
@@ -154,6 +158,8 @@ void ObjectSync::Clear() {
     levelSinceMs_ = -1;
     censusMs_ = 0;
     censusIndex_.clear();
+    censusSnap_.clear();
+    censusSnapDone_ = false;
     movingCursor_ = idleCursor_ = 0;
     book_.Clear();
     sent_.clear();
@@ -170,7 +176,7 @@ void ObjectSync::Clear() {
     actorKind_.clear();
     // Spawned objects: a new level, a new set. The reconciler and the minter start over (a host that took over reloaded the
     // level and announces what it finds again); the provisional ids of this machine go on from where they were.
-    reconciler_ = ObjectReconciler(kHostSlot);
+    reconciler_ = ObjectReconciler(kHostSlot); spawnGate_.Reset();
     for (const ObjectAnnounceMsg& a : adopt_) reconciler_.Adopt(a);   // a migrated host keeps the ids it adopted across the reload
     skippedLogged_.clear();
     simCache_.Clear();
@@ -206,6 +212,14 @@ void ObjectSync::Tick(double nowMs, const std::vector<std::pair<uint8_t, UObject
     if (!loose_.empty()) TickLoose(nowMs);
     if (env_.fightLevel && env_.fightLevel()) {
         if (levelSinceMs_ < 0) { levelSinceMs_ = nowMs; censusMs_ = nowMs + kCensusFirstMs; recheckMs_ = censusMs_; }
+        // A client records where each free prop lies, once, kCensusSnapMs into the level: the census matches on those places.
+        if (!env_.host && env_.censusSnapshot && !censusSnapDone_ && nowMs >= levelSinceMs_ + kCensusSnapMs) {
+            censusSnapDone_ = true;
+            size_t notSimulating = 0;
+            for (const LevelActor& a : WalkLevel(notSimulating))
+                if (!byActor_.count(a.actor))
+                    censusSnap_[LevelKey{a.actor, a.index}] = CensusCandidate{a.classHash, float(a.at.x), float(a.at.y), float(a.at.z)};
+        }
         if (env_.host) {
             if (nowMs >= censusMs_) HostCensus(nowMs);
         } else if (census_.HaveCensus() && nowMs >= levelSinceMs_ + kCensusFirstMs &&
@@ -272,7 +286,8 @@ void ObjectSync::Tick(double nowMs, const std::vector<std::pair<uint8_t, UObject
         LeaseLevel want = LeaseLevel::Free;
         // TOUCH leasing as in 0.8.0-pre7: whoever's fighter bumps, kicks or pushes a prop simulates it until it rests. Rev 32
         // gave every loose prop to the host instead, so a client's own bumps and kicks lagged a round trip (KNOWN_ISSUES.md).
-        const ClaimSend cs = StepClaim(p.claim, holding, p.lastContactMs, moving, nowMs, want);
+        // A structure (soft or local) is leased by nobody (hsm_structure.h).
+        const ClaimSend cs = OwnCopy(id, p) ? ClaimSend::None : StepClaim(p.claim, holding, p.lastContactMs, moving, nowMs, want);
         if (cs != ClaimSend::None) Claim(id, cs, want, nowMs);
 
         const uint8_t streamer = view_.Streamer(id);
@@ -284,6 +299,7 @@ void ObjectSync::Tick(double nowMs, const std::vector<std::pair<uint8_t, UObject
         if (streamer == me) {
             p.dirty = false;
             for (BodyRef& b : p.bodies) b.dirty = false;
+            SetFollowing(p, false, nowMs);
             // A lease of mine I have just released streams no more (the host would drop it until its FREE Grant lands).
             const bool streaming = !p.attachedSent && (level == LeaseLevel::Free || p.claim.sent != LeaseLevel::Free);
             if (streaming && Kept(id, p)) {   // never streamed (hsm_structure.h): every machine simulates its own copy
@@ -296,15 +312,19 @@ void ObjectSync::Tick(double nowMs, const std::vector<std::pair<uint8_t, UObject
         } else if (p.dirty) {
             p.dirty = false;
             const bool awaitingGrant = p.claim.sent != LeaseLevel::Free && level == LeaseLevel::Free;
-            if (!parent && !awaitingGrant && !p.attachedSent) {
+            if (p.shapeDiffers) {   // body N here is not body N on the host (MarkFound): left to the physics here
+                for (BodyRef& b : p.bodies) b.dirty = false;
+            } else if (!parent && !awaitingGrant && !p.attachedSent) {
                 if (!p.bodies.empty()) p.bodies[0].dirty = true;   // p.dirty is an explicit redrive of the root (and the state heard)
                 if ((Soft(id, p) ? SoftDrive(id, p, nowMs) : Drive(id, p)) && (p.level || p.spawned)) ++n_.levelDriven;
             }
         }
         ++it;
     }
-    size_t budget = kLevelReadsPerTick;
+    size_t budget = kMovingReadsPerTick;
     StreamLevel(dueMoving, movingCursor_, budget, true, me, nowMs);
+    const size_t movingReads = kMovingReadsPerTick - budget;
+    budget = movingReads < kLevelReadsPerTick ? kLevelReadsPerTick - movingReads : 0;
     StreamLevel(dueIdle, idleCursor_, budget, false, me, nowMs);
     if (nowMs >= eventMs_) { eventMs_ = nowMs + kEventPollMs; PollEvents(nowMs); ShatterPoll(nowMs); }
     if (idleDespawn_ && nowMs >= idleCheckMs_) { idleCheckMs_ = nowMs + kIdleCheckMs; DespawnIdle(nowMs); }
@@ -352,11 +372,11 @@ size_t ObjectSync::StreamState(uint64_t propId, Prop& p, LeaseLevel level, uint8
         for (const BodyStateMsg& s : out)
             if (s.body == 0) reconciler_.UpdateMotion(propId, s.px, s.py, s.pz, s.vx, s.vy, s.vz, nowMs);
     // A soft structure goes out as one snapshot: every body read this tick, in one go, at 20 Hz while any of them moves.
-    const bool due = Soft(propId, p) ? StructureStreamDue(p.lastSentMs, atRest, nowMs) : PropStreamDue(level, p.lastSentMs, atRest, nowMs);
-    if (out.empty() || !due) return reads;
+    const double period = Soft(propId, p) ? StructureStreamPeriodMs(atRest) : PropStreamPeriodMs(level, atRest);
+    if (out.empty() || nowMs - p.lastSentMs < period) return reads;
     for (const BodyStateMsg& s : out)
         if (env_.send) { env_.send(Encode(s), false); ++n_.statesSent; }
-    p.lastSentMs = nowMs;
+    p.lastSentMs = NextSentMs(p.lastSentMs, period, nowMs);   // the remainder carries: the rate holds at any frame rate
     if (p.level || p.spawned) ++n_.levelStreamed;
     return reads;
 }
@@ -917,7 +937,8 @@ void ObjectSync::HostCensus(double nowMs) {
 // still has it as it was matched and its actor lives; the others are matched (MatchCensus) against the props here that
 // are not synced yet. In the first match of a level, a prop here tagged 'Random Delete' that matched nothing is one the
 // host's level manager purged (its RandomBool differs per machine): destroyed, so both sides keep the host's set. What is
-// left over is looked at for announces and proposals (AfterWalk).
+// left over is looked at for announces and proposals (AfterWalk). Each free prop is matched on the place it lay early in the
+// level (censusSnap_, when it has one), so a roll or a carry before the match does not take it off its home.
 void ObjectSync::ClientCensus(double nowMs) {
     const std::vector<CensusEntry>& census = census_.Census();
     const bool fresh = !matched_ || census_.Seq() != matchedSeq_;
@@ -950,20 +971,43 @@ void ObjectSync::ClientCensus(double nowMs) {
         if (!bound_.count(e.index)) open.push_back(e);
     std::vector<CensusCandidate> locals;
     locals.reserve(free.size());
-    for (const LevelActor& a : free) locals.push_back(CensusCandidate{a.classHash, float(a.at.x), float(a.at.y), float(a.at.z)});
+    size_t snapped = 0;   // free props that have an early place
+    for (const LevelActor& a : free) {
+        const CensusCandidate now{a.classHash, float(a.at.x), float(a.at.y), float(a.at.z)};
+        const auto snap = censusSnap_.find(LevelKey{a.actor, a.index});
+        if (snap != censusSnap_.end()) ++snapped;
+        locals.push_back(CensusMatchPlace(now, snap != censusSnap_.end() ? &snap->second : nullptr));
+    }
     const std::vector<int> match = MatchCensus(open, locals);
     std::vector<bool> used(free.size(), false);
     size_t bound = 0;
-    for (size_t i = 0; i < open.size(); ++i) {
-        if (match[i] < 0) continue;
-        used[size_t(match[i])] = true;
-        const uint64_t id = MakeLevelPropId(open[i].index);
-        Prop* p = Track(id, free[size_t(match[i])].actor);
-        if (!p) continue;
+    auto bindOne = [&](const CensusEntry& e, size_t j) {
+        used[j] = true;
+        const uint64_t id = MakeLevelPropId(e.index);
+        Prop* p = Track(id, free[j].actor);
+        if (!p) return;
         p->level = true;
         p->dirty = view_.Find(id) != nullptr;
-        bound_[open[i].index] = open[i];
+        bound_[e.index] = e;
         ++bound;
+    };
+    std::vector<CensusEntry> unplaced;   // homes no early place fits
+    for (size_t i = 0; i < open.size(); ++i) {
+        if (match[i] < 0) unplaced.push_back(open[i]);
+        else bindOne(open[i], size_t(match[i]));
+    }
+    // A prop still rolling at the early place lay far from where it came to rest, so its home is tried on the current places too.
+    if (snapped > 0 && !unplaced.empty()) {
+        std::vector<CensusCandidate> nowPlaces;
+        std::vector<size_t> nowIndex;
+        for (size_t j = 0; j < free.size(); ++j) {
+            if (used[j]) continue;
+            nowPlaces.push_back(CensusCandidate{free[j].classHash, float(free[j].at.x), float(free[j].at.y), float(free[j].at.z)});
+            nowIndex.push_back(j);
+        }
+        const std::vector<int> again = MatchCensus(unplaced, nowPlaces);
+        for (size_t i = 0; i < unplaced.size(); ++i)
+            if (again[i] >= 0) bindOne(unplaced[i], nowIndex[size_t(again[i])]);
     }
     misses_ = census.size() - bound_.size();
     const bool purge = !purged_;
@@ -977,8 +1021,9 @@ void ObjectSync::ClientCensus(double nowMs) {
     }
     n_.censusPurged += purged;
     if ((fresh && n_.censuses <= kLogFirst) || (!fresh && bound > 0))
-        HSM_LOG("props: level census seq %u resolved %zu of %zu (%zu now), purged %zu, miss %zu (%zu here unmatched, %zu movable not simulating)",
-                census_.Seq(), bound_.size(), census.size(), bound, purged, misses_, unmatched, notSimulating);
+        HSM_LOG("props: level census seq %u resolved %zu of %zu (%zu now), purged %zu, miss %zu (%zu here unmatched, %zu movable not simulating, "
+                "%zu of %zu free with an early place)",
+                census_.Seq(), bound_.size(), census.size(), bound, purged, misses_, unmatched, notSimulating, snapped, free.size());
     AfterWalk(left, nowMs);
 }
 
@@ -1066,6 +1111,14 @@ void ObjectSync::NoteContact(UObject* a, UObject* b) {
             if (auto q = props_.find(pusher->second); q != props_.end()) entity = q->second.toucher;
             if (!entity) entity = uint8_t(MySlot() + 1);   // this machine's fighter: the roster slot's entity
         }
+        // A touch here quiets a soft structure's rest lock for a while (sync/hsm_rest_lock.h): a fighter here (a stand-in too: it
+        // pushes the copy here), a weapon, or another tracked prop. Stamped before the claim, since a stand-in claims nothing.
+        if (fighter || kind == OtherKind::Prop) {
+            if (auto t = props_.find(it->second); t != props_.end()) {
+                t->second.lastTouchMs = SteadyNowMs();
+                if (fighter) t->second.lastHitMs = t->second.lastTouchMs;   // a break right after it is a hit (ClassifyLocalBreak)
+            }
+        }
         entity = ContactClaimant(entity, kind, streamedHere);
         if (!entity) continue;
         auto p = props_.find(it->second);
@@ -1151,11 +1204,12 @@ bool ObjectSync::Drive(uint64_t id, Prop& p) {
     return any;
 }
 
-// A soft structure (hsm_structure.h) on a machine that does not stream it: no body is ever teleported by a state (the joints do
+// A soft structure (hsm_structure.h) on a machine that does not stream it: no body is teleported by a state (the joints do
 // not follow a teleport and break). Each body with a fresh state is steered toward the host's pose, extrapolated by its velocity
 // to now, with velocity (sync/hsm_soft_correct.h Steer): v = v_host + a push toward the pose, nothing under the dead band.
-// The one exception is a structure that is badly off as a whole (any body past kSnapCm, or one far for kStuckMs on end), which is
-// put right by placing ALL its bodies from one snapshot in this frame, each with the host's velocity, at most every kSnapGapMs.
+// The exceptions: a copy that broke here alone (PlaceBroken), and a structure that is badly off as a whole (any body past kSnapCm,
+// or one far for kStuckMs on end), which is put right from one snapshot in this frame, each body with the host's velocity, at most
+// every kSnapGapMs. Only the root and the bodies that hang on nothing are placed; the others go with them.
 // Applied when a state arrives (20 Hz while it swings), not every frame, so the local physics (a fighter walking on its own
 // copy) is left alone in between.
 bool ObjectSync::SoftDrive(uint64_t id, Prop& p, double nowMs) {
@@ -1164,17 +1218,43 @@ bool ObjectSync::SoftDrive(uint64_t id, Prop& p, double nowMs) {
         BodyStateMsg now;           // the body as it is here
         sync::V3 pos;
         sync::Q4 rot;
+        BodyStateMsg host;          // the host state as heard, which DriveBody reads
         sync::SoftTarget target;    // the host's state for it, extrapolated to now
     };
+    // A break waits to be passed on (session/hsm_structure.h NextBreakStep): it goes when the time after a snap is over, so nothing
+    // here may place a body and start that time again.
+    if (BreaksHeld(p.heldJoints, p.heldBodies)) {
+        for (BodyRef& r : p.bodies) r.dirty = false;
+        SetFollowing(p, false, nowMs);
+        return false;
+    }
+    // A joint broke in this copy only and was not passed on (session/hsm_structure.h ClassifyLocalBreak): the copy is not the
+    // host's shape any more, and steering or snapping its pieces toward the whole one would throw them about.
+    if (CopyDiverged(p.localBroken, p.bodyOffHere)) {
+        ++n_.structDiverged;
+        SetFollowing(p, false, nowMs);
+        if (FollowsWhenBroken(env_.syncStructures, env_.structureFollowBroken, p.found, p.shapeDiffers)) return PlaceBroken(id, p, nowMs);
+        for (BodyRef& r : p.bodies) r.dirty = false;
+        return false;
+    }
     std::vector<Item> items;
     double worst = 0, oldest = 0, newest = 1e18;
+    bool hostRest = true;               // every body the host streams is at rest (PropAtRest, as StreamState)
     for (size_t b = 0; b < p.bodies.size(); ++b) {
         BodyRef& r = p.bodies[b];
         if (r.detached || r.rxMs <= 0 || !adapter_->StillValid(r.comp, r.index) || IsGeometryCollection(r.comp)) continue;
         const BodyStateMsg* s = view_.Find(id, uint8_t(b));
         if (!s) continue;
+        if (!PropAtRest(*s)) hostRest = false;
+        // A body that does not simulate here (a plank before its start-up delay turned its physics on) is neither steered nor
+        // placed: a teleport of a body held by an anchor joint breaks the joint, and it does not count toward the snap.
+        RootCalls* c = CallsFor(r.comp);
+        if (!c) continue;
+        c->simulating.put(0, FName{});
+        if (!c->simulating.invoke(r.comp) || !c->simulating.take<bool>(1)) { r.dirty = false; ++n_.structNotSimulating; continue; }
         Item it;
         it.b = b;
+        it.host = *s;
         if (!Read(p, b, it.now)) continue;
         float qx, qy, qz, qw;
         UnpackQuat(it.now.rot, qx, qy, qz, qw);
@@ -1192,9 +1272,99 @@ bool ObjectSync::SoftDrive(uint64_t id, Prop& p, double nowMs) {
         newest = std::min(newest, age);
         items.push_back(it);
     }
-    if (items.empty()) { for (BodyRef& r : p.bodies) r.dirty = false; return false; }
+    if (items.empty()) { for (BodyRef& r : p.bodies) r.dirty = false; SetFollowing(p, false, nowMs); return false; }
+    // Moving follow (sync/hsm_moving_follow.h): while the streamer copy of a late-found structure moves, every body here goes to
+    // the host pose from this one snapshot, as a rock does, and the physics carries it between states. Items are in body order,
+    // so the root goes first: moving the actor carries what hangs on it, and each body after it is placed at its own target.
+    // A snapshot that is not followable leaves the steering below to run.
+    double fastCm = 0, fastDeg = 0;
+    bool fresh = false;
+    for (const Item& it : items) {
+        fastCm = std::max(fastCm, sync::VLen(it.target.vel));
+        fastDeg = std::max(fastDeg, sync::VLen(it.target.angVel));
+        fresh = fresh || p.bodies[it.b].dirty;
+    }
+    const bool moving = p.follow.Update(nowMs, fastCm, fastDeg);
+    const bool follows = fresh && sync::CopyFollows(env_.structureFollowMoving, p.found, !p.shapeDiffers, nowMs - p.bornMs, moving,
+                                                    sync::SnapshotFollowable(oldest, newest), env_.structureBridgesFollow);
+    SetFollowing(p, follows, nowMs);
+    if (follows) {
+        bool any = false;
+        for (const Item& it : items) {
+            BodyStateMsg s = it.host;
+            s.px = float(it.target.pos.x);
+            s.py = float(it.target.pos.y);
+            s.pz = float(it.target.pos.z);
+            s.rot = PackQuat(float(it.target.rot.x), float(it.target.rot.y), float(it.target.rot.z), float(it.target.rot.w));
+            p.bodies[it.b].steerMs = nowMs;
+            if (!DriveBody(p, it.b, s)) continue;
+            ++n_.structFollowed;
+            any = true;
+        }
+        for (BodyRef& r : p.bodies) r.dirty = false;
+        p.stuck = sync::StuckTimer{};   // a copy that follows is not stuck: its clock starts again when it stops
+        p.rest = sync::RestLock{};      // and it is not at rest: the rest clock starts again when it stops
+        // A bridge's joint that tears here stays here (NextBreakStep: after a snap, census): the host's own break reaches everyone.
+        // A late-found copy takes no stamp, so a hit while it follows is shared.
+        if (!p.found) p.lastSnapMs = nowMs;
+        return any;
+    }
+    // A soft structure at rest (sync/hsm_rest_lock.h): a copy far from the host's rest pose is placed once to it, then held still:
+    // no steer, no snap, no velocity, until something touches it here or the host's root moves. Hold writes nothing at all.
+    if (env_.structureRestLock) {
+        const Item* rootItem = &items.front();
+        for (const Item& it : items) if (it.b == 0) rootItem = &it;
+        const bool wasLocked = p.rest.locked;
+        double bodyMoved = 0;   // a hinged piece can swing on the host while the root stays
+        if (wasLocked)
+            for (const Item& it : items) {
+                const sync::V3& at = p.bodies[it.b].restAt;
+                bodyMoved = std::max(bodyMoved, sync::VLen({it.target.pos.x - at.x, it.target.pos.y - at.y, it.target.pos.z - at.z}));
+            }
+        const sync::RestStep step = sync::DecideRestStep(p.rest, nowMs, hostRest, rootItem->target.pos, worst, nowMs - p.lastTouchMs,
+                                                         (p.found || env_.structureBridgesFollow) && sync::SnapAllowed(nowMs - p.bornMs),
+                                                         sync::SnapReady(oldest, newest), nowMs - p.lastSnapMs, bodyMoved);
+        if (p.rest.locked && !wasLocked) for (const Item& it : items) p.bodies[it.b].restAt = it.target.pos;
+        if (step == sync::RestStep::Hold) {
+            if (!wasLocked) { ++n_.restLocked; LogRestLock(p, worst, false); }
+            ++n_.restHeld;
+            for (BodyRef& r : p.bodies) r.dirty = false;
+            p.stuck = sync::StuckTimer{};
+            return false;
+        }
+        if (step == sync::RestStep::Place) {
+            bool placed = false, failed = false;
+            for (const Item& it : items) {
+                if (!BodyPlacedAtRest(it.b, p.attachedMask, p.found)) continue;
+                BodyRef& r = p.bodies[it.b];
+                const Quat16 packed = PackQuat(float(it.target.rot.x), float(it.target.rot.y), float(it.target.rot.z), float(it.target.rot.w));
+                if (!ApplyBodyPose(r.comp, float(it.target.pos.x), float(it.target.pos.y), float(it.target.pos.z), packed)) { failed = true; continue; }
+                placed = true;
+                r.steerMs = nowMs;
+                RootCalls* c = CallsFor(r.comp);
+                if (!c) continue;
+                c->setLin.put(0, FVector{0, 0, 0}).put(1, false).put(2, FName{}).invoke(r.comp);
+                c->setAng.put(0, FVector{0, 0, 0}).put(1, false).put(2, FName{}).invoke(r.comp);
+            }
+            if (placed && !failed) {
+                for (const Item& it : items)   // at rest: asleep until a touch or a move wakes it
+                    if (RootCalls* c = CallsFor(p.bodies[it.b].comp); c && c->sleep.valid()) c->sleep.put(0, FName{}).invoke(p.bodies[it.b].comp);
+                for (BodyRef& r : p.bodies) r.dirty = false;
+                p.lastSnapMs = nowMs;
+                p.restPlacedMs = nowMs;
+                p.stuck = sync::StuckTimer{};
+                ++n_.restLocked;
+                ++n_.restPlaced;
+                LogRestLock(p, worst, true);
+                return true;
+            }
+            p.rest.locked = false;   // not all of it could be placed here: steered as before, and tried again
+        }
+    }
     const double stuckMs = p.stuck.Update(nowMs, worst);
-    const bool snap = sync::ShouldSnap(sync::SnapReady(oldest, newest), worst, stuckMs, nowMs - p.lastSnapMs);
+    static_assert(kBreakSettleMs == sync::kSnapSettleMs, "a break kept for settling and a snap held back for it are the same wait");
+    const bool snap = sync::SnapAllowed(nowMs - p.bornMs) &&
+                      sync::ShouldSnap(sync::SnapReady(oldest, newest), worst, stuckMs, nowMs - p.lastSnapMs);
     bool any = false;
     for (const Item& it : items) {
         BodyRef& r = p.bodies[it.b];
@@ -1203,23 +1373,28 @@ bool ObjectSync::SoftDrive(uint64_t id, Prop& p, double nowMs) {
         sync::V3 lin = it.target.vel, ang = it.target.angVel;
         if (snap) {   // one snapshot, all bodies, this frame; the host's velocity, no relative velocity left to correct
             const Quat16 packed = PackQuat(float(it.target.rot.x), float(it.target.rot.y), float(it.target.rot.z), float(it.target.rot.w));
-            if (!ApplyBodyPose(r.comp, float(it.target.pos.x), float(it.target.pos.y), float(it.target.pos.z), packed)) continue;
+            if (BodyPlacedOnItsOwn(it.b, p.attachedMask) &&
+                !ApplyBodyPose(r.comp, float(it.target.pos.x), float(it.target.pos.y), float(it.target.pos.z), packed)) continue;
         } else {
             const double dt = r.steerMs < -1e17 ? 0.05 : (nowMs - r.steerMs) / 1000.0;
             const sync::SoftSteer st = sync::Steer(it.pos, it.rot, it.target, dt);
             lin = st.vel;
             ang = st.angVel;
             if (st.corrected) ++n_.structCorrected;
+            // In place and at rest on both machines: leave its velocity alone so the physics can keep it asleep.
+            if (sync::KeepLocalVelocity(st, it.target.vel, it.target.angVel, {it.now.vx, it.now.vy, it.now.vz},
+                                        {it.now.wx, it.now.wy, it.now.wz})) {
+                r.steerMs = nowMs;
+                ++n_.structRestKept;
+                continue;
+            }
         }
         r.steerMs = nowMs;
         any = true;
         RootCalls* c = CallsFor(r.comp);
         if (!c) continue;
-        c->simulating.put(0, FName{});
-        if (c->simulating.invoke(r.comp) && c->simulating.take<bool>(1)) {
-            c->setAng.put(0, FVector{ang.x, ang.y, ang.z}).put(1, false).put(2, FName{}).invoke(r.comp);
-            c->setLin.put(0, FVector{lin.x, lin.y, lin.z}).put(1, false).put(2, FName{}).invoke(r.comp);
-        }
+        c->setAng.put(0, FVector{ang.x, ang.y, ang.z}).put(1, false).put(2, FName{}).invoke(r.comp);
+        c->setLin.put(0, FVector{lin.x, lin.y, lin.z}).put(1, false).put(2, FName{}).invoke(r.comp);
         ++n_.bodyDriven;
     }
     if (snap) {
@@ -1228,6 +1403,61 @@ bool ObjectSync::SoftDrive(uint64_t id, Prop& p, double nowMs) {
         p.stuck = sync::StuckTimer{};
         ++n_.structSnapped;
         LogStructureSnap(p, worst);
+    }
+    return any;
+}
+
+// A copy starts or stops following its streamer copy (SoftDrive). Each change is counted; the log lines are rate limited.
+void ObjectSync::SetFollowing(Prop& p, bool on, double nowMs) {
+    if (p.following == on) return;
+    p.following = on;
+    if (on) {
+        p.followSinceMs = nowMs;
+        ++n_.followStarts;
+    }
+    LogFollow(p, on, nowMs - p.followSinceMs);
+}
+
+// At most a few lines a minute, however many copies follow (the health line counts every start and stop).
+void ObjectSync::LogFollow(const Prop& p, bool started, double durationMs) {
+    constexpr int kFollowLogsPerMinute = 8;
+    const double now = SteadyNowMs();
+    if (now - followLogWindowMs_ >= 60000.0 || now < followLogWindowMs_) { followLogWindowMs_ = now; followLogCount_ = 0; }
+    if (followLogCount_++ >= kFollowLogsPerMinute) return;
+    if (started) HSM_LOG("props: structure %s follows the host copy while it moves", ObjectName(p.actor).c_str());
+    else HSM_LOG("props: structure %s stops following the host copy after %.1f s", ObjectName(p.actor).c_str(), durationMs / 1000.0);
+}
+
+// A late-found prop that broke on this screen alone (session/hsm_structure.h FollowsWhenBroken): the root and the bodies that
+// hang on nothing go to the host's place when ShouldPlaceBody says so, the others go with them. As in a snap, not while the copy
+// settles and never a body that does not simulate here (a teleport of a body held by an anchor joint breaks the joint). Only a
+// real placement stamps lastSnapMs, so a break right after one stays here and a later hit is passed on.
+bool ObjectSync::PlaceBroken(uint64_t id, Prop& p, double nowMs) {
+    const bool settled = sync::SnapAllowed(nowMs - p.bornMs);
+    bool any = false;
+    for (size_t b = 0; b < p.bodies.size(); ++b) {
+        BodyRef& r = p.bodies[b];
+        const bool fresh = r.dirty;
+        r.dirty = false;
+        if (!fresh || !settled || r.detached || !BodyPlacedOnItsOwn(b, p.attachedMask) || !adapter_->StillValid(r.comp, r.index)) continue;
+        const BodyStateMsg* s = view_.Find(id, uint8_t(b));
+        RootCalls* c = s ? CallsFor(r.comp) : nullptr;
+        if (!c) continue;
+        c->simulating.put(0, FName{});
+        if (!c->simulating.invoke(r.comp) || !c->simulating.take<bool>(1)) { ++n_.structNotSimulating; continue; }
+        BodyStateMsg here;
+        if (!Read(p, b, here)) continue;
+        const sync::V3 host{s->px, s->py, s->pz};
+        const double off = sync::VLen({host.x - here.px, host.y - here.py, host.z - here.pz});
+        const double moved = sync::VLen({host.x - r.placedAt.x, host.y - r.placedAt.y, host.z - r.placedAt.z});
+        if (!ShouldPlaceBody(r.placed, moved, off) || !DriveBody(p, b, *s)) continue;
+        r.placed = true;
+        r.placedAt = host;
+        any = true;
+    }
+    if (any) {
+        p.lastSnapMs = nowMs;
+        ++n_.structPlaced;
     }
     return any;
 }
@@ -1263,6 +1493,7 @@ ObjectSync::RootCalls* ObjectSync::CallsFor(UObject* root) {
     c->setAng = PreparedCall(cls, "SetPhysicsAngularVelocityInDegrees", {"NewAngVel", "bAddToCurrent", "BoneName"});
     c->setLin = PreparedCall(cls, "SetPhysicsLinearVelocity", {"NewVel", "bAddToCurrent", "BoneName"});
     c->simulating = PreparedCall(cls, "IsSimulatingPhysics", {"BoneName", "ReturnValue"});
+    c->sleep = PreparedCall(cls, "PutRigidBodyToSleep", {"BoneName"});   // optional: without it a placed body is only left still
     if (!c->toWorld.valid() || !c->linVel.valid() || !c->angVel.valid() || !c->setAng.valid() || !c->setLin.valid() ||
         !c->simulating.valid()) {
         HSM_LOG("props: %s is not a physics body; props rooted in it are not synced", ObjectName(reinterpret_cast<const UObject*>(cls)).c_str());
@@ -1347,15 +1578,37 @@ std::string ObjectSync::HealthLine() {
                   censusIndex_.size(), d(a.levelStreamed, b.levelStreamed), d(a.levelDriven, b.levelDriven),
                   d(a.levelDeferred, b.levelDeferred), misses_, book_.LeftOut(), d(a.censusPurged, b.censusPurged),
                   d(a.censuses, b.censuses), d(a.censusRejected, b.censusRejected), d(a.despawned, b.despawned), d(a.resetUnmoved, b.resetUnmoved));
-    size_t spawned = 0, bodies = 0, structures = 0;
-    for (const auto& kv : props_) { spawned += kv.second.spawned ? 1 : 0; bodies += kv.second.bodies.size(); structures += OwnCopy(kv.first, kv.second) ? 1 : 0; }
-    char structText[160];   // by mode: soft streams and steers, local skips, full is pre17 (nothing is a structure)
+    size_t spawned = 0, bodies = 0, structures = 0, found = 0;
+    for (const auto& kv : props_) {
+        spawned += kv.second.spawned ? 1 : 0;
+        bodies += kv.second.bodies.size();
+        const bool own = OwnCopy(kv.first, kv.second);
+        structures += own ? 1 : 0;
+        found += own && kv.second.found ? 1 : 0;
+    }
+    char structText[640];   // by mode: soft streams and steers, local skips, full is pre17 (nothing is a structure)
     if (env_.syncStructures == StructureMode::Soft)
-        std::snprintf(structText, sizeof structText, "structures %zu soft, corrections %llu, snaps %llu", structures,
-                      d(a.structCorrected, b.structCorrected), d(a.structSnapped, b.structSnapped));
+        std::snprintf(structText, sizeof structText,
+                      "structures %zu soft (%zu found late), corrections %llu, snaps %llu, at rest %llu, not simulating %llu, "
+                      "diverged %llu, placed %llu, breaks passed on %llu held %llu kept here %llu dropped %llu, shape differs %llu, "
+                      "followed %llu bodies (%llu starts), breaks while following %llu, "
+                      "rest placed %llu, rest locked %llu, rest held %llu, game breaks %llu",
+                      structures, found, d(a.structCorrected, b.structCorrected), d(a.structSnapped, b.structSnapped),
+                      d(a.structRestKept, b.structRestKept), d(a.structNotSimulating, b.structNotSimulating),
+                      d(a.structDiverged, b.structDiverged), d(a.structPlaced, b.structPlaced), d(a.jointsReported, b.jointsReported),
+                      d(a.breaksHeld, b.breaksHeld), d(a.jointsKeptLocal, b.jointsKeptLocal),
+                      d(a.jointReportsDropped, b.jointReportsDropped), d(a.shapeMismatch, b.shapeMismatch),
+                      d(a.structFollowed, b.structFollowed), d(a.followStarts, b.followStarts), d(a.breaksWhileFollowing, b.breaksWhileFollowing),
+
+                      d(a.restPlaced, b.restPlaced), d(a.restLocked, b.restLocked), d(a.restHeld, b.restHeld),
+                      d(a.gameBreaks, b.gameBreaks));
     else if (env_.syncStructures == StructureMode::Local)
-        std::snprintf(structText, sizeof structText, "structures %zu local, states skipped %llu, reset skipped %llu", structures,
-                      d(a.structStatesSkipped, b.structStatesSkipped), d(a.structResetSkipped, b.structResetSkipped));
+        std::snprintf(structText, sizeof structText,
+                      "structures %zu local (%zu found late), states skipped %llu, reset skipped %llu, breaks passed on %llu held %llu kept here %llu "
+                      "dropped %llu, shape differs %llu",
+                      structures, found, d(a.structStatesSkipped, b.structStatesSkipped), d(a.structResetSkipped, b.structResetSkipped),
+                      d(a.jointsReported, b.jointsReported), d(a.breaksHeld, b.breaksHeld), d(a.jointsKeptLocal, b.jointsKeptLocal),
+                      d(a.jointReportsDropped, b.jointReportsDropped), d(a.shapeMismatch, b.shapeMismatch));
     else
         std::snprintf(structText, sizeof structText, "structures full (as pre17)");
     char objects[640];
@@ -1369,7 +1622,7 @@ std::string ObjectSync::HealthLine() {
                   d(a.eventsSent, b.eventsSent), d(a.eventsApplied, b.eventsApplied), queuedEvents_.size(),
                   d(a.eventsRejected, b.eventsRejected), d(a.jointsBroken, b.jointsBroken), d(a.bodiesDetached, b.bodiesDetached),
                   d(a.destroyedSent, b.destroyedSent), d(a.destroyedApplied, b.destroyedApplied));
-    char fixes[704];
+    char fixes[1408];   // structText (up to 640) included
     std::snprintf(fixes, sizeof fixes,
                   " | pre2: skippedClasses %llu attachHeld %llu letGo sent %llu applied %llu | adopt known %llu bound %llu expired %llu | "
                   "walk asked %llu cached %llu capped %llu | %s | "

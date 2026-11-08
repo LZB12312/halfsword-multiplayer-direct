@@ -39,7 +39,7 @@ void DirectTransport::Stop() {
     byId_.clear(); bySlot_.clear(); queue_.clear(); head_ = 0;
 }
 
-void DirectTransport::Send(uint32_t peer, uint8_t channel, std::vector<uint8_t> data, bool reliable) {
+void DirectTransport::Send(uint32_t peer, uint8_t channel, const std::vector<uint8_t>& data, bool reliable) {
     uint64_t id = UserOf(peer);
     if (!id) return;
     int flags = direct::kAutoRestart | (reliable ? direct::kReliable : direct::kNoNagle);
@@ -49,7 +49,7 @@ void DirectTransport::Send(uint32_t peer, uint8_t channel, std::vector<uint8_t> 
     }
 }
 
-void DirectTransport::Broadcast(uint8_t channel, std::vector<uint8_t> data, bool reliable) {
+void DirectTransport::Broadcast(uint8_t channel, const std::vector<uint8_t>& data, bool reliable) {
     for (auto& [peer, id] : bySlot_) Send(peer, channel, data, reliable);
 }
 
@@ -80,5 +80,6 @@ uint32_t DirectTransport::RoundTripMs(uint32_t peer) {
     int ping = id ? direct::PingMs(id) : -1;
     return ping > 0 ? uint32_t(ping) : 0;
 }
+
 
 }  // namespace hsm

@@ -8,6 +8,7 @@
 #include "log.h"
 #include "paths.h"
 #include "session/hsm_ue4ss.h"
+#include "ue4ss_bundle.h"
 
 // Load mechanics (assumption until an in-game test has run): UE4SS 3.x's proxy dwmapi.dll
 // only forwards exports and LoadLibrary's ue4ss/UE4SS.dll; UE4SS.dll starts itself from its own DllMain by creating its
@@ -138,6 +139,12 @@ void Run(const Config& cfg) {
     files.sub = FileExists(dir + Wide(RelPath(Pick::Sub)));
     files.beside = FileExists(dir + Wide(RelPath(Pick::Beside)));
     files.xinput2x = LooksLikeUe4ss2x(FileExists(dir + L"xinput1_3.dll"), FileExists(dir + L"UE4SS-settings.ini"), DirExists(dir + L"Mods"));
+    const bool proxyRunning = files.xinput2x && GetModuleHandleW(L"xinput1_3.dll");
+    InstallBundled(dir, files, cfg.ue4ssKeep);
+    files.sub = FileExists(dir + Wide(RelPath(Pick::Sub)));
+    files.beside = FileExists(dir + Wide(RelPath(Pick::Beside)));
+    // A 2.x proxy that already started keeps this one game: a second UE4SS would double-hook. The next start has no proxy.
+    files.xinput2x = proxyRunning || (files.xinput2x && FileExists(dir + L"xinput1_3.dll"));
     const Pick pick = ChoosePick(files);
 
     if (pick == Pick::None) {
@@ -192,4 +199,5 @@ void Run(const Config& cfg) {
 std::string ReportVersion() { std::lock_guard<std::mutex> lock(g_mu); return g_version; }
 std::string ReportMods() { std::lock_guard<std::mutex> lock(g_mu); return g_mods; }
 std::string Notice() { std::lock_guard<std::mutex> lock(g_mu); return g_notice; }
+std::vector<std::string> EnabledModNames(const std::wstring& modsDir) { return ReadMods(modsDir); }
 }  // namespace hsm::ue4ss

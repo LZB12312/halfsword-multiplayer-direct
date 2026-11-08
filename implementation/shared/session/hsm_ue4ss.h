@@ -3,7 +3,7 @@
 //
 // Layouts: UE4SS 3.x keeps everything but its proxy under <exe dir>/ue4ss/ (UE4SS.dll, UE4SS-settings.ini, Mods/);
 // older installs keep UE4SS.dll, the settings and Mods/ next to the exe; a 2.x install is proxied by xinput1_3.dll and
-// loads itself, so there is nothing for HSMMod to do. The UE4SS mod list is names only, for bug reports: enabled mods
+// loads itself until the bundled build takes over (see ChooseBundleStep). The UE4SS mod list is names only, for bug reports: enabled mods
 // from Mods/mods.txt ("Name : 1" / "Name : 0", ';' comments) and folders holding an enabled.txt.
 #pragma once
 #include <algorithm>
@@ -44,6 +44,28 @@ inline const char* PickName(Pick p) {
 // An xinput1_3.dll beside the exe is UE4SS's when it sits next to UE4SS files (a real one lives in System32).
 inline bool LooksLikeUe4ss2x(bool xinput13Present, bool settingsIni, bool modsDir) { return xinput13Present && (settingsIni || modsDir); }
 
+// HSMMod carries one UE4SS build inside its DLL, and that's the one that runs. Install: ue4ss/ has no UE4SS.dll. Replace: it has
+// an older accepted build. Ask: it has a build nobody here knows, which may be the player's own and can't be got back, so they
+// choose. Keep: they already said no to this very file. Install and Replace write the DLL and every other file already there
+// stays. Then an old-layout UE4SS.dll and a 2.x proxy beside the exe get .off on their names, so nothing else starts a second UE4SS.
+enum class BundleStep { None, Install, Replace, Ask, Keep };
+inline BundleStep ChooseBundleStep(bool subThere, bool subIsBundled, bool subIsAccepted, bool subIsKept) {
+    if (!subThere) return BundleStep::Install;
+    if (subIsBundled) return BundleStep::None;
+    if (subIsAccepted) return BundleStep::Replace;
+    return subIsKept ? BundleStep::Keep : BundleStep::Ask;
+}
+// Where a file of the bundled zip goes, relative to the exe dir with backslashes; "" for what stays in the zip. Only ue4ss/ is
+// unpacked: the zip's dwmapi.dll is UE4SS's proxy, and that slot is HSMMod's.
+inline std::string BundleFilePath(std::string_view zipName) {
+    constexpr std::string_view kRoot = "ue4ss/";
+    if (zipName.size() <= kRoot.size() || zipName.compare(0, kRoot.size(), kRoot) != 0 || zipName.back() == '/') return {};
+    if (zipName.find("..") != std::string_view::npos || zipName.find('\\') != std::string_view::npos || zipName.find(':') != std::string_view::npos) return {};
+    std::string out(zipName);
+    std::replace(out.begin(), out.end(), '/', '\\');
+    return out;
+}
+
 // ue4ss_order: "before" (load UE4SS first) or anything else = "after" (default: after HSMMod's ProcessEvent hook).
 enum class Order { After, Before };
 namespace detail {
@@ -60,6 +82,13 @@ inline bool SameName(std::string_view a, std::string_view b) {
     return true;
 }
 }  // namespace detail
+// UE4SS's stock console and cheat manager mods. The console's `set` is a cheat tool on its own, so the bundled build has them off
+// and a Vanilla lobby refuses them; UE4SS without them is not a mod to a lobby.
+inline constexpr const char* kConsoleMods[] = {"CheatManagerEnablerMod", "ConsoleCommandsMod", "ConsoleEnablerMod"};
+inline bool IsConsoleMod(std::string_view name) {
+    for (const char* m : kConsoleMods) if (detail::SameName(m, name)) return true;
+    return false;
+}
 inline Order ParseOrder(const std::string& s) { return detail::SameName(detail::Trim(s), "before") ? Order::Before : Order::After; }
 inline const char* OrderName(Order o) { return o == Order::Before ? "before" : "after"; }
 

@@ -1,6 +1,8 @@
 #include "gameplay/mod_maps.h"
+#include "file_hash.h"
 #include "log.h"
 #include "paths.h"
+#include "session/hsm_mod_rules.h"
 #include "session/hsm_modpack.h"
 #include "ue/engine.h"
 #include <windows.h>
@@ -42,6 +44,7 @@ struct Shared {
     std::vector<ModPak> paks;
     std::vector<PakMaps> pakMaps;
     std::vector<LocalPack> packs;             // the manifests under Paks/~mods/<pack>/ (session/hsm_modpack.h)
+    std::vector<ModKind> kinds;               // per paks[i]: a map pak or another content pak (ContentPak until its index is read)
     bool listed = false, allHashed = false, running = false;
     uint32_t version = 0;                     // bumps on every change; the game thread copies when it differs
 };
@@ -56,26 +59,11 @@ bool ReadAt(HANDLE h, uint64_t offset, void* out, size_t len) {
     return ReadFile(h, out, DWORD(len), &got, nullptr) && got == len;
 }
 
-bool HashFile(const std::wstring& path, Sha256Digest& out) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    Sha256 s;
-    std::vector<uint8_t> buf(1 << 20);
-    bool ok = true;
-    for (;;) {
-        DWORD got = 0;
-        if (!ReadFile(h, buf.data(), DWORD(buf.size()), &got, nullptr)) { ok = false; break; }
-        if (got == 0) break;
-        s.Update(buf.data(), got);
-    }
-    CloseHandle(h);
-    if (ok) out = s.Final();
-    return ok;
-}
-
-// Reads the pak's own index (unencrypted, version 3 to 11) and returns the map packages it lists.
-PakParse ReadPakMaps(const std::wstring& path, uint64_t size, std::vector<std::string>& maps) {
+// Reads the pak's own index (unencrypted, version 3 to 11) and returns the map packages it lists, and the folders of its
+// other assets (for the mod rules' map-pak test, session/hsm_mod_rules.h ClassifyPak).
+PakParse ReadPakMaps(const std::wstring& path, uint64_t size, std::vector<std::string>& maps, PakAssets& assets) {
     maps.clear();
+    assets = PakAssets{};
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return PakParse::NotPak;
     PakParse result = PakParse::NotPak;
@@ -89,13 +77,13 @@ PakParse ReadPakMaps(const std::wstring& path, uint64_t size, std::vector<std::s
         if (result != PakParse::Ok) break;
         std::vector<uint8_t> primary(size_t(f.indexSize));
         if (!ReadAt(h, f.indexOffset, primary.data(), primary.size())) { result = PakParse::Malformed; break; }
-        if (f.version < 10) { result = ParsePakLegacyIndex(primary.data(), primary.size(), f.version, maps); break; }
+        if (f.version < 10) { result = ParsePakLegacyIndex(primary.data(), primary.size(), f.version, maps, &assets); break; }
         PakPrimary pr;
         result = ParsePakPrimaryIndex(primary.data(), primary.size(), size, pr);
         if (result != PakParse::Ok) break;
         std::vector<uint8_t> fdi(size_t(pr.fdiSize));
         if (!ReadAt(h, pr.fdiOffset, fdi.data(), fdi.size())) { result = PakParse::Malformed; break; }
-        result = ParsePakDirectoryIndex(fdi.data(), fdi.size(), pr.mountPoint, maps);
+        result = ParsePakDirectoryIndex(fdi.data(), fdi.size(), pr.mountPoint, maps, &assets);
     } while (false);
     CloseHandle(h);
     return result;
@@ -103,16 +91,27 @@ PakParse ReadPakMaps(const std::wstring& path, uint64_t size, std::vector<std::s
 
 struct FoundPak { std::wstring path; std::string name; uint64_t size = 0, mtime = 0; };
 
+// What a scan couldn't vouch for. The online check refuses these: a mod the list can't name mustn't be a way off the list.
+std::mutex g_uncheckedMu;
+std::vector<std::string> g_unchecked;
+void NoteUnchecked(const std::string& what) {
+    std::lock_guard<std::mutex> lock(g_uncheckedMu);
+    if (g_unchecked.size() < 16 && std::find(g_unchecked.begin(), g_unchecked.end(), what) == g_unchecked.end()) g_unchecked.push_back(what);
+    HSM_LOG("maps: not checked: %s", what.c_str());
+}
+
 void ListPaks(const std::wstring& root, const std::wstring& dir, int depth, std::vector<FoundPak>& out, size_t& seen) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((dir + L"*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (++seen > kMaxFilesSeen) break;
+        if (++seen > kMaxFilesSeen) { NoteUnchecked("Paks (too many files)"); break; }
         const std::wstring name = fd.cFileName;
         if (name == L"." || name == L"..") continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (depth < kMaxDepth && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) ListPaks(root, dir + name + L"\\", depth + 1, out, seen);
+            // The game follows these and goes as deep as it likes, so what's out of reach here has to count as something.
+            if (depth >= kMaxDepth || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) NoteUnchecked(Narrow(name) + " (folder not checked)");
+            else ListPaks(root, dir + name + L"\\", depth + 1, out, seen);
             continue;
         }
         const std::string n8 = Narrow(name);
@@ -123,7 +122,8 @@ void ListPaks(const std::wstring& root, const std::wstring& dir, int depth, std:
         p.name = SanitizePakName(n8);
         p.size = uint64_t(fd.nFileSizeHigh) << 32 | fd.nFileSizeLow;
         p.mtime = uint64_t(fd.ftLastWriteTime.dwHighDateTime) << 32 | fd.ftLastWriteTime.dwLowDateTime;
-        if (!ModPakNameOk(p.name) || p.size == 0 || p.size > kMaxModPakBytes) continue;
+        if (!ModPakNameOk(p.name) || p.size > kMaxModPakBytes) { NoteUnchecked(p.name + " (pak not checked)"); continue; }   // the game loads it anyway
+        if (p.size == 0) continue;
         out.push_back(p);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -192,13 +192,15 @@ std::vector<LocalPack> ScanPacks(const std::wstring& root) {
     return out;
 }
 
-void Publish(const std::vector<ModPak>& paks, const std::vector<PakMaps>& pakMaps, const std::vector<LocalPack>& packs, bool listed, bool allHashed) {
+void Publish(const std::vector<ModPak>& paks, const std::vector<PakMaps>& pakMaps, const std::vector<LocalPack>& packs, const std::vector<ModKind>& kinds,
+             bool listed, bool allHashed) {
     std::lock_guard<std::mutex> lock(g_shared.mu);
-    g_shared.paks = paks; g_shared.pakMaps = pakMaps; g_shared.packs = packs; g_shared.listed = listed; g_shared.allHashed = allHashed;
+    g_shared.paks = paks; g_shared.pakMaps = pakMaps; g_shared.packs = packs; g_shared.kinds = kinds; g_shared.listed = listed; g_shared.allHashed = allHashed;
     ++g_shared.version;
 }
 
 void ScanOnce() {
+    { std::lock_guard<std::mutex> lock(g_uncheckedMu); g_unchecked.clear(); }
     const ULONGLONG t0 = GetTickCount64();
     const std::wstring root = PaksRoot();
     std::vector<FoundPak> found;
@@ -207,13 +209,15 @@ void ScanOnce() {
     std::sort(found.begin(), found.end(), [](const FoundPak& a, const FoundPak& b) { return LowerPath(a.path) < LowerPath(b.path); });
     if (found.size() > kMaxModPaks) {
         HSM_LOG("maps: %zu mod paks found, only the first %zu are used", found.size(), kMaxModPaks);
+        NoteUnchecked(std::to_string(found.size() - kMaxModPaks) + " paks (too many paks)");
         found.resize(kMaxModPaks);
     }
     std::vector<ModPak> paks;
     for (const FoundPak& f : found) { ModPak p; p.name = f.name; p.size = f.size; paks.push_back(p); }
     std::vector<PakMaps> pakMaps;
+    std::vector<ModKind> kinds(paks.size(), ModKind::ContentPak);
     const std::vector<LocalPack> packs = ScanPacks(root);
-    Publish(paks, pakMaps, packs, true, paks.empty());     // listed: the client can already say "no such pak" for names that are absent
+    Publish(paks, pakMaps, packs, kinds, true, paks.empty());     // listed: the client can already say "no such pak" for names that are absent
 
     HashCache cache;
     cache.Parse(ReadWholeFile(CachePath()));
@@ -228,19 +232,26 @@ void ScanOnce() {
         if (!have) { HSM_LOG("maps: mod pak %s: could not be read", f.name.c_str()); paks[i].size = 0; continue; }
         paks[i].hashed = true; paks[i].sha = sha;
         std::vector<std::string> maps;
-        const PakParse r = ReadPakMaps(f.path, f.size, maps);
-        HSM_LOG("maps: mod pak %s %llu %s%s", f.name.c_str(), (unsigned long long)f.size, Short(sha).c_str(),
-                r == PakParse::Ok ? "" : (std::string(" (index not read: ") + PakParseName(r) + ")").c_str());
+        PakAssets assets;
+        const PakParse r = ReadPakMaps(f.path, f.size, maps, assets);
+        // An unread index cannot show the pak holds only maps: it counts as a content pak.
+        PakClass judged;
+        if (r == PakParse::Ok) judged = ClassifyPakWhy(maps, assets.dirs, assets.overflow, assets.overflowWhy, assets.badMaps, assets.stockFiles);
+        else judged.why = std::string("index not read: ") + PakParseName(r);
+        kinds[i] = judged.kind;
+        HSM_LOG("maps: mod pak %s %llu %s %s%s", f.name.c_str(), (unsigned long long)f.size, Short(sha).c_str(), ModKindName(judged.kind),
+                judged.why.empty() ? "" : (" (" + judged.why + ")").c_str());
+        if (r == PakParse::Ok && assets.badMaps) HSM_LOG("maps: mod pak %s: %zu map(s) can't go on the map list, first %s", f.name.c_str(), assets.badMaps, assets.badMapName.c_str());
         if (r == PakParse::Ok && !maps.empty()) pakMaps.push_back({i, maps});
-        Publish(paks, pakMaps, packs, true, false);
+        Publish(paks, pakMaps, packs, kinds, true, false);
     }
     // A pak that could not be read is dropped from the list so nothing waits on its hash.
-    std::vector<ModPak> kept; std::vector<PakMaps> keptMaps;
+    std::vector<ModPak> kept; std::vector<PakMaps> keptMaps; std::vector<ModKind> keptKinds;
     std::vector<size_t> remap(paks.size(), size_t(-1));
-    for (size_t i = 0; i < paks.size(); ++i) if (paks[i].hashed) { remap[i] = kept.size(); kept.push_back(paks[i]); }
+    for (size_t i = 0; i < paks.size(); ++i) if (paks[i].hashed) { remap[i] = kept.size(); kept.push_back(paks[i]); keptKinds.push_back(kinds[i]); }
     for (PakMaps pm : pakMaps) { pm.pak = remap[pm.pak]; keptMaps.push_back(pm); }
     if (cacheDirty) WriteWholeFile(CachePath(), cache.Serialize());
-    Publish(kept, keptMaps, packs, true, true);
+    Publish(kept, keptMaps, packs, keptKinds, true, true);
     HSM_LOG("maps: scanned %zu mod pak(s) under %s in %llu ms", kept.size(), Narrow(root).c_str(), (unsigned long long)(GetTickCount64() - t0));
 }
 
@@ -268,6 +279,7 @@ struct Local {
     std::vector<ModPak> paks;
     std::vector<PakMaps> pakMaps;
     std::vector<LocalPack> packs;
+    std::vector<ModKind> kinds;
     bool listed = false, allHashed = false;
     std::vector<std::string> registryMaps;
     bool registryDone = false, registryTried = false;
@@ -361,7 +373,7 @@ void Tick() {
         std::lock_guard<std::mutex> lock(g_shared.mu);
         if (g_shared.version != g.seenVersion) {
             g.seenVersion = g_shared.version;
-            g.paks = g_shared.paks; g.pakMaps = g_shared.pakMaps; g.packs = g_shared.packs;
+            g.paks = g_shared.paks; g.pakMaps = g_shared.pakMaps; g.packs = g_shared.packs; g.kinds = g_shared.kinds;
             g.listed = g_shared.listed; g.allHashed = g_shared.allHashed;
             g.dirty = true;
         }
@@ -385,8 +397,11 @@ void Rescan() {
 }
 
 const std::vector<ModMapEntry>& Maps() { return g.maps; }
+std::vector<std::string> Unchecked() { std::lock_guard<std::mutex> lock(g_uncheckedMu); return g_unchecked; }
 const std::vector<ModPak>& Paks() { return g.paks; }
 const std::vector<LocalPack>& Packs() { return g.packs; }
+const std::vector<ModKind>& PakKinds() { return g.kinds; }
+uint32_t ScanVersion() { return g.seenVersion; }
 bool Listed() { return g.listed; }
 bool AllHashed() { return g.allHashed; }
 

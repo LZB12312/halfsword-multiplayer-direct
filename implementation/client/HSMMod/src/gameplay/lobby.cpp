@@ -1,9 +1,12 @@
 #include "gameplay/lobby.h"
 #include "config.h"
 #include "session/hsm_display_name.h"
+#include "file_hash.h"
 #include "gameplay/mod_pack.h"
+#include "gameplay/mod_rules.h"
 #include "hsm_protocol.h"
 #include "log.h"
+#include "match/hsm_build_card.h"
 #include "session/hsm_build.h"
 #include "session/hsm_password.h"
 #include "session/hsm_player_limit.h"
@@ -14,6 +17,11 @@
 
 namespace hsm::game {
 namespace {
+#ifdef HSM_TESTBENCH
+constexpr const char* kLobbyNamePrefix = "[TEST] ";
+#else
+constexpr const char* kLobbyNamePrefix = "";
+#endif
 // Parses a decimal int from Steam key/value data; anything else (empty, garbage, overflow) gives the fallback.
 int IntOr(const std::string& s, int fallback) {
     if (s.empty() || s.size() > 6) return fallback;
@@ -24,7 +32,12 @@ int IntOr(const std::string& s, int fallback) {
 #ifndef HSM_GIT_DESCRIBE
 #define HSM_GIT_DESCRIBE ""
 #endif
-std::string ModBuild() { return ModBuildString(kModVersion, HSM_GIT_DESCRIBE); }
+// The version, the commit build.sh saw and the SHA-256 of this DLL's own file (session/hsm_build.h). Worked out once: the
+// first call reads the DLL (a few MB; mod.cpp makes it on the worker thread at startup, before any session).
+std::string ModBuild() {
+    static const std::string build = ModBuildString(kModVersion, HSM_GIT_DESCRIBE, OwnBinaryHash());
+    return build;
+}
 namespace {
 bool g_allowBuildMismatch = false;
 }  // namespace
@@ -63,7 +76,7 @@ void Lobby::Tick() {
                 direct::SetLobbyData(e.lobby, "hsm_proto", ProtocolStr());
                 direct::SetLobbyData(e.lobby, "hsm_build", BuildKeyHex());
                 direct::SetLobbyData(e.lobby, "hsm_ver", kModVersion);
-                direct::SetLobbyData(e.lobby, "name", direct::PersonaName(direct::MyUserId()) + "'s fight");
+                direct::SetLobbyData(e.lobby, "name", kLobbyNamePrefix + direct::PersonaName(direct::MyUserId()) + "'s fight");
                 direct::SetLobbyData(e.lobby, "state", "menu");
                 direct::SetLobbyData(e.lobby, "hsm_srv", server_ ? "1" : "0");
                 direct::SetLobbyData(e.lobby, "hsm_max", std::to_string(maxPlayers_));
@@ -84,7 +97,7 @@ void Lobby::Tick() {
                 if (!e.ok) { state_ = State::Idle; SetStatus(e.text.empty() ? "Could not connect: check address, UDP port and firewall" : e.text); break; }
                 if (state_ != State::InLobby || lobby_ != e.lobby) {
                     LobbyListing l = Describe(e.lobby);
-                    if (!l.compatible) { direct::LeaveLobby(e.lobby); state_ = State::Idle; SetStatus("Cannot join: " + l.reason); break; }
+                    if (!l.compatible) { direct::LeaveLobby(e.lobby); state_ = State::Idle; SetStatus(l.modsText.empty() ? "Cannot join: " + l.reason : l.modsText); break; }
                     if (l.pack.any()) {   // the host's modpack: this machine must have exactly it (nothing is downloaded)
                         const PackCheck pc = modpack::Check(l.pack);
                         modpack::LogJoinCheck(l.pack, pc);
@@ -149,15 +162,35 @@ LobbyListing Lobby::Describe(direct::UserId lobby) const {
         l.reason = "lobby full";   // a full lobby we are already in is not full to us
     l.locked = direct::LobbyData(lobby, "hsm_lock") == "1";
     l.pack = ReadLobbyPack(direct::LobbyData(lobby, "hsm_pack"), direct::LobbyData(lobby, "hsm_packv"), direct::LobbyData(lobby, "hsm_packh"));   // peer-written: validated
+    if (!proto.empty()) {   // mod rules: the lobby's rule against this machine's own report (the host checks again after the join)
+        const ModRule rule = DecodeLobbyRule({direct::LobbyData(lobby, kLobbyModRuleKey), direct::LobbyData(lobby, kLobbyModCheatsKey),
+                                              direct::LobbyData(lobby, kLobbyModOfficialKey), direct::LobbyData(lobby, kLobbyModListKey)});   // peer-written: DecodeLobbyRule reads it strictly
+        const LobbyModView v = ViewLobbyRule(rule, modrules::Own(), modrules::OwnOfficial(), direct::LobbyData(lobby, kLobbyHostCheatKey));   // the host's cheats: peer-written, HostCheatNames filters them
+        l.mods = v.tag;
+        if (!DecodeLobbyBlock(direct::LobbyData(lobby, kLobbyBlockKey)).hse) l.mods += l.mods.empty() ? "HS Enhancer allowed" : ", HS Enhancer allowed";   // so nobody joins one by accident
+        if (modrules::Enabled() && !v.reason.empty()) {   // mod_rules=0: no pre-check here, the host still decides
+            l.modsText = v.text;
+            if (l.reason.empty()) l.reason = v.reason;
+        }
+    }
     l.compatible = l.reason.empty();
     return l;
 }
 
 void Lobby::Host(direct::LobbyType type, bool server) {
+    if (!server && onlineBlock) if (const std::string why = onlineBlock(hostPreset, hostBlock); !why.empty()) { SetStatus(why); return; }
     if (state_ != State::Idle) return;
     password_.clear(); passwordLobby_ = 0; askLobby_ = 0; askNote_.clear();
     type_ = type; server_ = server; state_ = State::Creating; SetStatus("Creating lobby...");
     direct::CreateLobby(type, maxPlayers_ + (server ? 1 : 0));
+}
+
+ModRule Lobby::RoomRule(bool* named) const {
+    const std::string rule = InLobby() ? direct::LobbyData(lobby_, kLobbyModRuleKey) : std::string();
+    if (named) *named = !rule.empty();
+    if (rule.empty()) return NoRule();
+    return DecodeLobbyRule({rule, direct::LobbyData(lobby_, kLobbyModCheatsKey), direct::LobbyData(lobby_, kLobbyModOfficialKey),
+                            direct::LobbyData(lobby_, kLobbyModListKey)});   // peer-written: DecodeLobbyRule reads it strictly
 }
 
 bool Lobby::ServerLobby() const { return InLobby() && direct::LobbyData(lobby_, "hsm_srv") == "1"; }
@@ -210,6 +243,11 @@ void Lobby::Enter(direct::UserId lobby) {
     lobby_ = lobby; state_ = State::InLobby; owner_ = direct::LobbyOwner(lobby);
     direct::SetMemberData(lobby_, "hsm_ver", kModVersion);
     direct::SetMemberData(lobby_, "hsm_mod", ModBuild());   // the lobby names every other player on another build
+    if (onEnterCard) onEnterCard();
+    if (myCard) direct::SetMemberData(lobby_, "hsm_card", myCard());
+    if (myRuleSheet) direct::SetMemberData(lobby_, "hsm_sheet", myRuleSheet());
+    officialSent_.clear();
+    SetOfficial(modrules::OwnOfficial());   // mod rules: the update check's verdict on this DLL (LobbyTick updates it)
     direct::SetRichPresence("connect", "+connect_lobby " + std::to_string(lobby_));
     direct::SetRichPresence("status", IsHost() ? "Hosting a Half Sword fight" : "In a Half Sword lobby");
     members_.clear();
@@ -294,6 +332,29 @@ void Lobby::SetPack(const LobbyPack& p) {
     direct::SetLobbyData(lobby_, "hsm_packv", p.version);
     direct::SetLobbyData(lobby_, "hsm_packh", p.hash);
 }
+void Lobby::SetModRule(const ModRule& rule, const std::string& hostCheats) {
+    if (!IsHost()) return;
+    const LobbyModData d = EncodeLobbyRule(rule);
+    bool changed = false;
+    const auto put = [&](const char* key, const std::string& v) {
+        if (direct::LobbyData(lobby_, key) == v) return;
+        direct::SetLobbyData(lobby_, key, v);
+        changed = true;
+    };
+    put(kLobbyModRuleKey, d.rule); put(kLobbyModCheatsKey, d.cheats); put(kLobbyModOfficialKey, d.official); put(kLobbyModListKey, d.list);
+    put(kLobbyHostCheatKey, hostCheats);
+    put(kLobbyBlockKey, EncodeLobbyBlock(hostBlock));
+    if (changed) HSM_LOG("lobby: mod rule announced: %s%s%s", RuleSummary(rule).c_str(), hostCheats.empty() ? "" : "; host runs ", hostCheats.c_str());
+}
+
+void Lobby::SetOfficial(Official o) {
+    if (!InLobby()) return;
+    const char* name = OfficialName(o);
+    if (officialSent_ == name) return;
+    direct::SetMemberData(lobby_, kMemberOfficialKey, name);
+    officialSent_ = name;
+}
+
 bool Lobby::Progression() const { return InLobby() && direct::LobbyData(lobby_, "hsm_prog") == "1"; }
 void Lobby::SetProgression(bool on) { if (IsHost()) direct::SetLobbyData(lobby_, "hsm_prog", on ? "1" : "0"); }
 
@@ -314,6 +375,20 @@ bool Lobby::SetDisplayName(const std::string& name) {
     SaveIniValues({{"name",clean}});
     SetStatus("Display name updated"); return true;
 }
+LobbyBlock Lobby::CurrentBlock() const { return InLobby() ? DecodeLobbyBlock(direct::LobbyData(lobby_, kLobbyBlockKey)) : hostBlock; }
+bool Lobby::InUnrestrictedLobby() const { return InLobby() && direct::LobbyData(lobby_, kLobbyModRuleKey) == std::to_string(int(ModPreset::Unrestricted)); }
+bool Lobby::InClassesLobby() const { return InLobby() && (InUnrestrictedLobby() || direct::LobbyData(lobby_, kLobbyModRuleKey) == std::to_string(int(ModPreset::Classes))); }
+
+void Lobby::RepublishMyCard() {
+    if (!InLobby() || !myCard) return;
+    const std::string card = myCard();
+    if (direct::MemberData(lobby_, direct::MyUserId(), "hsm_card") != card) direct::SetMemberData(lobby_, "hsm_card", card);
+    if (myRuleSheet) {
+        const std::string sheet = myRuleSheet();
+        if (direct::MemberData(lobby_, direct::MyUserId(), "hsm_sheet") != sheet) direct::SetMemberData(lobby_, "hsm_sheet", sheet);
+    }
+}
+
 
 void Lobby::SetPublicState(const std::string& state, const std::string& map, const std::string& mode) {
     if (!IsHost()) return;
@@ -351,6 +426,9 @@ void Lobby::RefreshMembers() {
         LobbyMember m; m.id = id; m.name = direct::PersonaName(id); m.host = id == owner_;
         m.ready = direct::MemberData(lobby_, id, "ready") == "1";
         m.build = direct::MemberData(lobby_, id, "hsm_mod").substr(0, kMaxModBuild);   // peer-written
+        m.card = direct::MemberData(lobby_, id, "hsm_card").substr(0, kMaxCardValue);   // peer-written; decoded by hsm_build_card.h
+        auto was = std::find_if(members_.begin(), members_.end(), [&](const LobbyMember& o) { return o.id == id; });
+        if (!m.card.empty() && onBuildCard && (was == members_.end() || was->card != m.card)) onBuildCard(m.name, m.card);
         auto team = [](int t) { return t >= -1 && t <= 3 ? t : -1; };   // peer-written; later narrowed to int8_t
         m.team = team(IntOr(direct::MemberData(lobby_, id, "hsm_team"), -1));
         m.hostOverride = team(IntOr(direct::LobbyData(lobby_, "hsm_ovr_" + std::to_string(id)), -1));

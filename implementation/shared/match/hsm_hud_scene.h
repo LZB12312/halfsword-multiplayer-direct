@@ -324,7 +324,7 @@ inline SceneText Pill(const MatchInfo& m, uint8_t me, bool oneFight) {
     }
     if (IsBotFormat(f)) {
         int bots = 0;
-        for (const FighterEntry& e : m.fighters) if (e.team == kBotTeam && e.alive) ++bots;
+        for (const FighterEntry& e : m.fighters) if (e.team == kBotTeam && e.alive && !e.down) ++bots;   // an opponent that gave up is out
         std::string left = bots ? " \xC2\xB7 " + std::to_string(bots) + " LEFT" : "";
         if (oneFight) p.text = "FIGHT" + left;                    // a Progression fight has no waves
         else p.text = "WAVE " + std::to_string(ScoreOf(m, kHumanTeam) + 1) + left;
@@ -399,7 +399,9 @@ inline Board MakeBoard(const MatchInfo& m, const LocalHud& l) {
     bool oneFight = l.oneFight && IsBotFormat(f);               // Progression: back to the Tavern after the results
     b.title = (oneFight ? std::string("PROGRESSION FIGHT") : Upper(ModeName(f, Gear(m.gear), m.teams)) + " \xC2\xB7 " + limit)
             + (l.map.empty() ? "" : " \xC2\xB7 " + Upper(l.map));
-    if (m.phase == uint8_t(MatchPhase::Results)) b.footer = (oneFight ? "BACK TO THE TAVERN IN " : "REMATCH IN ") + Seconds(m.timeLeftMs);
+    if (m.phase == uint8_t(MatchPhase::Results))
+        b.footer = CoopFightWon(m, l.oneFight) ? "FIGHT WON \xC2\xB7 HOLD G TO GO ON \xC2\xB7 OR IN " + Seconds(m.timeLeftMs)
+                 : (oneFight ? "BACK TO THE TAVERN IN " : "REMATCH IN ") + Seconds(m.timeLeftMs);
 
     // Fighters by score, then kills (free-for-all and Duel score per fighter; elsewhere a fighter's score is kills).
     bool perEntity = ScoresPerFighter(f);
@@ -482,6 +484,9 @@ inline HudScene BuildHudScene(const MatchInfo& info, const LocalHud& l, uint32_t
     if (l.giveUp > 0 && pvp) s.hold = {true, "GIVING UP" + pct, style::kBloodInk, true, held};
     if (l.giveUp > 0 && InWaveBreak(m))          // the same G hold votes to skip the loot break
         s.hold = {true, "SKIPPING THE BREAK" + pct, style::kOk, true, held};
+    if (act == GiveUpAction::ClaimWin)           // a Progression fight won: G goes on, as the stock Talk key does
+        s.hold = l.giveUp > 0 ? HoldView{true, "GOING ON" + pct, style::kOk, true, held}
+                              : HoldView{true, "FIGHT WON - HOLD G TO GO ON (OR IN " + Seconds(m.timeLeftMs) + ")", style::kOk, false, 0};
     if (l.giveUpWait && fought)
         s.hold = {true, m.roundGapLeftMs ? "NOTHING TO GIVE UP - NEXT ROUND IN " + Seconds(m.roundGapLeftMs) : std::string("NOTHING TO GIVE UP - YOU ARE OUT"), style::kIron, false, 0};
     if (m.phase == uint8_t(MatchPhase::Countdown)) {

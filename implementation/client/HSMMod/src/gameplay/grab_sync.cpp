@@ -119,7 +119,9 @@ void GrabSync::Tick(double nowMs, float dt, const std::vector<std::pair<uint8_t,
     down.fill(-1);
     for (const sync::GrabPull& p : inbox_.Pulls(nowMs, isMine, dead)) {
         if (down[p.target] < 0) down[p.target] = DownHere(p.target, mine[p.target]) ? 1 : 0;
-        if (!Pull(p, mine[p.target], down[p.target] == 1, nowMs, dt)) continue;
+        const bool grappler = env_.grappler && env_.grappler(p.grabber);
+        if (grappler && lastGrab_[p.grabber][p.hand] != p.grabId) HSM_LOG("grabs: e%u has Grappler: e%u is carried", p.grabber, p.target);
+        if (!Pull(p, mine[p.target], sync::GrabCarried(down[p.target] == 1, grappler), nowMs, dt)) continue;
         KeepNoCollide(p, mine[p.target]);
         const bool fresh = lastGrab_[p.grabber][p.hand] != p.grabId;
         lastGrab_[p.grabber][p.hand] = p.grabId;

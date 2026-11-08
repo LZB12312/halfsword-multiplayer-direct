@@ -46,8 +46,18 @@ static void TestPlayerDedFollowsTheFighter() {
     CHECK(StockFlagsFor(Info(Format::Zombies, MatchPhase::Live, 30000), true).matchWon == MatchWonFlag::Set);
 }
 
+// A Progression fight won and waiting for G: Match Won is set, so the stock Talk key goes on instead of kneeling in a give-up.
+static void TestCoopWon() {
+    MatchInfo won = Info(Format::PlayersVsBots, MatchPhase::Results); won.winner = kHumanTeam;
+    CHECK(MatchWonFor(won, true) == MatchWonFlag::Set && StockFlagsFor(won, true, true).matchWon == MatchWonFlag::Set);
+    CHECK(MatchWonFor(won) == MatchWonFlag::Leave);                                               // not a Progression fight
+    MatchInfo lost = won; lost.winner = kBotTeam;
+    CHECK(MatchWonFor(lost, true) == MatchWonFlag::Leave);
+    CHECK(MatchWonFor(Info(Format::PlayersVsBots), true) == MatchWonFlag::Clear);                 // fought: clear, as before
+}
+
 int main() {
-    TestBotFormats(); TestEveryOtherFormatIsClearInARound(); TestOutsideAFight(); TestPlayerDedFollowsTheFighter();
+    TestBotFormats(); TestEveryOtherFormatIsClearInARound(); TestOutsideAFight(); TestPlayerDedFollowsTheFighter(); TestCoopWon();
     if (g_fail) { std::printf("%d failure(s)\n", g_fail); return 1; }
     std::puts("hsm_match_won ok");
     return 0;

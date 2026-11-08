@@ -107,7 +107,35 @@ static void TestProxy() {
     CHECK(ProxyNote(false, true, false, {"winmm.dll"}).find("; another proxy") != std::string::npos);
 }
 
+static void TestBundle() {
+    // Nothing there: unpack it, whatever the flags say with no DLL to judge.
+    CHECK(ChooseBundleStep(false, false, false, false) == BundleStep::Install);
+    CHECK(ChooseBundleStep(false, true, true, true) == BundleStep::Install);
+    // The bundled build stays, and an older accepted one goes without a question.
+    CHECK(ChooseBundleStep(true, true, true, false) == BundleStep::None);
+    CHECK(ChooseBundleStep(true, false, true, false) == BundleStep::Replace);
+    // A build nobody knows is the player's to decide, once.
+    CHECK(ChooseBundleStep(true, false, false, false) == BundleStep::Ask);
+    CHECK(ChooseBundleStep(true, false, false, true) == BundleStep::Keep);
+
+    CHECK(BundleFilePath("ue4ss/UE4SS.dll") == "ue4ss\\UE4SS.dll");
+    CHECK(BundleFilePath("ue4ss/Mods/Keybinds/Scripts/main.lua") == "ue4ss\\Mods\\Keybinds\\Scripts\\main.lua");
+    // UE4SS's proxy stays in the zip: that slot is HSMMod's.
+    CHECK(BundleFilePath("dwmapi.dll").empty());
+    CHECK(BundleFilePath("ue4ss/").empty() && BundleFilePath("ue4ss/Mods/").empty());
+    CHECK(BundleFilePath("ue4ss/../dwmapi.dll").empty() && BundleFilePath("ue4ss/a\\b").empty() && BundleFilePath("ue4ss/C:x").empty());
+    CHECK(BundleFilePath("ue4ssx/a").empty());
+}
+
+static void TestConsoleMods() {
+    for (const char* m : kConsoleMods) CHECK(IsConsoleMod(m));
+    CHECK(IsConsoleMod("consoleenablermod"));
+    CHECK(!IsConsoleMod("Keybinds") && !IsConsoleMod("BPModLoaderMod") && !IsConsoleMod(""));
+}
+
 int main() {
+    TestBundle();
+    TestConsoleMods();
     TestPick();
     TestOrder();
     TestModsTxt();

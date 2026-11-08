@@ -1,7 +1,9 @@
 // Steam lobby lifecycle for the in-game Multiplayer screen. The lobby is the source of truth for who is in the
 // session; the session layer mirrors membership into the transport. Game thread only.
 #pragma once
+#include "match/hsm_online_rules.h"
 #include "match/hsm_match.h"
+#include "session/hsm_mod_rules.h"
 #include "session/hsm_modpack.h"
 #include "net/direct_api.h"
 #include <cstdint>
@@ -13,14 +15,19 @@ namespace hsm::game {
 
 constexpr int kMaxLobbyMembers = 8;   // players: == kMaxPlayers (session/hsm_roster.h; static_assert in session.cpp).
                                       // A role=server lobby has one member more: the server, which is not a player.
-constexpr const char* kModVersion = "0.3.0";   // bump with every release tag
-// This mod's build: kModVersion plus the git describe build.sh passed (session/hsm_build.h). Players compare it.
+#ifdef HSM_TESTBENCH
+constexpr const char* kModVersion = "0.4.0-test";
+#else
+constexpr const char* kModVersion = "0.4.0";   // bump with every release tag
+#endif
+// This mod's build: kModVersion, the git describe build.sh passed and the DLL file's hash (session/hsm_build.h). Players
+// compare it.
 std::string ModBuild();
 // allow_build_mismatch in HSMMod.ini (config.h): the host may start a match with other builds in. Set once at start.
 void SetAllowBuildMismatch(bool on);
 bool AllowBuildMismatch();
 
-struct LobbyMember { direct::UserId id = 0; std::string name; bool ready = false; int team = -1; int hostOverride = -1; bool host = false; std::string build; };
+struct LobbyMember { direct::UserId id = 0; std::string card; std::string name; bool ready = false; int team = -1; int hostOverride = -1; bool host = false; std::string build; };
 
 struct LobbyListing {
     direct::UserId id = 0;
@@ -29,8 +36,11 @@ struct LobbyListing {
     int maxPlayers = kMaxLobbyMembers;   // the host's player limit (hsm_max); 8 when the lobby has none
     bool locked = false;  // asks for a password (hsm_lock); the password is never listed
     LobbyPack pack;       // the modpack the host announced (hsm_pack/hsm_packv/hsm_packh); empty: none. Checked live, not here
+    bool banned = false;  // the owner is on the global ban list (session/hsm_global_bans.h): left out of the list
     bool compatible = false;
     std::string reason;   // why it is not joinable, if !compatible
+    std::string mods;     // the lobby's mod rule tag ("mods: Vanilla"), empty for the default (session/hsm_mod_rules.h LobbyRuleTag)
+    std::string modsText; // the mod rules' full sentence for this machine (what to remove), when they turn it away
 };
 
 class Lobby {
@@ -44,6 +54,17 @@ public:
     // stays; false (or unset): leave the lobby, as before 0.7.0-pre5.
     std::function<bool(direct::UserId oldOwner, direct::UserId newOwner)> onOwnerChanged;
     std::function<void(direct::UserId from, const std::string& text)> onChat;   // a lobby chat line (ours too); the text is unchecked
+    LobbyBlock hostBlock;                        // how strict this machine's lobbies are (block_hse=, mod_block=)
+    LobbyBlock CurrentBlock() const;             // this lobby's, from its host; hostBlock outside one
+    ModPreset hostPreset = ModPreset::MapsOnly;  // the rule of this machine's lobbies (mod_rule=)
+    bool InClassesLobby() const;                 // the lobby this machine is in uses classes (mod_rule=classes or unrestricted)
+    bool InUnrestrictedLobby() const;            // ...with no class power budget (mod_rule=unrestricted)
+    std::function<std::string()> myRuleSheet;   // this machine's class settings (hsm_online_rules.h)
+    std::function<std::string(ModPreset, LobbyBlock)> onlineBlock;   // why this machine may not play online in this kind of lobby; empty: it may
+    std::function<void()> onEnterCard;   // a new lobby: the old lobby's cards go
+    void RepublishMyCard();   // the card again, if it changed since it was sent
+    std::function<std::string()> myCard;                                        // this machine's build card (hsm_build_card.h), asked for on entering a lobby
+    std::function<void(const std::string& name, const std::string& card)> onBuildCard;   // a member's card arrived or changed; peer-written
     std::function<void(const std::string& name, bool joined)> onPresence;       // someone else came or went, after we entered
 
     void Tick();                                   // drives Steam init + callback processing
@@ -84,6 +105,15 @@ public:
     void SetMapPick(const std::string& path);
     LobbyPack Pack() const;                         // the host's announced modpack (session/hsm_modpack.h); empty: none
     void SetPack(const LobbyPack& pack);            // host: announce it (empty: none); gameplay/mod_pack.cpp
+    // Host: announce the lobby's mod rule and the host's own cheat mods (gameplay/mod_rules.cpp LobbyTick); only changed
+    // keys are written.
+    void SetModRule(const ModRule& rule, const std::string& hostCheats);
+    // This lobby's rule as its lobby data names it (what a member is held to; the MODS tab). `named`: the host wrote one
+    // (a lobby without hsm_mrule reads as NoRule).
+    ModRule RoomRule(bool* named = nullptr) const;
+    // Any member: this DLL's official-build verdict in member data (kMemberOfficialKey); written when it changes, since
+    // the update check usually answers after the lobby is entered.
+    void SetOfficial(Official o);
     bool Progression() const;                       // the host chose the Progression card (hsm_prog)
     void SetProgression(bool on);
     void SetTeamPick(int team);
@@ -112,6 +142,7 @@ private:
     direct::UserId askLobby_ = 0;         // the lobby the page should ask a password for
     std::string askNote_;                 // why it asks again ("Wrong password")
     int maxPlayers_ = kMaxLobbyMembers;   // the host's choice; hsm_max is what everyone reads
+    std::string officialSent_;   // the kMemberOfficialKey value last written (SetOfficial)
     bool server_ = false;   // Host(type, true): this machine runs role=server
     State state_ = State::Offline;
     direct::UserId lobby_ = 0, owner_ = 0, joining_ = 0;   // joining_: the lobby Join asked for, until its enter

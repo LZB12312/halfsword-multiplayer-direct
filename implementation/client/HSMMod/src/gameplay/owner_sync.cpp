@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace hsm::game {
 using namespace hsm::ue;
@@ -157,13 +158,19 @@ void StandIns::Detach(uint8_t entity) {
 }
 
 bool StandIns::Release(uint8_t entity) {
-    if (!ValidEntity(entity) || !slots_[entity].actor) return false;
+    if (!ValidEntity(entity) || !slots_[entity].actor) return true;
     Actor& a = *slots_[entity].actor;
     const bool bound = a.rig.Bound();
-    if (bound) a.rig.Revive();
+    if (!FighterRig::RestoreDeferredTwoHandPoseFor(a.willie, a.index) || (bound && !a.rig.Revive())) {
+        if (audit_ && !a.releaseBlockedLogged) {
+            HSM_LOG("standins: entity %u release delayed: native two-hand reference restoration pending", entity);
+            a.releaseBlockedLogged = true;
+        }
+        return false;
+    }
     HSM_LOG("standins: entity %u's stand-in %s released (%s)", entity, ObjectName(a.willie).c_str(), bound ? "revived" : "never bound");
     slots_[entity].actor.reset();
-    return bound;
+    return true;
 }
 
 void StandIns::ResetFeed(uint8_t entity) {
@@ -386,8 +393,37 @@ void StandIns::TickOne(Adapter& adapter, uint8_t entity, Slot& s, double nowMs, 
             a.rig.Drive(cmd);
         }
     }
-    if (st.have) a.rig.ApplyGrip(target.grip);   // after Neutralise and Drive: the owner's grips on this stand-in's hands
-    if (st.have) a.rig.ApplyHeld(target, now, nowMs);   // and the owner's seat of the weapon in the right hand
+    if (st.have) {
+        // A pose-owned grip stays at its last target while an external joint holds either arm/weapon. Re-seating or
+        // restoring a guessed native frame here would pull against that joint even though velocity driving yielded.
+        const bool pauseGrip = a.rig.HasTwoHandPose() &&
+            ((held & sync::kTwoHandArmBones) || (heldWeapons_ && (heldWeapons_(entity) & 1u)) || st.info.stale);
+        if (!pauseGrip) a.rig.ApplyGrip(target.grip);
+        const auto twoHand = a.rig.ApplyTwoHandPose(target, now, held, st.info.stale, nowMs);
+        if (!pauseGrip) a.rig.ApplyHeld(target, now, nowMs);   // skips a grip currently owned by the pose path
+        if (audit_) {
+            if ((target.grip.offhand || a.rig.HasTwoHandPose()) && nowMs >= a.nextTwoHandLogMs &&
+                (!a.twoHandReason || std::strcmp(a.twoHandReason, twoHand.reason) != 0)) {
+                HSM_LOG("twohand: e%u mode %s reason %s weapon %s", entity, twoHand.active ? "active" : "suspended", twoHand.reason,
+                        a.rig.HeldWeaponName().c_str());
+                a.twoHandReason = twoHand.reason;
+                a.nextTwoHandLogMs = nowMs + 1000.0;
+            }
+            auto& measurement = s.window.twoHand;
+            measurement.updates += twoHand.updated;
+            measurement.failures += twoHand.failed;
+            std::array<double, 5> errors;
+            if (a.rig.TwoHandErrors(target, now, errors)) {
+                ++measurement.samples;
+                measurement.active += twoHand.active;
+                measurement.suspended += !twoHand.active;
+                for (size_t i = 0; i < errors.size(); ++i) {
+                    measurement.sum[i] += errors[i];
+                    measurement.max[i] = std::max(measurement.max[i], errors[i]);
+                }
+            }
+        }
+    }
     Record(s, st, now, target);
     if (stepObserver_) stepObserver_(entity, st, now, target, a.rig);
 }
@@ -430,6 +466,17 @@ std::string StandIns::HealthLine() {
                       100.0 * double(w.stale) / nt, static_cast<unsigned long long>(w.cuts), static_cast<unsigned long long>(w.snaps),
                       static_cast<unsigned long long>(w.grabNoSnap), static_cast<unsigned long long>(w.placed), static_cast<unsigned long long>(w.struck), poses, rejected);
         out += buf;
+        const auto& motion = w.twoHand;
+        if (audit_ && (motion.samples || motion.updates || motion.failures)) {
+            const double count = motion.samples ? double(motion.samples) : 1.0;
+            HSM_LOG("twohand: e%zu samples %llu active %llu suspended %llu | hand R avg %.1f max %.1f L avg %.1f max %.1f uu | "
+                    "weapon root avg %.1f max %.1f tip avg %.1f max %.1f uu angle avg %.1f max %.1f deg | updates %llu failures %llu",
+                    e, static_cast<unsigned long long>(motion.samples), static_cast<unsigned long long>(motion.active),
+                    static_cast<unsigned long long>(motion.suspended), motion.sum[0] / count, motion.max[0], motion.sum[1] / count,
+                    motion.max[1], motion.sum[2] / count, motion.max[2], motion.sum[3] / count, motion.max[3],
+                    motion.sum[4] / count, motion.max[4], static_cast<unsigned long long>(motion.updates),
+                    static_cast<unsigned long long>(motion.failures));
+        }
         s.window = Window{};
     }
     if (out.empty()) return out;
@@ -438,6 +485,16 @@ std::string StandIns::HealthLine() {
     costSumMs_ = costMaxMs_ = 0;
     ticks_ = 0;
     return out;
+}
+
+void StandIns::SetAudit(bool on) {
+    SetStandInTwoHandAudit(on);
+    if (on == audit_) return;
+    audit_ = on;
+    for (Slot& s : slots_) {
+        s.window.twoHand = Window::TwoHand{};
+        if (s.actor) { s.actor->twoHandReason = nullptr; s.actor->nextTwoHandLogMs = 0; }
+    }
 }
 
 }  // namespace hsm::game

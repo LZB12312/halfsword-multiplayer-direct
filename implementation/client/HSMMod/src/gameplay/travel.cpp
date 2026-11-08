@@ -38,6 +38,8 @@ constexpr const char* kSettings[] = {
     // The level scripts read these too (audit item 39): Lose Condition 3 spawns BP_Fence_Bags in Pit, Yard and Cellar;
     // Day Time (Progression) and Current FreeMode Time (Free Mode) pick the lighting sublevel and ambience.
     "Current Lose Condition", "Day Time", "Current FreeMode Time",
+    // rev 40: Progression co-op keeps one calendar, the host's (session/hsm_career.h): every client's career takes its day too.
+    "Day Count",
 };
 bool PlainType(const std::string& t) {
     return t == "BoolProperty" || t == "ByteProperty" || t == "EnumProperty" || t == "IntProperty" || t == "FloatProperty" || t == "DoubleProperty";

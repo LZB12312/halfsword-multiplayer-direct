@@ -15,9 +15,12 @@
 #include "gameplay/standin_slots.h"
 #include "sync/hsm_held.h"
 #include "sync/hsm_standin.h"
+#include "sync/hsm_two_hand_pose.h"
+#include "sync/hsm_two_hand_update.h"
 #include "ue/engine.h"
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace hsm::game {
@@ -29,6 +32,9 @@ public:
     // Mesh, a pose bone is missing or a per-frame call does not resolve; the rig is then unbound.
     bool Bind(ue::UObject* willie);
     void Unbind();
+    // A replacement Actor may be unbound while an earlier rig still owes this mesh its native grip references.
+    // Hand-off must wait for that deferred restoration too, before native input or simulation resumes.
+    static bool RestoreDeferredTwoHandPoseFor(ue::UObject* willie, int32_t index);
     bool Bound() const { return willie_ != nullptr; }
     ue::UObject* Willie() const { return willie_; }
     bool StillValid() const;                       // the bound Willie and its Mesh are still the live objects they were
@@ -67,7 +73,8 @@ public:
     // and world collision, the held weapons' collision (ModularWeaponBP Turn On Collision), BoneCore and capsule
     // collision, walking, and the pelvis-to-capsule constraints made again where the capsule stands. The session stops
     // blocking the Willie's tick, which takes over from the next frame. Then Unbind: nothing here drives it any more.
-    void Revive();
+    // False leaves the rig bound and neutralised until a saved grip reference can be restored safely.
+    bool Revive();
 
     // Stand-in: writes the owner's grip state into this Willie, so its fingers and animation follow the owner's hands (the
     // left hand of a two-handed grip never holds a Weapon L; the game marks it with L Hand In Offhand Attached). The two
@@ -79,6 +86,19 @@ public:
     // Stand-in: when this weapon has sat in the right hand differently from the owner's for a while (hsm_held.h), the joint
     // is made again at the owner's seat, read from the target pose's hand_r and weapon. Call after ApplyGrip.
     void ApplyHeld(const sync::PoseFrame& target, const sync::FighterNow& now, double nowMs);
+    // Uses the sampled owner's hand/weapon relationship for both existing grip joints. The right hand still carries
+    // the weapon, and the weapon carries the off hand without competing velocity drives. Takeover rebuilds both
+    // existing joints once to capture scaled baseline frames. A suspended grip keeps its last target while locally
+    // grabbed, pinned or stale. Legacy seat/switch changes restore that regenerated baseline first.
+    struct TwoHandResult {
+        const char* reason = "not-two-handed";
+        bool active = false, updated = false, failed = false;
+    };
+    TwoHandResult ApplyTwoHandPose(const sync::PoseFrame& target, const sync::FighterNow& now,
+                                  uint32_t heldBones, bool stale, double nowMs);
+    bool HasTwoHandPose() const;
+    std::string HeldWeaponName() const;   // the class in the main hand, for the log
+    bool TwoHandErrors(const sync::PoseFrame& target, const sync::FighterNow& now, std::array<double, 5>& out) const;
 
 private:
     sync::GripState ReadGrip() const;             // the bound Willie's own grip variables (the owner's side)
@@ -111,6 +131,7 @@ private:
         // never shifted with the body and never made to pass through fighters. Found once they simulate (a sheathed
         // chain is kinematic): the head is the 'Blade*' part, else the part farthest from the handle, driven through
         // headSim/headLinVelAt/headAngVel/headSetLin/headSetAng with no bone name.
+        bool linked = false;                   // a part named Link: a real chain of joined bodies (ScanParts)
         std::vector<ue::UObject*> parts;
         std::vector<int32_t> partIndex;
         ue::UObject* head = nullptr;
@@ -119,7 +140,7 @@ private:
         // this frame
         bool read = false, haveTip = false, driven = false;
         bool wasHeld = false, farFromHand = false;   // read last frame / this frame's read failed for being out of the hand's reach
-        sync::V3 pos{}, basePos{}, tipPos{};
+        sync::V3 pos{}, basePos{}, tipPos{}, scale{1, 1, 1};
         sync::Q4 rot{};
     };
     ue::UObject* FieldAt(int32_t offset) const;   // UObject* field of the bound Willie at a cached offset
@@ -144,6 +165,33 @@ private:
     void NeutraliseFull();
     void SetBodyPolicy(ue::UObject* body);
     void SetChainPolicy(ue::UObject* chain);   // SetBodyPolicy, and through fighters' bodies (a flail's chain)
+    struct TwoHandJoint {
+        ue::UObject* joint = nullptr;
+        int32_t index = -1;
+        ue::UObject* root = nullptr;
+        int32_t rootIndex = -1;
+        ue::UObject* mesh = nullptr;
+        int32_t meshIndex = -1;
+        ue::FName handBone{};
+        uint8_t weaponFrame = 0;
+        sync::GripFrame original, handFrame, current;
+        sync::V3 scale{};
+        ue::PreparedCall components, broken, setFrame, toWorld, rebind;
+        bool changed = false;
+    };
+    bool BindTwoHandJoint(int hand, TwoHandJoint& out, const char*& failure);
+    bool RebaseTwoHandJoint(int hand, TwoHandJoint& joint);
+    static bool TwoHandScaleMatches(TwoHandJoint& joint);
+    bool TwoHandJointMatches(int hand, TwoHandJoint& joint);
+    static sync::GripJointState TwoHandJointState(TwoHandJoint& joint);
+    static bool WriteTwoHandFrame(TwoHandJoint& joint, const sync::GripFrame& frame);
+    static bool RestoreTwoHandJoint(TwoHandJoint& joint);
+    static std::vector<TwoHandJoint>& DeferredTwoHandRestores();
+    static bool RestoreDeferredTwoHandPoses(ue::UObject* mesh, int32_t meshIndex);
+    bool RestoreTwoHandPose();
+    std::array<TwoHandJoint, 2> twoHandJoints_{};
+    std::array<sync::V3, 2> handScale_{};
+    double twoHandRetryMs_ = 0;
 
     ue::UObject* willie_ = nullptr;
     int32_t willieIndex_ = -1;
@@ -162,6 +210,7 @@ private:
     std::array<ue::UObject*, kSheathSlots> slotSeen_{};      // what each slot held at the last Neutralise
     ue::UObject* gripFreed_[2] = {nullptr, nullptr};         // freed per hand since the last full pass (null: free it again)
     ue::UObject* gripLocked_[2] = {nullptr, nullptr};        // locked per hand since the last full pass (null: lock it again)
+    bool poseHeld_[2] = {false, false};                      // the two-hand pose owned this hand's joint at the last Drive
     ue::UObject* gripLoose_[2] = {nullptr, nullptr};         // freed at all (limits never restored), until a weapon change
     int32_t gripLooseIndex_[2] = {-1, -1};
     ue::UObject* gripLogged_[2] = {nullptr, nullptr};
@@ -197,6 +246,8 @@ private:
     bool savedFields_ = false, savedPolicy_ = false;
     uint8_t savedMeshResponse_[2] = {2, 2};                  // WorldStatic, WorldDynamic (ECR_Block)
     uint8_t savedCore_ = 3, savedCapsule_ = 1;               // ECollisionEnabled: BoneCore QueryAndPhysics, the capsule QueryOnly
+    uint8_t savedHidden_[2] = {0xff, 0xff};                  // kHiddenParts, as they were (standin_parts_off); 0xff not read
+    uint8_t savedBox_ = 2;                                   // Box1's BodyCollision response, ECR_Block in the game's template
     bool savedGravity_ = true;
     bool typesLogged_ = false;
     sync::V3 pelvis_{};                                      // this frame's Read
@@ -208,5 +259,11 @@ private:
 
 // standin_grip in HSMMod.ini (config.h): true locks the stand-ins' grip joints, false frees them (pre7). Set once at start.
 void SetStandInGripLock(bool on);
+// standin_parts_off under [net] in HSMMod.ini (config.h): a stand-in's Box1 stops blocking bodies, and its DriverSkeleton and head mesh lose collision.
+void SetStandInPartsOff(bool on);
+void SetStandInTwoHandPose(bool on);
+// standin_two_hand_lock under [net] (config.h): both hand joints lock while the two-hand pose owns them. Set once at start.
+void SetStandInTwoHandLock(bool on);
+void SetStandInTwoHandAudit(bool on);   // Help improve consent; off by default
 
 }  // namespace hsm::game

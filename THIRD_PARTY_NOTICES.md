@@ -65,6 +65,43 @@ Built into `dwmapi.dll`; each keeps its license file in its directory.
 | Library | Directory | License |
 |---|---|---|
 | MinHook | `implementation/client/HSMMod/third_party/minhook` | BSD 2-Clause (`LICENSE.txt`) |
+| miniz 3.1.2 | `implementation/client/HSMMod/third_party/miniz` | MIT (`LICENSE`) |
+
+## UE4SS
+
+`dwmapi.dll` carries an unchanged build of RE-UE4SS (https://github.com/UE4SS-RE/RE-UE4SS),
+`implementation/client/HSMMod/third_party/ue4ss/UE4SS_v3.0.1-1217-g4fb9b615.zip`, and unpacks it next to the game. Its
+`ue4ss/LICENSE` goes with it:
+
+> MIT License
+>
+> Copyright (c) 2022 Narknon
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+> documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+> rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+> persons to whom the Software is furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+> Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+> WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+> COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+> OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+UE4SS.dll is built from these projects, under their own licenses:
+
+| Project | License |
+|---|---|
+| PolyHook 2 (https://github.com/stevemk14ebr/PolyHook_2_0) | MIT |
+| Zydis (https://github.com/zyantific/zydis) | MIT |
+| Dear ImGui (https://github.com/ocornut/imgui) | MIT |
+| {fmt} (https://github.com/fmtlib/fmt) | MIT |
+| patternsleuth (https://github.com/trumank/patternsleuth) | MIT OR Apache-2.0 |
+| GLFW (https://github.com/glfw/glfw) | Zlib |
+| raw_pdb (https://github.com/MolecularMatters/raw_pdb) | BSD 2-Clause |
+| Tracy (https://github.com/wolfpld/tracy) | BSD 3-Clause |
 
 ## Not used
 

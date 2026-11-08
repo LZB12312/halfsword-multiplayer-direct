@@ -20,6 +20,7 @@
 #include "session/hsm_lease.h"
 #include "session/hsm_map_reset.h"
 #include "session/hsm_object.h"
+#include "session/hsm_incoming_guard.h"
 #include "session/hsm_object_attach.h"
 #include "session/hsm_object_event.h"
 #include "session/hsm_object_skip.h"
@@ -27,6 +28,8 @@
 #include "session/hsm_structure.h"
 #include "session/hsm_walk_cache.h"
 #include "sync/hsm_handmatch.h"
+#include "sync/hsm_moving_follow.h"
+#include "sync/hsm_rest_lock.h"
 #include "sync/hsm_soft_correct.h"
 #include "ue/engine.h"
 #include <array>
@@ -69,6 +72,15 @@ public:
         // 0.8.0-pre17 (streamed, teleported, leased, reset); local keeps every machine's copy to itself; soft streams it from the
         // host as one snapshot and steers the receivers' copies (sync/hsm_soft_correct.h).
         StructureMode syncStructures = StructureMode::Soft;
+        bool structureFollowBroken = true;   // structure_follow_broken: a late-found copy broken here alone follows the host's
+        bool structureShareHeld = true;      // structure_share_held_breaks: a break not sent at once waits and goes (NextBreakStep)
+        bool structureFollowMoving = true;   // structure_follow_moving: a late-found soft copy follows its streamer's copy while it moves
+        // prop_census_snapshot (default on): a client records where each free physics prop lies early in a fight level, and the
+        // census matches it on that place (ObjectSync::Tick). Off: on the place at the first match, as 0.8.0-pre34.
+        bool censusSnapshot = true;
+        bool structureBridgesFollow = true;   // structure_bridges_follow: rest placing and moving follow take census structures too
+        bool structureGameBreak = true;       // structure_game_break: a barrel plank off elsewhere comes off here by the game's own code
+        bool structureRestLock = true;       // structure_rest_lock: a soft structure at rest is placed once to the host's pose, then held still
     };
     void Start(Adapter& adapter, StandIns& standIns, Env env);
     void Stop();                                                     // everything, the drop sequences too
@@ -147,7 +159,7 @@ public:
 
 private:
     struct RootCalls {
-        ue::PreparedCall toWorld, linVel, angVel, setAng, setLin, simulating;
+        ue::PreparedCall toWorld, linVel, angVel, setAng, setLin, simulating, sleep;
     };
     struct BodyRef {                       // one body of an object: a movable primitive component of its actor
         ue::UObject* comp = nullptr;
@@ -155,6 +167,9 @@ private:
         bool dirty = false;                // a fresh state from the streamer was applied to the view since the last drive
         double rxMs = 0;                   // when the state in the view for this body arrived here (SteadyNowMs); soft structures extrapolate from it
         double steerMs = -1e18;            // when this body was last steered toward a state (soft structures)
+        bool placed = false;               // PlaceBroken: placed at least once
+        sync::V3 placedAt;                 // PlaceBroken: the host's place it was last put at
+        sync::V3 restAt;   // the host body when the rest lock took hold (sync/hsm_rest_lock.h)
         bool detached = false;             // left the object (a Detached event): it is its own object now
         bool gone = false;                 // its component was destroyed here (logged once, never streamed again)
         uint64_t readTick = 0;             // the tick `read` was taken in
@@ -202,6 +217,19 @@ private:
         std::vector<StartBody> start;      // a level prop: each body's transform as the level began (map reset)
         sync::StuckTimer stuck;            // a soft structure: how long some body has been far from the host's pose
         double lastSnapMs = -1e18;         // a soft structure: when all its bodies were last placed at once
+        double lastHitMs = -1e18;          // a soft structure: when a fighter or a weapon last touched it here
+        double lastTouchMs = -1e18;        // a soft structure: when a fighter, a weapon or another prop last touched it here
+        double restPlacedMs = -1e18;       // a soft structure: when the rest lock last placed it (ClassifyLocalBreak)
+        sync::RestLock rest;               // a soft structure at rest: placed once to the host's pose, then held still
+        bool found = false;                // a level actor the host's walk found after the census, announced under a spawned id
+        bool shapeDiffers = false;         // found: this copy has another body count than the host's; never driven here
+        uint64_t localBroken = 0;          // own-copy structure: joints that broke here only and were not passed on (a bit each)
+        uint64_t bodyOffHere = 0;          // own-copy structure: bodies that came off here only and were not passed on (a bit each)
+        uint64_t heldJoints = 0;           // own-copy structure: joints broken here that wait to be passed on (NextBreakStep)
+        uint64_t heldBodies = 0;           // own-copy structure: bodies off here that wait to be passed on; attachedMask keeps their bits
+        sync::MoveFollow follow;           // soft structure: whether the streamer's copy moves (sync/hsm_moving_follow.h)
+        bool following = false;            // soft structure: placed from the streamer's moving copy at its last state (SoftDrive)
+        double followSinceMs = 0;          // when it began to follow
     };
     using Hands = hands::Hands;
     using StandInHand = hands::StandInHand;
@@ -241,6 +269,11 @@ private:
                  skippedClasses = 0, attachHeld = 0, letGoSent = 0, letGoApplied = 0, adoptKnown = 0, adoptBound = 0, adoptExpired = 0,
                  simAsked = 0, simCached = 0, simCapped = 0, structStatesSkipped = 0, structResetSkipped = 0,
                  structCorrected = 0, structSnapped = 0;
+        uint64_t restLocked = 0, restPlaced = 0, restHeld = 0;   // 0.8.0-pre35: the rest lock (sync/hsm_rest_lock.h)
+        uint64_t structNotSimulating = 0, structRestKept = 0, structDiverged = 0, structPlaced = 0, shapeMismatch = 0,
+                 jointsReported = 0, jointsKeptLocal = 0, jointReportsDropped = 0, breaksHeld = 0;   // 0.8.0-pre29 breakables
+        uint64_t structFollowed = 0, followStarts = 0, breaksWhileFollowing = 0;   // 0.8.0-pre35 moving follow
+        uint64_t gameBreaks = 0;   // planks that came off by the barrel's own code
         uint64_t lateRecovered = 0, lateAliased = 0, lateExpired = 0, dropRestored = 0;   // 0.8.0-pre18 (weapon_hands.cpp)
         uint64_t flagSkipped = 0;   // #612 (weapon_hands.cpp): the CTF flag left alone by stand-in hands
     };
@@ -256,14 +289,35 @@ private:
     // A constraint-built level prop (session/hsm_structure.h), by mode. Kept: sync_structures=local, never streamed, driven,
     // claimed or reset here. Soft: the host streams it, a receiver steers it. OwnCopy: either, nobody leases, claims a blow on or
     // resets it.
-    bool Kept(uint64_t id, const Prop& p) const { return StructureLocal(env_.syncStructures, id, p.sub, p.bodies.size(), p.constraints.size()); }
-    bool Soft(uint64_t id, const Prop& p) const { return StructureSoft(env_.syncStructures, id, p.sub, p.bodies.size(), p.constraints.size()); }
-    bool OwnCopy(uint64_t id, const Prop& p) const { return StructureOwnCopy(env_.syncStructures, id, p.sub, p.bodies.size(), p.constraints.size()); }
+    bool Kept(uint64_t id, const Prop& p) const { return StructureLocal(env_.syncStructures, id, p.sub, p.bodies.size(), p.constraints.size(), p.found); }
+    bool Soft(uint64_t id, const Prop& p) const { return StructureSoft(env_.syncStructures, id, p.sub, p.bodies.size(), p.constraints.size(), p.found); }
+    bool OwnCopy(uint64_t id, const Prop& p) const { return StructureOwnCopy(env_.syncStructures, id, p.sub, p.bodies.size(), p.constraints.size(), p.found); }
+    // A level actor found after the census (HostSpawn, Rekey, BindAnnounced, BindAdopted): marked so the structure rule applies to
+    // it, its body count checked against the host's on a client (hostBodies 0: not known), logged once. sync_structures=full: nothing.
+    void MarkFound(uint64_t id, Prop& p, size_t hostBodies, size_t localBodies);
     void LogStructureBreak(const Prop& p, size_t constraint);        // once per structure: its first joint broke
     void LogStructures();                                            // once per level: how many are kept local / soft (shatter_sync.cpp)
     void LogStructureSnap(const Prop& p, double worstCm);            // a soft structure was placed at once (rate limited)
+    void LogFollow(const Prop& p, bool started, double durationMs);  // a copy starts or stops following its streamer's moving copy (rate limited)
+    void SetFollowing(Prop& p, bool on, double nowMs);               // a copy's follow mode: counted and logged when it changes
+    void LogRestLock(const Prop& p, double errCm, bool placed);      // a soft structure at rest was placed or held still (rate limited)
+    void LogStructureJoints(const Prop& p);                          // a found structure's joints and bodies, as bound (rate limited)
+    bool GameBreakHere(uint64_t id, Prop& p, size_t body);           // a barrel's plank comes off here by the barrel's own code
+    void LogLocalBreak(const Prop& p, const char* what, size_t index, LocalBreak share, bool afterHold = false);   // a break in this copy of another's structure
+    bool StructLogBudget();                                          // the breakables lines' shared per-minute budget
+    double structLogWindowMs_ = -1e18;
+    int structLogCount_ = 0;
+    std::array<JointReportBudget, kMaxFighters> jointBudget_{};      // host: joint breaks taken from each machine
+    JointReportBudget sendBudget_{kJointSendBurst};                  // a client: breaks it may still pass on (LocalBreak::OverBudget)
+    void HoldBreakHere(const Prop& p, const char* what, size_t index, LocalBreak why);   // log and count a break that waits to be passed on
+    void KeepBreakHere(const Prop& p, const char* what, size_t index, LocalBreak why);   // log and count a break that is not passed on
+    void AdoptSubId(const ue::UObject* comp, uint64_t canonical);    // a body two machines saw come off: the host's id is the one
     double snapLogWindowMs_ = -1e18;                                 // LogStructureSnap's minute
     int snapLogCount_ = 0;
+    double followLogWindowMs_ = -1e18;                               // LogFollow's minute
+    int followLogCount_ = 0;
+    double restLogWindowMs_ = -1e18;                                 // LogRestLock's minute
+    int restLogCount_ = 0;
     void DetectDrops(double nowMs, const std::vector<std::pair<uint8_t, ue::UObject*>>& owned);
     void ResolvePending(double nowMs);
     void DeadlineRelease(uint64_t id, uint8_t owner, int hand, ue::UObject* standIn, ue::UObject* copy);
@@ -299,6 +353,7 @@ private:
     void StreamLevel(const std::vector<uint64_t>& due, uint64_t& cursor, size_t& budget, bool countDeferred, uint8_t me, double nowMs);
     bool Drive(uint64_t id, Prop& p);                                // every body with a fresh state from the streamer
     bool SoftDrive(uint64_t id, Prop& p, double nowMs);              // soft structure: steer every body with a fresh state (object_sync.cpp)
+    bool PlaceBroken(uint64_t id, Prop& p, double nowMs);            // a late-found prop that broke here alone (object_sync.cpp)
     bool DriveBody(Prop& p, size_t body, const BodyStateMsg& s);
     bool BuildBodies(Prop& p, bool multi);                           // BodyIndex over the actor's movable primitives
     bool LooseParts(ue::UObject* actor, ue::UObject* root);          // a simulating movable primitive besides the root (a flail's chain)
@@ -319,7 +374,7 @@ private:
     void ClientAnnounce(const ObjectAnnounceMsg& m, double nowMs);
     void BindAnnounced(std::vector<LevelActor>& free, double nowMs); // match pending announces to actors in free
     void Bound(uint64_t id, double nowMs);                           // an object got its actor here: queued events replay
-    bool Rekey(uint64_t provisional, uint64_t canonical);
+    bool Rekey(uint64_t provisional, uint64_t canonical, uint8_t hostBodies);
     uint64_t MintSpawned();
     void SendEvent(const ObjectEventMsg& m);
     void PollEvents(double nowMs);
@@ -389,6 +444,10 @@ private:
     double levelSinceMs_ = -1;
     double censusMs_ = 0;
     std::set<uint16_t> censusIndex_;
+    // Client: where each free physics prop lay kCensusSnapMs into the level (taken once). Keyed by the actor and its object-array
+    // slot, as the host's book is: a slot is reused once its actor is gone, and a reused slot must not bring the old place.
+    std::map<LevelKey, CensusCandidate> censusSnap_;
+    bool censusSnapDone_ = false;
     uint64_t movingCursor_ = 0, idleCursor_ = 0;                     // StreamLevel's round robin
     // Host: the book that names its props, the census as sent, and its sequence (kept across levels: a client may hold
     // the previous level's census until its own level change clears it).
@@ -419,10 +478,13 @@ private:
     double adoptUntilMs_ = 0;
     // Spawned objects (object_events.cpp). reconciler_: host only. minter_: this machine's provisional ids (client).
     ObjectReconciler reconciler_;
+    SpawnGate spawnGate_;                    // what each player may make appear (session/hsm_incoming_guard.h)
+    uint64_t spawnRefused_ = 0;
     SpawnedIdMinter minter_;
     GhostTable ghosts_;
     std::map<uint64_t, Announced> announced_;                        // canonical announces with no actor here yet
     std::unordered_map<const ue::UObject*, double> refused_;         // actors the host would not name -> when to try again
+    bool rekeyRefusedLogged_ = false;                                // Rekey's refusal of a proposal is logged once per session
     std::unordered_map<const ue::UObject*, double> touched_;         // untracked actors a fighter simulated here touched
     std::set<const ue::UObject*> leftBefore_;                        // unnamed, simulating actors the previous re-check saw
     std::set<uint64_t> detached_;                                    // host: ids of detached bodies (valid spawned ids)

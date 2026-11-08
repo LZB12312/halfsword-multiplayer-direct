@@ -468,13 +468,80 @@ bool Adapter::ExportPassportOf(UObject* willie, std::vector<uint8_t>& out) {
     return willie && SavePassportFrom(willie, FindProperty(ClassOf(willie), "Character Passport"), out);
 }
 
-// Copies one passport-typed property of `owner` into a fresh SG_GameProgress_C and serializes it.
-bool Adapter::SavePassportFrom(UObject* owner, FProperty* src, std::vector<uint8_t>& out) {
+UObject* Adapter::NewSaveObject() {
     UClass* sgClass = FindClass(kSaveGameClass);
-    if (!sgClass || !src) return false;
+    if (!sgClass || !statics_) return nullptr;
     Call c(statics_, "CreateSaveGameObject");
     c.set<UClass*>("SaveGameClass", sgClass);
-    UObject* sg = c.invoke() ? c.get<UObject*>("ReturnValue") : nullptr;
+    return c.invoke() ? c.get<UObject*>("ReturnValue") : nullptr;
+}
+
+// ------------------------------------------------------------------ a Progression fight's end on the career (session/hsm_career.h)
+
+bool Adapter::GetCareerInt(const char* field, int64_t& out) {
+    UObject* gi = GameInstance();
+    FProperty* p = gi ? FindProperty(ClassOf(gi), field) : nullptr;
+    if (!p) return false;
+    const uint8_t* at = reinterpret_cast<const uint8_t*>(gi) + PropertyOffset(p);
+    if (PropertySize(p) == 8) { std::memcpy(&out, at, 8); return true; }
+    if (PropertySize(p) == 4) { int32_t v = 0; std::memcpy(&v, at, 4); out = v; return true; }
+    return false;
+}
+
+bool Adapter::SetCareerInt(const char* field, int64_t value) {
+    UObject* gi = GameInstance();
+    FProperty* p = gi ? FindProperty(ClassOf(gi), field) : nullptr;
+    if (!p) return false;
+    uint8_t* at = reinterpret_cast<uint8_t*>(gi) + PropertyOffset(p);
+    if (PropertySize(p) == 8) { std::memcpy(at, &value, 8); return true; }
+    if (PropertySize(p) == 4) { const int32_t v = int32_t(std::clamp<int64_t>(value, INT32_MIN, INT32_MAX)); std::memcpy(at, &v, 4); return true; }
+    return false;
+}
+
+int Adapter::CareerGameMode() { UObject* gi = GameInstance(); const uint8_t* m = gi ? Field<uint8_t>(gi, "Current Game Mode enum") : nullptr; return m ? *m : -1; }
+int Adapter::CareerCombatMode() { UObject* gi = GameInstance(); const uint8_t* m = gi ? Field<uint8_t>(gi, "Current Combat Mode") : nullptr; return m ? *m : -1; }
+
+bool Adapter::ReadCareerRank(hsm::CareerRank& out) {
+    UObject* gi = GameInstance();
+    const uint8_t* tier = gi ? Field<uint8_t>(gi, "Player Tier") : nullptr;
+    const uint8_t* perm = gi ? Field<uint8_t>(gi, "Permanent Tier") : nullptr;
+    if (!tier || !perm || !GetCareerInt("Player Funds", out.funds) || !GetCareerInt("Reputation on Rank", out.reputation)) return false;
+    out.tier = *tier; out.permanentTier = *perm;
+    return true;
+}
+
+bool Adapter::WriteCareerRank(const hsm::CareerChange& change) {
+    UObject* gi = GameInstance();
+    uint8_t* tier = gi ? Field<uint8_t>(gi, "Player Tier") : nullptr;
+    uint8_t* perm = gi ? Field<uint8_t>(gi, "Permanent Tier") : nullptr;
+    if (!tier || !perm) return false;
+    bool ok = SetCareerInt("Player Funds", change.after.funds) && SetCareerInt("Reputation on Rank", change.after.reputation);
+    *tier = uint8_t(change.after.tier); *perm = uint8_t(change.after.permanentTier);
+    if (change.tourneyWon) {
+        // The stock Tourney win (decomp UI_NextFIght.cpp:146-153): the nemeses are settled, and the Tavern renews its people,
+        // its fight board (the next rank's) and the merchant's stock. Their own Save Game calls stay blocked by the save guard.
+        if (FProperty* nem = FindProperty(ClassOf(gi), "Nemesis Opponents")) ClearPropertyValue(nem, reinterpret_cast<uint8_t*>(gi) + PropertyOffset(nem));
+        else ok = false;
+        auto run = [&ok](Call& c, const char* what) { if (!c.valid() || !c.invoke()) { HSM_LOG("adapter: the Tourney's %s could not be called", what); ok = false; } };
+        Call npcs(gi, "Refresh NPCs Event"); run(npcs, "Refresh NPCs Event");
+        Call board(gi, "Event Generate Random Combat Events"); run(board, "Event Generate Random Combat Events");
+        Call merchant(gi, "Renew Merchant"); run(merchant, "Renew Merchant");
+    }
+    return ok;
+}
+
+bool Adapter::SkipTimeStep() {
+    UObject* gi = GameInstance();
+    if (!gi) return false;
+    Call c(gi, "Skip Time Event");   // GI_Settings.cpp:2013: at no price it always moves; after Night comes a new day
+    c.setReal("Price", 0.0);
+    return c.valid() && c.invoke();
+}
+
+// Copies one passport-typed property of `owner` into a fresh SG_GameProgress_C and serializes it.
+bool Adapter::SavePassportFrom(UObject* owner, FProperty* src, std::vector<uint8_t>& out) {
+    if (!src) return false;
+    UObject* sg = NewSaveObject();
     FProperty* dst = sg ? FindProperty(ClassOf(sg), kSavePassport) : nullptr;
     if (!dst || PropertySize(src) != PropertySize(dst) || PropertyType(src) != PropertyType(dst)) {
         HSM_LOG("adapter: passport properties missing or mismatched (%s)", PropertyName(src).c_str()); return false;
@@ -589,6 +656,168 @@ void Adapter::ApplyBuild(UObject* willie, FProperty* passport, bool bot, double 
         HSM_LOG("adapter: %s build kept (Weight %.3f, mass x%.2f, grip x%.2f)", name.c_str(), own, MassScaleFor(want), GripScaleFor(want));
 }
 
+// A weapon or foot's Kick Power: what the game multiplies a hit's push by (Willie_BP Deal Complex Damage). The piece a hand lets go of
+// gets the game's value back, because anyone can pick it up next.
+static void ApplyPiecePower(UObject* now, double multiplier, Adapter::ClassPiece& piece) {
+    if (piece.what != now) {
+        if (piece.what && ObjectAt(piece.index) == piece.what) if (double* p = Field<double>(piece.what, "Kick Power")) if (piece.power.seen) *p = piece.power.base;
+        piece = Adapter::ClassPiece{};
+        piece.what = now; piece.index = now ? ObjectIndex(now) : -1;
+    }
+    if (!now) return;
+    if (double* p = Field<double>(now, "Kick Power")) *p = piece.power.Next(*p, multiplier);
+}
+
+// The game sets this from the Muscle Rate at a spawn and at a character reset, and nothing reads it back, so it changes the skin and no physics.
+bool Adapter::SetMusclesLook(UObject* willie, double value) {
+    UObject* const* const material = willie ? Field<UObject*>(willie, "Body Material") : nullptr;
+    if (!material || !*material) return false;
+    return Call(*material, "SetScalarParameterValue").setName("ParameterName", MakeName("Muscles")).set<float>("Value", float(value)).invoke();
+}
+
+void Adapter::ClearPain(UObject* willie) {
+    static constexpr const char* kPainDoubleFields[] = {"Pain", "Pain Upper Body", "Pain Lower Body", "Pain Neck", "Pain Head", "Pain Leg L", "Pain Leg R", "Pain Arm L", "Pain Arm R"};
+    if (!willie) return;
+    for (const char* name : kPainDoubleFields) if (double* p = Field<double>(willie, name)) *p = 0.0;
+    SetBool(willie, "Pain Shock", false);
+}
+
+// Strength and Muscle on this player's own fighter, from the lobby's build or their own. The same steps as the forced build (ApplyBuildLive).
+void Adapter::ApplyClassWeight(UObject* willie, double base, const ClassSheet& sheet, ClassTracks& tracks) {
+    double* rate = willie ? Field<double>(willie, "Muscle Rate") : nullptr;
+    double* mass = willie ? Field<double>(willie, "Mass Scale (Set in BP)") : nullptr;
+    if (!rate) return;
+    const double want = ClassWeight(base, sheet), rateNow = ClassHoldRate(want, sheet, tracks.holding), newMass = ClassMassScale(want, sheet);
+    const double oldMass = mass ? *mass : 0.0;
+    // The game sets this field itself about 0.2 s into a fighter's life, along with every bone, and only from the Muscle Rate. So it's checked every
+    // time: a field that's been reset gets the class's Weight back, on the bones it was just set on.
+    const bool massOk = !mass || !std::isfinite(oldMass) || oldMass <= 0.0 || oldMass == newMass;
+    if (tracks.weightSet == want && massOk && (*rate == want || *rate == tracks.rateWritten)) {
+        if (*rate != rateNow) HSM_LOG("classes: grappler Muscle Rate %.2f (%.2f when not holding)", rateNow, want);
+        *rate = tracks.rateWritten = rateNow;
+        return;
+    }
+    *rate = want;
+    tracks.weightSet = want;
+    int bodies = 0;
+    UObject* mesh = MeshOf(willie);
+    if (mass && std::isfinite(oldMass) && oldMass > 0.0 && oldMass != newMass && mesh && ResolveBones(mesh)) {
+        const double k = newMass / oldMass;
+        for (const FName& bone : bones_) {
+            Call g(mesh, "GetMassScale");
+            if (!g.valid() || !g.setName("BoneName", bone).invoke()) continue;
+            const float s = g.get<float>("ReturnValue");
+            if (!std::isfinite(s) || s <= 0.f) continue;
+            Call set(mesh, "SetMassScale");
+            if (set.valid() && set.setName("BoneName", bone).set<float>("InMassScale", float(s * k)).invoke()) ++bodies;
+        }
+        *mass = newMass;
+        tracks.massCheckIn = 30;
+    }
+    *rate = tracks.rateWritten = rateNow;
+    HSM_LOG("classes: Muscle Rate %.2f on %s (base %.2f; class weight x%.2f, mass scale %.3f on %d bodies, grip x%.2f)", want, ObjectName(willie).c_str(), base, sheet.mass, newMass, bodies, GripScaleFor(want));
+}
+
+UObject* Adapter::HeldFighterMesh(UObject* willie) {
+    if (!willie) return nullptr;
+    for (const char* hand : {"R", "L"}) {
+        bool grabbed = false;
+        if (!GetBool(willie, std::string("Grabbed ") + hand, grabbed) || !grabbed) continue;
+        UObject** const comp = Field<UObject*>(willie, std::string("Grab Component ") + hand);
+        UObject* const owner = comp && *comp ? OuterOf(*comp) : nullptr;
+        if (owner && owner != willie && Field<double>(owner, "Mass Scale (Set in BP)") && MeshOf(owner) == *comp) return *comp;
+    }
+    return nullptr;
+}
+
+// Grappler under host physics: what's held counts as a plain body with no armour while it's held, and every bone goes back to what it was on letting go.
+void Adapter::LightenHeld(UObject* target, ClassTracks& tracks) {
+    if (target == tracks.heldMesh) return;
+    if (tracks.heldMesh && StillValid(tracks.heldMesh, tracks.heldIndex)) {
+        for (const auto& [bone, scale] : tracks.heldScales) Call(tracks.heldMesh, "SetMassScale").setName("BoneName", bone).set<float>("InMassScale", scale).invoke();
+        HSM_LOG("classes: grappler let go: %zu bodies back to their weight", tracks.heldScales.size());
+    }
+    tracks.heldMesh = nullptr; tracks.heldScales.clear();
+    if (!target || !ResolveBones(target)) return;
+    tracks.heldMesh = target; tracks.heldIndex = ObjectIndex(target);
+    const float plain = float(MassScaleFor(kDefaultWeight));
+    for (const FName& bone : bones_) {
+        Call g(target, "GetMassScale");
+        if (!g.valid() || !g.setName("BoneName", bone).invoke()) continue;
+        const float s = g.get<float>("ReturnValue");
+        if (!std::isfinite(s) || s <= 0.f) continue;
+        tracks.heldScales.emplace_back(bone, s);
+        Call(target, "SetMassScale").setName("BoneName", bone).set<float>("InMassScale", plain).invoke();
+    }
+    HSM_LOG("classes: grappler holding %s: %zu bodies at a plain fighter's weight", ObjectName(target).c_str(), tracks.heldScales.size());
+}
+
+void Adapter::ReadLiveStats(UObject* willie, double& run, double& strength) {
+    run = strength = 0;
+    if (!willie) return;
+    if (double* const r = Field<double>(willie, "Running Speed Rate")) run = *r;
+    if (double* const s = Field<double>(willie, "Muscle Power")) strength = *s;
+}
+
+void Adapter::ApplyClassStats(UObject* willie, const ClassSheet& sheet, ClassTracks& tracks) {
+    if (!willie) return;
+    if (tracks.who != willie) {
+        // A new fighter. The hands' weapons outlive the last one, so they go back first.
+        ApplyPiecePower(nullptr, 1.0, tracks.handR); ApplyPiecePower(nullptr, 1.0, tracks.handL);
+        LightenHeld(nullptr, tracks);
+        const bool logged = tracks.loggedMissing, lighten = tracks.lightenHeld;
+        tracks = ClassTracks{};
+        tracks.who = willie; tracks.loggedMissing = logged; tracks.lightenHeld = lighten;
+    }
+    UObject** const footR = Field<UObject*>(willie, "Foot R Weapon");
+    UObject** const footL = Field<UObject*>(willie, "Foot L Weapon");
+    UObject** const handR = Field<UObject*>(willie, "Weapon R");
+    UObject** const handL = Field<UObject*>(willie, "Weapon L");
+    ApplyPiecePower(footR ? *footR : nullptr, sheet.kick, tracks.footR);
+    ApplyPiecePower(footL ? *footL : nullptr, sheet.kick, tracks.footL);
+    ApplyPiecePower(handR ? *handR : nullptr, sheet.knockback, tracks.handR);
+    ApplyPiecePower(handL ? *handL : nullptr, sheet.knockback, tracks.handL);
+    UObject* const held = sheet.grappler ? HeldFighterMesh(willie) : nullptr;
+    tracks.holding = held != nullptr;
+    if (tracks.lightenHeld || tracks.heldMesh) LightenHeld(tracks.lightenHeld ? held : nullptr, tracks);
+    double* const gameMass = Field<double>(willie, "Mass Scale (Set in BP)");
+    // Three seconds on, what it came to: if this reads like a plain fighter, something undid the class's weight.
+    if (tracks.massCheckIn > 0 && --tracks.massCheckIn == 0) {
+        UObject* const mesh = MeshOf(willie);
+        if (mesh && ResolveBones(mesh)) {
+            Call g(mesh, "GetMassScale");
+            if (g.valid() && g.setName("BoneName", bones_[0]).invoke()) HSM_LOG("classes: weight check: %s scale %.3f (class x%.2f, game's %.3f)", boneNames_[0].c_str(), g.get<float>("ReturnValue"), sheet.mass, gameMass ? *gameMass : 0.0);
+        }
+    }
+    double* const run = Field<double>(willie, "Running Speed Rate");
+    float* const walk = Field<float>(willie, "Walk Speed Rate Run");
+    double* const strength = Field<double>(willie, "Muscle Power");
+    double* const gripR = Field<double>(willie, "R Grab Force Limit");
+    double* const gripL = Field<double>(willie, "L Grab Force Limit");
+    double* const hands = Field<double>(willie, "Hands Rigidity (Gauntlets)");
+    if (!tracks.loggedMissing && !(run && walk && strength && gripR && gripL && hands)) {
+        tracks.loggedMissing = true;
+        HSM_LOG("classes: fields missing on %s: run %d walk %d strength %d grip %d/%d hands %d", ObjectName(willie).c_str(), run != nullptr, walk != nullptr, strength != nullptr, gripR != nullptr, gripL != nullptr, hands != nullptr);
+    }
+    if (run) *run = tracks.run.Next(*run, sheet.run);
+    if (walk) *walk = float(tracks.walk.Next(*walk, sheet.walk));
+    if (strength) *strength = tracks.strength.Next(*strength, 1.0);   // only read: for the base stat check. It drives a severed body and nothing else
+    if (gripR) *gripR = tracks.gripR.Next(*gripR, sheet.grip);
+    if (gripL) *gripL = tracks.gripL.Next(*gripL, sheet.grip);
+    if (hands) *hands = tracks.hands.Next(*hands, sheet.hands);
+    if (double* const regen = Field<double>(willie, "Regen Rate")) *regen = tracks.regen.Next(*regen, sheet.recovery);
+    if (double* const stamina = Field<double>(willie, "Stamina")) {
+        const double* const health = Field<double>(willie, "Health");
+        if (tracks.staminaLast >= 0.0) *stamina = ClassStaminaNext(tracks.staminaLast, *stamina, ClassEnduranceNow(sheet, health ? *health : 100.0));
+        tracks.staminaLast = *stamina;
+    }
+    if (sheet.quickKicks) SetBool(willie, "Kick Cooldown", false);
+    // Bone Snapping is what the game multiplies a hit by before asking whether a bone gives (Willie_BP Get Damage), so sturdier bones
+    // divide it. Block Spine Breaking is what its dislocation check looks at for every limb.
+    if (double* const snap = Field<double>(willie, "Bone Snapping")) *snap = tracks.bones.Next(*snap, 1.0 / sheet.bones);
+    if (sheet.noDislocation) SetBool(willie, "Block Spine Breaking", true);
+}
+
 // The forced build on a live fighter: the game read the save's Weight at BeginPlay (Muscle Rate, UserConstructionScript)
 // and set the mass scale from it 0.2 s later (Willie_BP: SetAllMassScale(1..1.25 over the Muscle Rate)); worn armour and
 // held weapons then added their weight per bone, scaled by that same "Mass Scale (Set in BP)" (Add and Remove Weapon
@@ -688,6 +917,23 @@ UObject* Adapter::SpawnFighter(const SpawnOptions& o) {
         heightLogged_ = true;
         HSM_LOG("adapter: spawned a fighter at height %.2f (scale %.3f)", height, sc);
     }
+    // The career's body as the start body, as the stock spawner sets it (BP_SpawnerPoint_Willies.cpp:144); the fighter's
+    // BeginPlay copies it onto its limbs and health (Willie_BP.cpp:14702-14710), after FinishSpawningActor below.
+    if (o.careerBody) {
+        UObject* gi = GameInstance();
+        FProperty* src = gi ? FindProperty(ClassOf(gi), "Player Body Condition") : nullptr;
+        FProperty* dst = FindProperty(ClassOf(w), "Start Body Condition");
+        if (src && dst && PropertySize(src) == PropertySize(dst) && PropertyType(src) == PropertyType(dst))
+            CopyPropertyValue(dst, reinterpret_cast<uint8_t*>(w) + PropertyOffset(dst), reinterpret_cast<const uint8_t*>(gi) + PropertyOffset(src));
+        else HSM_LOG("adapter: the career's body could not be carried into the fighter (fields missing or mismatched); it starts whole");
+    }
+    // A career Brawl or Blossfechten fight: the stock spawner's kit flags, on every fighter as the stock spawner does
+    // (session/hsm_career.h CareerSpawnKitFor); the fighter's BeginPlay leaves the weapons off by them.
+    const hsm::CareerSpawnKit kit = hsm::CareerSpawnKitFor(FreeModeActive(), CareerCombatMode());
+    if ((kit.pants && !SetBool(w, "Spawn in Pants", true)) || (kit.blossfechten && !SetBool(w, "Blossfechten Gear", true)))
+        HSM_LOG("adapter: the fight's %s kit could not be set on the fighter (field missing)", kit.pants ? "Brawl" : "Blossfechten");
+    else if (kit.pants || kit.blossfechten)   // a few fighters a fight: each one is the tester's evidence
+        HSM_LOG("adapter: a career %s: this fighter starts %s", kit.pants ? "Brawl" : "Blossfechten", kit.pants ? "in pants, no weapons" : "in training gear");
     Call finish(statics_, "FinishSpawningActor");
     finish.set<UObject*>("Actor", w).set("SpawnTransform", t).set<uint8_t>("TransformScaleMethod", 1);
     UObject* done = finish.invoke() ? finish.get<UObject*>("ReturnValue") : nullptr;
@@ -1535,6 +1781,23 @@ std::string EventName(const uint8_t* element, const std::vector<FProperty*>& mem
 }
 }  // namespace
 
+int Adapter::CareerArrayNum(const char* field) {
+    UObject* gi = GameInstance();
+    FProperty* p = gi ? FindProperty(ClassOf(gi), field) : nullptr;
+    if (!p || PropertyType(p) != "ArrayProperty" || PropertySize(p) != int32_t(sizeof(ScriptArray))) return -1;
+    const ScriptArray* a = reinterpret_cast<const ScriptArray*>(reinterpret_cast<const uint8_t*>(gi) + PropertyOffset(p));
+    return ReadableMem(a, sizeof *a) && a->num >= 0 ? a->num : -1;
+}
+
+bool Adapter::GenerateTourneyChampion(int tier) {
+    const std::vector<UObject*> managers = FindInstances(kGameManagerClass);
+    if (managers.empty()) return false;
+    Call c(managers.front(), "Generate Random Characters");
+    c.set<int32_t>("Amount of Characters to Spawn", 1).setReal("Equipment Budget", hsm::TourneyChampionBudget(tier))
+     .set<bool>("Champion", true).set<uint8_t>("Tier", uint8_t(std::clamp(tier, 0, hsm::kTopRank)));
+    return c.valid() && c.invoke();
+}
+
 std::vector<std::string> Adapter::OfferedFights(bool freshVisit) {
     std::vector<std::string> out;
     UObject* gi = GameInstance();
@@ -2051,6 +2314,20 @@ bool Adapter::FlagCarryOnBack(UObject* carrier, UObject* flag) {
     return FlagAttachedTo(carrier, flag);
 }
 
+int Adapter::DropHeldWeapons(UObject* willie) {
+    int dropped = 0;
+    if (!willie) return 0;
+    for (int h = 0; h < 2; ++h) {
+        UObject** held = Field<UObject*>(willie, h == 0 ? "Weapon R" : "Weapon L");
+        uint8_t* grip = Field<uint8_t>(willie, h == 0 ? "R_GripType_Current" : "L_GripType_Current");
+        if (!held || !*held || IsBodyWeapon(*held) || !grip || *grip == 0) continue;
+        Call c(willie, h == 0 ? "Set Up Right Hand Weapon" : "Set Up Left Hand Weapon");
+        c.set<bool>(h == 0 ? "Dropped With no Damage" : "Dropped with No Damage", true);
+        if (c.invoke()) ++dropped;
+    }
+    return dropped;
+}
+
 int Adapter::DropLoot(UObject* willie, uint32_t seed, int& weapons) {
     weapons = 0;
     if (!willie) return 0;
@@ -2367,6 +2644,8 @@ KitTally Adapter::TintKit(UObject* willie, int team, TeamKit kit) {
 UObject* Adapter::RespawnLocalPlayer(const SpawnOptions& o) {
     UObject* old = PlayerWillie(0);
     SpawnOptions puppet = o; puppet.brain = false; puppet.stockBrain = false;
+    // In Progression the player's own fighter starts with the career's injuries (session/hsm_career.h).
+    puppet.careerBody = hsm::CareerBodyAtSpawn(FreeModeActive(), CareerGameMode());
     UObject* w = SpawnFighter(puppet);
     if (!w) { HSM_LOG("adapter: local player respawn failed: the new fighter did not spawn"); return nullptr; }
     Call pc(statics_, "GetPlayerController");

@@ -2,9 +2,12 @@
 #include <windows.h>
 #include "gameplay/travel.h"
 #include "log.h"
+#include "session/hsm_gvas.h"
 #include "ue/script_hook.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <utility>
 
@@ -14,6 +17,12 @@ namespace {
 
 constexpr const wchar_t* kSave = L"GameProgress.sav";   // GI_Settings.cpp:1431 SaveGameToSlot(Save File, "GameProgress", 0)
 constexpr const char* kHookOwner = "saveguard";
+constexpr const wchar_t* kCareer = L"HSMMP_Progression.sav";          // the multiplayer career (session/hsm_mp_career.h)
+constexpr const wchar_t* kCareerPrev = L"HSMMP_Progression.prev.sav";  // the career as it was before its last write
+// The player's own passports, which a career load leaves as they are: Free Mode's character (the lobby loadout,
+// hsm_gvas.h kPassportSaveProperty) and the stock player-2 slot (the default loadout). Load Game reads both from the
+// save it loads, and Delete Save resets the second; neither belongs to the career.
+constexpr const char* kOwnPassports[] = {"Free Mode Player Character 1", "Free Mode Player Character 2"};
 
 bool ReadAll(const std::wstring& path, std::vector<uint8_t>& out, bool& exists) {
     out.clear();
@@ -114,6 +123,54 @@ void KeepAside(const std::wstring& dir, const std::wstring& backup, const char* 
     HSM_LOG("save: %ls could not be moved aside (%s); left as is", backup.c_str(), why);
 }
 
+// The player's own save back into the GameProgress slot after the career borrowed it; the backup stays (the session goes
+// on). An empty backup means there was no save, so none is left in the slot.
+bool RefillSlot(const std::wstring& dir, const std::wstring& backup) {
+    std::vector<uint8_t> own;
+    bool exists = false;
+    if (!ReadAll(dir + backup, own, exists) || !exists) return false;
+    if (own.empty()) return DeleteFileW((dir + kSave).c_str()) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND;
+    return WriteAll(dir + kSave, own);
+}
+
+// Before the career borrows the slot, the backup's time moves to now: a crash while the slot holds the career is then no
+// "save newer than its backup" at the next start (hsm_save_guard.h DecideLeftBackup), so the backup still goes back.
+void TouchBackup(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    SetFileTime(h, nullptr, nullptr, &now);
+    CloseHandle(h);
+}
+
+// A career file that is no save: renamed HSMMP_Progression_bad_<utc>_<n>.sav (never overwritten). False when it could not be.
+bool SetAsideCareer(const std::wstring& dir, std::wstring& to) {
+    SYSTEMTIME t;
+    GetSystemTime(&t);
+    for (int i = 0; i < 100; ++i) {
+        wchar_t b[96];
+        std::swprintf(b, 96, L"HSMMP_Progression_bad_%04u%02u%02uT%02u%02u%02uZ_%d.sav", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, i);
+        if (MoveFileExW((dir + kCareer).c_str(), (dir + b).c_str(), 0)) { to = b; return true; }
+        if (GetLastError() != ERROR_ALREADY_EXISTS && GetLastError() != ERROR_FILE_EXISTS) break;
+    }
+    return false;
+}
+
+// The player's own passports from one object to another (the game instance and a blank SG_GameProgress_C have them all,
+// same names and types). How many were copied.
+size_t CopyPassports(UObject* from, UObject* to) {
+    size_t n = 0;
+    for (const char* name : kOwnPassports) {
+        FProperty* s = FindProperty(ClassOf(from), name);
+        FProperty* d = FindProperty(ClassOf(to), name);
+        if (!s || !d || PropertySize(s) != PropertySize(d) || PropertyType(s) != PropertyType(d)) continue;
+        CopyPropertyValue(d, reinterpret_cast<uint8_t*>(to) + PropertyOffset(d), reinterpret_cast<const uint8_t*>(from) + PropertyOffset(s));
+        ++n;
+    }
+    return n;
+}
+
 std::atomic<bool> g_sweepRestored{false};   // the startup sweep put a save back: the game instance needs one Load Game
 
 struct LeftFile {
@@ -172,7 +229,8 @@ void SaveGuard::Hook() {
     // still goes back over GameProgress when the session is over, and Save Game stays blocked everywhere.
     auto block = [this](const char* what, bool fightOnly = false) {
         return [this, what, fightOnly](ScriptCall&) {
-            if (!policy_.Blocking() || (fightOnly && !matchLevel_)) return false;
+            if (own_ || !policy_.Blocking() || (fightOnly && !matchLevel_)) return false;
+            if (passOne_ && std::strcmp(passOne_, what) == 0) { passOne_ = nullptr; return false; }   // that call only, not a nested one
             if (++blocked_ % 50 == 1) HSM_LOG("save: blocked the game's \"%s\" during a session (%u so far)", what, blocked_);
             return true;
         };
@@ -181,7 +239,18 @@ void SaveGuard::Hook() {
     int n = HookScript(kHookOwner, "GI_Settings_C", "Save Game", block("Save Game"));
     n += HookScript(kHookOwner, "GI_Settings_C", "Reset Player Character", block("Reset Player Character", true));
     n += HookScript(kHookOwner, "GI_Settings_C", "Override Player Character Equipment", block("Override Player Character Equipment", true));
-    n += HookScript(kHookOwner, "GI_Settings_C", "Delete Save", block("Delete Save"));
+    // The Tavern's DELETE SAVE (UI_DeleteSave_Confirm) in a session: the multiplayer career goes, never the player's own save;
+    // the game's call is never let through (it deletes the slot GameProgress). Logged every time: it is the player's act.
+    n += HookScript(kHookOwner, "GI_Settings_C", "Delete Save", [this](ScriptCall&) {
+        if (own_ || !policy_.Blocking()) return false;
+        const session::CareerStep step = career_.DeleteAsked();
+        if (step != session::CareerStep::Delete) {
+            HSM_LOG("save: the game's Delete Save during a session is blocked: your own save is not deleted, and no multiplayer career is held to delete");
+            return true;
+        }
+        career_.Done(step, DeleteCareer());
+        return true;
+    });
     // The game reloads the game instance from GameProgress on its level loads (it saved it just before, so the pair
     // kept the session's settings). With the save blocked, the load brought back the pre-session ones: test 2026-10-25,
     // every lobby fight came up in Progression (Free Mode Activated false), so Duel ran as Progression co-op, with the
@@ -256,6 +325,8 @@ void SaveGuard::Reload(Adapter& adapter) {
 }
 
 void SaveGuard::Restore(Adapter& adapter) {
+    // The career first, while the game instance still holds it and the backup the player's own save.
+    if (career_.SessionOver() == session::CareerStep::Save) career_.Done(session::CareerStep::Save, SaveCareer(adapter, "session over"));
     const std::wstring dir = adapter.SaveGamesDir();
     if (!backup_.empty() && !dir.empty()) {
         if (PutBack(dir, backup_, "session over")) backup_.clear();
@@ -276,6 +347,142 @@ void SaveGuard::RestoreLeft(Adapter& adapter) {
     const bool restored = SweepLeftBackups(dir, "left by a session that did not end");
     // The startup sweep (before the engine was up) may have put a save back after the game instance read the old one.
     if (restored || g_sweepRestored.exchange(false)) Reload(adapter);
+}
+
+// ------------------------------------------------------------------ the multiplayer career (session/hsm_mp_career.h)
+
+bool SaveGuard::BackupOnDisk(const std::wstring& dir) const {
+    return !backup_.empty() && !dir.empty() && GetFileAttributesW((dir + backup_).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+void SaveGuard::CareerTravel(Adapter& adapter, bool progression, bool host) {
+    if (!policy_.Blocking()) Tick(adapter, true, matchLevel_);   // a travel heard in the tick the session began: the backup first
+    const bool guarded = policy_.Blocking() && BackupOnDisk(adapter.SaveGamesDir());
+    const session::CareerStep step = career_.Travel(progression, guarded);
+    if (step == session::CareerStep::Load) career_.Done(step, LoadCareer(adapter, host));
+    else if (step == session::CareerStep::Save) career_.Done(step, SaveCareer(adapter, "Progression left"));
+    else if (progression && !career_.Loaded() && !guarded)
+        HSM_LOG("career: your own save has no backup this session, so its slot is not borrowed; Progression plays on the career in memory and keeps nothing");
+}
+
+bool SaveGuard::CaptureFightEnd(Adapter& adapter) {
+    UObject* gi = adapter.GameInstance();
+    if (!gi) return false;
+    Call capture(gi, "Override Player Character Equipment");   // GI_Settings.cpp:725
+    if (!capture.valid()) return false;
+    capture.set<bool>("Keep Exact Values", false);
+    passOne_ = "Override Player Character Equipment";
+    const bool ok = capture.invoke();
+    passOne_ = nullptr;
+    return ok;
+}
+
+void SaveGuard::CareerHubLoaded(Adapter& adapter) {
+    if (career_.HubLoaded() == session::CareerStep::Keep) career_.Done(session::CareerStep::Keep, SaveCareer(adapter, "in the Tavern"));
+}
+
+bool SaveGuard::LoadCareer(Adapter& adapter, bool host) {
+    const std::wstring dir = adapter.SaveGamesDir();
+    UObject* gi = adapter.GameInstance();
+    if (dir.empty() || !gi) { HSM_LOG("career: no save folder or game instance; Progression plays on the career in memory and keeps nothing"); return false; }
+    std::vector<uint8_t> bytes;
+    bool exists = false;
+    const bool readable = ReadAll(dir + kCareer, bytes, exists);
+    std::string bad;
+    const bool valid = exists && readable && CheckCareerSave(bytes.data(), bytes.size(), &bad);
+    const session::CareerSource from = session::CareerSourceFor(exists, readable, valid);
+    if (from == session::CareerSource::Refuse) {
+        HSM_LOG("career: %ls could not be read; it is left as it is, and Progression plays on the career in memory and keeps nothing", kCareer);
+        return false;
+    }
+    if (from == session::CareerSource::FreshSetAside) {
+        std::wstring aside;
+        if (!SetAsideCareer(dir, aside)) {
+            HSM_LOG("career: %ls is no career save (%s) and could not be moved aside; Progression plays on the career in memory and keeps nothing", kCareer, bad.c_str());
+            return false;
+        }
+        HSM_LOG("career: %ls is no career save (%s); kept aside as %ls, and a new career starts", kCareer, bad.c_str(), aside.c_str());
+    }
+    // What a career load leaves as it was: the travel's settings (the modes, Free Mode's choices; on the host the Day Time
+    // and Day Count are the career's) and the player's own passports, held in a blank save object over the load.
+    std::vector<Setting> keep = CaptureGameSettings();
+    if (host) keep.erase(std::remove_if(keep.begin(), keep.end(), [](const Setting& s) { return s.name == "Day Time" || s.name == "Day Count"; }), keep.end());
+    UObject* holder = adapter.NewSaveObject();
+    const size_t held = holder ? CopyPassports(gi, holder) : 0;
+    TouchBackup(dir + backup_);
+    bool ok = false;
+    own_ = true;
+    if (from == session::CareerSource::File) {
+        Call load(gi, "Load Game");   // GI_Settings.cpp:603: every saved field from the slot "GameProgress", the career's for this call
+        ok = WriteAll(dir + kSave, bytes) && load.valid() && load.invoke();
+    } else {
+        // A new career: the game's own Delete Save (GI_Settings.cpp:292) resets every career field, makes a character and
+        // fills the fight board. First Start stays on, so the Tavern opens with character creation (Map_Hub_Tavern_Frank);
+        // the tutorial is marked as played, since finishing creation would otherwise open the Cellar by itself and leave
+        // the session (UI_CharacterCreation.cpp:433), and so is the intro video.
+        Call reset(gi, "Delete Save");
+        ok = reset.valid() && reset.invoke();
+        if (ok) { SetBool(gi, "First Start Tutorial Played", true); SetBool(gi, "First Start Intro Played", true); }
+    }
+    own_ = false;
+    if (held) CopyPassports(holder, gi);
+    const size_t kept = ApplyGameSettings(keep);
+    const bool back = RefillSlot(dir, backup_);
+    if (!ok) HSM_LOG("career: the multiplayer career could not be %s; Progression plays on the career in memory and keeps nothing",
+                     from == session::CareerSource::File ? "read in" : "made");
+    else if (from == session::CareerSource::File) HSM_LOG("career: multiplayer career read in from %ls (%zu bytes); %zu setting(s) and %zu own passport(s) kept", kCareer, bytes.size(), kept, held);
+    else HSM_LOG("career: a new multiplayer career (character creation in the Tavern); %zu setting(s) and %zu own passport(s) kept", kept, held);
+    if (!back) HSM_LOG("career: putting your own save back in its slot FAILED; the backup still holds it and goes back when the session ends");
+    if (ok) careerDir_ = dir;
+    return ok;
+}
+
+bool SaveGuard::DeleteCareer() {
+    if (careerDir_.empty()) { HSM_LOG("career: Delete Save: no save folder known; the multiplayer career is left as it is"); return false; }
+    const std::wstring file = careerDir_ + kCareer, prev = careerDir_ + kCareerPrev;
+    const bool had = GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES;
+    // One step back, as every career write keeps (HSMMP_Progression.prev.sav): a misclick is not the end of a career.
+    const bool gone = !had || MoveFileExW(file.c_str(), prev.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!gone) {
+        HSM_LOG("career: Delete Save: %ls could not be removed (Windows error %lu); the multiplayer career stays", kCareer, GetLastError());
+        return false;
+    }
+    HSM_LOG("career: Delete Save: the multiplayer career is deleted%s; your own save is untouched. The next Progression starts a new "
+            "one (character creation)", had ? " (the last one kept as HSMMP_Progression.prev.sav)" : " (it had not been saved yet)");
+    return true;
+}
+
+bool SaveGuard::SaveCareer(Adapter& adapter, const char* why) {
+    const std::wstring dir = adapter.SaveGamesDir();
+    UObject* gi = adapter.GameInstance();
+    if (dir.empty() || !gi || !BackupOnDisk(dir)) {
+        HSM_LOG("career: NOT saved (%s): %s", why, dir.empty() || !gi ? "no save folder or game instance" : "the backup of your own save is gone, so its slot is not borrowed");
+        return false;
+    }
+    // The game's own Save Game writes the career into the slot, emptied first so it makes a fresh save object and nothing
+    // of the player's own save rides along into the career's file.
+    TouchBackup(dir + backup_);
+    DeleteFileW((dir + kSave).c_str());
+    Call save(gi, "Save Game");   // GI_Settings.cpp:1355
+    own_ = true;
+    const bool called = save.valid() && save.invoke();
+    own_ = false;
+    std::vector<uint8_t> bytes;
+    bool exists = false;
+    std::string bad;
+    const bool read = called && ReadAll(dir + kSave, bytes, exists) && exists;
+    const bool good = read && CheckCareerSave(bytes.data(), bytes.size(), &bad);
+    bool kept = false;
+    if (good) {
+        if (GetFileAttributesW((dir + kCareer).c_str()) != INVALID_FILE_ATTRIBUTES)
+            CopyFileW((dir + kCareer).c_str(), (dir + kCareerPrev).c_str(), FALSE);   // one step back, should a write go wrong
+        kept = WriteAll(dir + kCareer, bytes);
+    }
+    const bool back = RefillSlot(dir, backup_);
+    if (kept) HSM_LOG("career: saved (%s): %zu bytes to %ls", why, bytes.size(), kCareer);
+    else HSM_LOG("career: NOT saved (%s): %s", why, !called ? "Save Game could not be called" : !read ? "the game wrote no save" : !good ? bad.c_str() : "the file could not be written");
+    if (!back) HSM_LOG("career: putting your own save back in its slot FAILED; the backup still holds it and goes back when the session ends");
+    return kept;
 }
 
 }  // namespace hsm::game

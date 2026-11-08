@@ -8,11 +8,14 @@
 #include "hsm_owner.h"
 #include "hsm_protocol.h"
 #include "match/hsm_ctf.h"
+#include "session/hsm_career.h"
 #include "session/hsm_dice.h"
 #include "session/hsm_lease.h"
 #include "session/hsm_loadout_change.h"
 #include "session/hsm_ground_clear.h"
 #include "session/hsm_map_reset.h"
+#include "session/hsm_mod_challenge.h"
+#include "session/hsm_mod_rules.h"
 #include "session/hsm_modmaps.h"
 #include "session/hsm_object_event.h"
 #include "session/hsm_password.h"
@@ -61,10 +64,17 @@ void TryAll(const uint8_t* d, size_t n) {
     Try<Event>(d, n); Try<Travel>(d, n); Try<Ready>(d, n); Try<Spawn>(d, n); Try<Despawn>(d, n); Try<BlobChunk>(d, n);
     Try<MatchInfo>(d, n); Try<Kill>(d, n);
     Try<PoseMsg>(d, n); Try<VitalsMsg>(d, n); Try<HitClaimMsg>(d, n); Try<HitFxMsg>(d, n);
+    PoseMsg pose; sync::PoseFrame frame;
+    const bool admitted = DecodePoseEnvelope(d, n, pose);
+    const bool decoded = DecodePoseFrame(d, n, pose, frame);
+    if ((decoded && !admitted) || !pose.pose.empty()) {
+        if (++g_roundTripFailures <= 5) std::printf("pose admission/frame contract failed (size %zu)\n", n);
+    }
     Try<combat::SeverClaimMsg>(d, n); Try<combat::SeverNoticeMsg>(d, n); Try<combat::StuckBladeMsg>(d, n);
     Try<GrabStateMsg>(d, n); Try<BodyStateMsg>(d, n); Try<PropLeaseMsg>(d, n);
     Try<combat::PaintFxMsg>(d, n); Try<combat::EquipStateMsg>(d, n); Try<PropCensusMsg>(d, n); Try<GiveUpMsg>(d, n); Try<ReportShareMsg>(d, n); Try<PeerMapMsg>(d, n); Try<MeshHeardMsg>(d, n); Try<PingTableMsg>(d, n); Try<VoiceMsg>(d, n); Try<VoiceModeMsg>(d, n); Try<RouteTableMsg>(d, n); Try<ForwardMsg>(d, n); Try<VoteStateMsg>(d, n); Try<DeathReport>(d, n);
     Try<ObjectAnnounceMsg>(d, n); Try<ObjectEventMsg>(d, n); Try<ModMapMsg>(d, n); Try<dice::LevelSeedMsg>(d, n); Try<MapResetMsg>(d, n); Try<GroundClearMsg>(d, n); Try<LobbySecretMsg>(d, n); Try<LoadoutChangeMsg>(d, n); Try<LoadoutChangeResult>(d, n); Try<CtfEventMsg>(d, n); Try<ModeEventMsg>(d, n); Try<ProgVoteMsg>(d, n);
+    Try<ModListMsg>(d, n); Try<SessionModsMsg>(d, n); Try<ModChallengeMsg>(d, n); Try<ModAnswerMsg>(d, n); Try<ProgResultMsg>(d, n);
     FuzzPak(d, n);
     Ping p; bool pong; DecodePing(d, n, p, pong);
     MsgType t; PeekType(d, n, t);
@@ -84,12 +94,27 @@ std::vector<std::vector<uint8_t>> Seeds() {
     { ProgVoteMsg pv; pv.seq = 3; pv.secondsLeft = 20; pv.mine = 1; pv.voters = 3; pv.voted = 2; pv.options = {{"The Pit", 1}, {"Old Yard", 1}, {"Tourney", 0}}; s.push_back(Encode(pv));   // the Tavern's next-fight vote: state, a pick, the result
       ProgVoteMsg pk; pk.kind = ProgVoteKind::Pick; pk.seq = 3; pk.pick = 2; s.push_back(Encode(pk));
       ProgVoteMsg pr; pr.kind = ProgVoteKind::Result; pr.seq = 3; pr.winner = 1; pr.how = ProgWin::Seed; pr.name = "Old Yard"; s.push_back(Encode(pr)); }
+    { ProgResultMsg rw; rw.fight = 41; rw.flags = kResultWon | kResultTourney; rw.purse = 240; s.push_back(Encode(rw));   // rev 41: a co-op fight's end
+      ProgResultMsg rl; rl.fight = 42; s.push_back(Encode(rl));
+      ProgResultMsg rn; rn.fight = 43; rn.flags = kResultWon | kResultNextRound | kResultTimeStep; s.push_back(Encode(rn)); }   // a round won, more to come
     { Spawn xs; xs.entity = 2; xs.flags = kSpawnCrossbow; s.push_back(Encode(xs)); }
     s.push_back(Encode(ModeEventMsg{ModeEventKind::TagPass, 1, 2})); s.push_back(Encode(ModeEventMsg{ModeEventKind::TagBurn, 3, 0})); s.push_back(Encode(ModeEventMsg{ModeEventKind::Infected, 0, 4}));
     { MatchInfo mt; mt.format = uint8_t(Format::Tag); mt.tagIt = 2; mt.fuseLeftMs = 12000; mt.fighters.resize(2); mt.fighters[0].entity = 1; mt.fighters[1].entity = 2; s.push_back(Encode(mt)); }                                                  // a body given a crossbow
     Welcome w; w.map = "/Game/Maps/Arenas/Map_Arena_Yard"; w.modBuild = "0.6.4"; w.flags = kWelcomeMesh; s.push_back(Encode(w));
     Reject r; r.reason = RejectReason::Full; s.push_back(Encode(r));
     r.reason = RejectReason::Banned; s.push_back(Encode(r));
+    r.reason = RejectReason::ModsNotAllowed; r.detail = "This lobby blocks cheats: remove HSEnhancer."; s.push_back(Encode(r));
+    {   // rev 40: mod rules and challenge-response
+        ModListMsg ml; ml.official = Official::Yes; ml.report.ue4ss = true; ml.report.complete = true;
+        ModItem a; a.kind = ModKind::MapPak; a.name = "Tavern.pak"; a.hashed = true; a.sha[0] = 1; ml.report.items.push_back(a);
+        ModItem b; b.kind = ModKind::Module; b.name = "HSEnhancer"; ml.report.items.push_back(b);
+        s.push_back(Encode(ml));
+        ModReport other = ml.report;
+        SessionModsMsg sm = BuildSessionMods({{0, &ml.report}, {2, &other}}); s.push_back(Encode(sm));
+        ModChallengeMsg mc; mc.id = 7; mc.nonce[0] = 9; mc.ranges = {{16, 4096}, {9000, 100}}; s.push_back(Encode(mc));
+        ModAnswerMsg ma; ma.id = 7; ma.digest[3] = 4; s.push_back(Encode(ma));
+        ma.status = AnswerStatus::Unable; s.push_back(Encode(ma));
+    }
     InputFrame f; f.seq = 7; f.axes[0] = 1; f.buttons = 5; s.push_back(Encode(f));
     Snapshot sn; WillieState ws; ws.entity = 1; ws.bodies.resize(23); sn.willies.push_back(ws); s.push_back(Encode(sn));
     Event e; e.kind = EventKind::Died; e.a = 2; s.push_back(Encode(e));

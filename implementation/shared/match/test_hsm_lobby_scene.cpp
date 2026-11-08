@@ -284,6 +284,16 @@ static void TestBrowserPack() {
         CHECK(s.browser[1].detail == "pack ArenaPack (not installed)" && !s.browser[1].joinable && s.browser[1].note.text == "Install the pack");
         CHECK(s.browser[2].detail.empty());
     }
+    // The lobby's mod rule follows the pack; a lobby whose rule refuses this machine's mods says why in its note.
+    LobbyFound rule; rule.name = "D"; rule.map = "Yard"; rule.players = 1; rule.compatible = true; rule.pack = "pack ArenaPack"; rule.mods = "mods: Vanilla";
+    LobbyFound blocked; blocked.name = "E"; blocked.players = 1; blocked.compatible = false; blocked.reason = "Blocks HSEnhancer";
+    l.found = {rule, blocked};
+    const LobbyScene m = BuildLobbyScene(l);
+    CHECK(m.browser.size() == 2);
+    if (m.browser.size() == 2) {
+        CHECK(m.browser[0].detail == "Yard " + kDot + " pack ArenaPack " + kDot + " mods: Vanilla" && m.browser[0].joinable);
+        CHECK(!m.browser[1].joinable && m.browser[1].note.text == "Blocks HSEnhancer");
+    }
 }
 
 // Locked lobbies: the row says so in plain text and can be hidden with the No password chip.
@@ -853,6 +863,16 @@ static void TestGroupsAndSections() {
     for (size_t i = 0; i <= size_t(LobbyRow::Sync); ++i) CHECK(SectionOf(LobbyRow(i)) < LobbySection::Count);
 }
 
+// The class row is for lobbies where the class counts, and for players in one: the page never has to open on the classes.
+static void TestClassLine() {
+    LobbyLocal l = InLobby(false, Format::FreeForAll, Gear::Own);
+    CHECK(BuildLobbyScene(l).classLine.empty());
+    l.myClass = "Crusader";
+    CHECK(BuildLobbyScene(l).classLine == "YOUR CLASS: Crusader");
+    l.phase = LobbyPhase::Idle;
+    CHECK(BuildLobbyScene(l).classLine.empty());
+}
+
 static void TestSummary() {
     LobbyScene s = BuildLobbyScene(InLobby(true, Format::TwoTeams, Gear::RandomTier));
     CHECK(s.summary.rfind("TEAMS (2) " + kDot + " ", 0) == 0);
@@ -1169,6 +1189,7 @@ int main() {
     TestBuildMismatch();
     TestDamage();
     TestGroupsAndSections();
+    TestClassLine();
     TestSummary();
     TestFilters();
     TestCaptureTheFlag();

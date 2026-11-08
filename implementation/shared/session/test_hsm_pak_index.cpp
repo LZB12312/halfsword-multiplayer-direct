@@ -1,5 +1,6 @@
 // Pak index reader (session/hsm_pak_index.h): a synthetic v11 pak (footer, primary index, full directory index) parses to
 // its map packages; every truncation, wrong version, encrypted index and out-of-range offset is refused, never over-read.
+#include "session/hsm_mod_rules.h"
 #include "session/hsm_pak_index.h"
 #include <cstdio>
 #include <string>
@@ -159,6 +160,10 @@ static void TestParse() {
     CHECK(ParsePakDirectoryIndex(p.file.data() + pr.fdiOffset, size_t(pr.fdiSize), pr.mountPoint, maps) == PakParse::Ok);
     CHECK(maps.size() == 3);
     CHECK(maps.size() == 3 && maps[0] == "/Game/Maps/Custom/Arena_Bog" && maps[1] == "/Game/Maps/Custom/Arena_Bog_Lighting" && maps[2] == "/Game/Maps/Arenas/Map_Arena_Yard");
+    // The other package files' folders, for the map/content split.
+    PakAssets assets;
+    CHECK(ParsePakDirectoryIndex(p.file.data() + pr.fdiOffset, size_t(pr.fdiSize), pr.mountPoint, maps, &assets) == PakParse::Ok && maps.size() == 3);
+    CHECK(assets.dirs.size() == 2 && assets.dirs[0] == "/Game/Maps/Custom" && assets.dirs[1] == "/Game/Textures" && !assets.overflow);
 
     // Version 10 reads the same; the mount point may carry the project, the root directory is "/".
     const Pak p10 = Build("../../../HalfswordUE5/Content/", {{"/", {"Top.umap"}}, {"Maps/", {"A.umap", "A.umap"}}}, 10);
@@ -252,7 +257,111 @@ static void TestIndexRejections() {
       CHECK(ParsePakDirectoryIndex(pm.file.data() + pm.fdiOff, pm.fdiSize, "../../../", maps) == PakParse::Ok && maps.size() == kMaxPakMaps); }
 }
 
+static PakAssets AssetsOf(const Dirs& dirs, const std::string& mount = "../../../") {
+    const Pak p = Build(mount, dirs);
+    const std::vector<uint8_t> tail = Tail(p);
+    PakFooter f; PakPrimary pr; std::vector<std::string> maps; PakAssets a;
+    if (ParsePakFooter(tail.data(), tail.size(), p.file.size(), f) != PakParse::Ok) { a.overflow = true; a.dirs = {"footer"}; return a; }
+    if (ParsePakPrimaryIndex(p.file.data() + f.indexOffset, size_t(f.indexSize), p.file.size(), pr) != PakParse::Ok) { a.overflow = true; a.dirs = {"primary"}; return a; }
+    if (ParsePakDirectoryIndex(p.file.data() + pr.fdiOffset, size_t(pr.fdiSize), pr.mountPoint, maps, &a) != PakParse::Ok) { a.overflow = true; a.dirs = {"fdi"}; }
+    return a;
+}
+
+// What the game's lobby rule makes of a pak with this index, from the parser on.
+static PakClass ClassOf(const Dirs& dirs) {
+    const Pak p = Build("../../../", dirs);
+    std::vector<std::string> maps;
+    PakAssets a;
+    if (ParsePakDirectoryIndex(p.file.data() + p.fdiOff, p.fdiSize, "../../../", maps, &a) != PakParse::Ok) return {};
+    return ClassifyPakWhy(maps, a.dirs, a.overflow, a.overflowWhy, a.badMaps, a.stockFiles);
+}
+
+// The cooked shapes real map paks come in, from the parser on.
+static void TestMapPaks() {
+    const std::string root = "HalfswordUE5/Content/";
+    CHECK(ClassOf({{root, {"Hole.umap", "Hole.uexp"}}}).kind == ModKind::MapPak);
+    CHECK(ClassOf({{root, {"Hole.uexp", "Hole.umap", "Hole.ubulk", "Hole.uptnl"}}}).kind == ModKind::MapPak);   // any order
+    CHECK(ClassOf({{root, {"Hole.umap", "Hole.uexp", "Hole_BuiltData.uasset", "Hole_BuiltData.uexp", "Hole_BuiltData.ubulk"}},
+                   {root + "Hole/Textures/", {"T.uasset", "T.uexp"}}}).kind == ModKind::MapPak);
+    CHECK(ClassOf({{"HalfswordUE5/Plugins/Hole/Content/", {"Hole.umap", "Hole.uexp"}}}).kind == ModKind::MapPak);
+    // New files anywhere only add: beside the map, in a folder of their own, or in a stock folder.
+    CHECK(ClassOf({{root, {"Hole.umap", "Hole.uexp", "Other.uasset", "Other.uexp"}}}).kind == ModKind::MapPak);
+    CHECK(ClassOf({{root, {"Hole.umap", "Hole.uexp"}}, {root + "Stadium/", {"W.uasset"}}}).kind == ModKind::MapPak);
+    CHECK(ClassOf({{root + "Maps/", {"Tower.umap", "Tower.uexp"}}}).kind == ModKind::MapPak);
+    CHECK(ClassOf({{root + "Mine/", {"M.umap"}}, {root + "Character/Blueprints/", {"Mine.uasset", "Mine.uexp"}}}).kind == ModKind::MapPak);
+    // A stock file by any of its extensions, in any case, wherever it comes in the index.
+    PakClass c = ClassOf({{root + "Mine/", {"M.umap"}}, {root + "Character/Blueprints/", {"AI_BP.uasset", "AI_BP.uexp"}}});
+    CHECK(c.kind == ModKind::ContentPak && c.why == "replaces stock files: /Game/Character/Blueprints/AI_BP");
+    CHECK(ClassOf({{root + "Character/Blueprints/", {"ai_bp.ubulk"}}, {root + "Mine/", {"M.umap"}}}).kind == ModKind::ContentPak);
+    CHECK(ClassOf({{root + "Mine/", {"M.umap"}}, {root, {"RT_Blood.uexp"}}}).why == "replaces stock files: /Game/RT_Blood");
+    // A map that takes a stock package's place.
+    c = ClassOf({{root, {"RT_Blood.umap", "RT_Blood.uexp"}}});
+    CHECK(c.kind == ModKind::ContentPak && c.why == "replaces stock /Game/RT_Blood");
+    // A map whose name cannot be a package path is a map all the same, and off the list: the log says so and names it.
+    c = ClassOf({{root + "Mine/", {"Space Hall.umap", "Space Hall.uexp"}}});
+    CHECK(c.kind == ModKind::MapPak && c.why == "a map's file name cannot be a package path");
+    CHECK(AssetsOf({{root + "Mine/", {"Space Hall.umap", "A.b.umap"}}}).badMaps == 2);
+    CHECK(AssetsOf({{root + "Mine/", {"Space Hall.umap", "A.b.umap"}}}).badMapName == "/Game/Mine/Space Hall");
+    CHECK(ClassOf({{root + "My Props/", {"P.uasset"}}, {root + "Mine/", {"M.umap"}}}).kind == ModKind::MapPak);
+    // A weapon pak's badly named test map doesn't help it.
+    CHECK(ClassOf({{root + "Mods/Gun/", {"Test Map.umap", "Test Map.uexp", "ModActor.uasset"}}}).kind == ModKind::ContentPak);
+    // The reasons name what happened. A .uasset under Engine/Plugins is neither too many folders nor a config file.
+    c = ClassOf({{root + "Mine/", {"M.umap"}}, {"HalfswordUE5/Config/", {"DefaultGame.ini"}}});
+    CHECK(c.kind == ModKind::ContentPak && c.why == "a config file");
+    c = ClassOf({{root + "Mine/", {"M.umap"}}, {"Engine/Plugins/X/Content/", {"T.uasset"}}});
+    CHECK(c.kind == ModKind::ContentPak && c.why == "a package file outside any content root");
+    CHECK(ClassOf({{"HalfswordUE5/Config/", {"Stray.umap"}}}).kind == ModKind::ContentPak);     // nowhere a map could load from
+    // Legacy paks read the same.
+    const Pak lp = BuildLegacy("../../../", {"HalfswordUE5/Content/Hole.umap", "HalfswordUE5/Content/Hole.uexp"}, 8);
+    std::vector<std::string> maps;
+    PakAssets la;
+    CHECK(ParsePakLegacyIndex(lp.file.data() + lp.primaryOff, lp.primarySize, 8, maps, &la) == PakParse::Ok);
+    CHECK(maps.size() == 1 && la.dirs.size() == 1 && la.dirs[0] == "/Game" && !la.overflow && la.stockFiles.empty());
+    const Pak bad = BuildLegacy("../../../", {"HalfswordUE5/Content/Mine/Space Hall.umap"}, 8);
+    CHECK(ParsePakLegacyIndex(bad.file.data() + bad.primaryOff, bad.primarySize, 8, maps, &la) == PakParse::Ok);
+    CHECK(maps.empty() && la.badMaps == 1 && la.badMapName == "/Game/Mine/Space Hall");
+    const Pak swap = BuildLegacy("../../../", {"HalfswordUE5/Content/Mine/M.umap", "HalfswordUE5/Content/Character/Blueprints/AI_BP.uexp"}, 8);
+    CHECK(ParsePakLegacyIndex(swap.file.data() + swap.primaryOff, swap.primarySize, 8, maps, &la) == PakParse::Ok);
+    CHECK(la.stockFiles.size() == 1 && la.stockFiles[0] == "/Game/Character/Blueprints/AI_BP");   // a legacy name is a whole path
+}
+
+static void TestAssets() {
+    // Side files do not count; an .ini anywhere does; a folder with a space is still a folder.
+    PakAssets a = AssetsOf({{"HalfswordUE5/Content/", {"ShaderArchive-HalfswordUE5-PCD3D_SM6.ushaderbytecode"}}, {"HalfswordUE5/", {"AssetRegistry.bin"}},
+                            {"HalfswordUE5/Content/Mine/", {"M.uasset", "M.uexp", "M.ubulk", "N.uptnl"}}});
+    CHECK(!a.overflow && a.dirs.size() == 1 && a.dirs[0] == "/Game/Mine");
+    a = AssetsOf({{"HalfswordUE5/Config/", {"DefaultGame.ini"}}});
+    CHECK(a.overflow);
+    a = AssetsOf({{"HalfswordUE5/Content/Bad Folder/", {"M.uasset"}}});
+    CHECK(!a.overflow && a.dirs.size() == 1 && a.dirs[0] == "/Game/Bad Folder");
+    a = AssetsOf({{"HalfswordUE5/Plugins/Mod/Content/Things/", {"T.uasset"}}});
+    CHECK(!a.overflow && a.dirs.size() == 1 && a.dirs[0] == "/Mod/Things");
+    a = AssetsOf({{"HalfswordUE5/Content/", {"Stray.uasset"}}});
+    CHECK(!a.overflow && a.dirs.size() == 1 && a.dirs[0] == "/Game" && a.stockFiles.empty());
+    // Stock files by name, once each, and no more than the log needs.
+    Dirs stock;
+    for (size_t i = 1; i < kMaxPakStockFiles + 3; ++i) {     // [0] is under /Engine
+        const std::string path = kStockMapPaths[i];
+        const size_t cut = path.rfind('/');
+        stock.push_back({"HalfswordUE5/Content" + path.substr(5, cut - 4), {path.substr(cut + 1) + ".uexp", path.substr(cut + 1) + ".ubulk"}});
+    }
+    a = AssetsOf(stock);
+    CHECK(a.stockFiles.size() == kMaxPakStockFiles && a.stockFiles[0] == kStockMapPaths[1] && a.stockFiles[1] == kStockMapPaths[2]);
+    // More folders than the cap: overflow.
+    Dirs many;
+    for (size_t i = 0; i <= kMaxPakAssetDirs; ++i) many.push_back({"HalfswordUE5/Content/D" + std::to_string(i) + "/", {"A.uasset"}});
+    a = AssetsOf(many);
+    CHECK(a.overflow);
+    // Legacy paks note the same.
+    const Pak lp = BuildLegacy("../../../", kLegacyFiles, 8);
+    std::vector<std::string> maps; PakAssets la;
+    CHECK(ParsePakLegacyIndex(lp.file.data() + lp.primaryOff, lp.primarySize, 8, maps, &la) == PakParse::Ok);
+    CHECK(maps.size() == 2 && la.dirs.size() == 2 && la.dirs[0] == "/Game/Maps/Airplane" && la.dirs[1] == "/Game/Textures" && !la.overflow);
+}
+
 int main() {
+    TestAssets();
+    TestMapPaks();
     TestLegacy();
     TestPackagePaths();
     TestParse();

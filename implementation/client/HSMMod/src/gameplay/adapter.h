@@ -1,10 +1,12 @@
 // Half Sword game adapter: the only place that knows Half Sword class, function, property and bone
 // names. Translates between protocol types (hsm_protocol.h) and the running game. Game thread only.
 #pragma once
+#include "match/hsm_class.h"
 #include "hsm_drivelean.h"
 #include "hsm_protocol.h"
 #include "match/hsm_scenarios.h"
 #include "match/hsm_team_kit.h"
+#include "session/hsm_career.h"
 #include "ue/engine.h"
 #include <array>
 #include <functional>
@@ -54,6 +56,7 @@ public:
         bool bot = false;                             // a generated bot (SpawnBot): keeps the generator's build, clamped to 0..1, never forced
         double weight = -1.0, height = -1.0;          // a role's build (match/hsm_roles.h; Riot, Juggernaut): the passport Weight / Height this fighter spawns with, 0..1; negative: none (SetBuild's rules)
         const char* fighterClass = nullptr;           // nullptr = the stock Willie_BP_C; else the actor class to spawn as (match/hsm_fighter_class.h: the Zombies format's bots)
+        bool careerBody = false;                      // the career's Player Body Condition as the start body (the stock spawner's, session/hsm_career.h CareerBodyAtSpawn)
     };
     ue::UObject* SpawnFighter(const SpawnOptions& o);
     void KeepRemoteFighter(ue::UObject* willie, float yawDeg, float pitchDeg);   // per tick on the host
@@ -189,6 +192,26 @@ public:
     // 0.8.0-pre21: the forced build on a fighter already in the world (the player's own, which the game spawned from its
     // save): passport Weight, Muscle Rate and every body's mass scale, rescaled so armour and weapon weights stay.
     void ApplyBuildLive(ue::UObject* willie);
+    // A class's stats on this machine's own fighter. Called often: each value keeps the game's own as its base (match/hsm_class.h).
+    struct ClassPiece { ue::UObject* what = nullptr; int32_t index = -1; ClassStatTrack power; };   // a foot or a held weapon
+    struct ClassTracks {
+        ue::UObject* who = nullptr;
+        ClassStatTrack run, walk, strength, gripR, gripL, hands, bones, regen;
+        double staminaLast = -1.0, weightSet = -1.0, rateWritten = -1.0;
+        bool holding = false;   // Grappler: this fighter's hand is on another fighter
+        // Under host physics both fighters are simulated here, so a Grappler's hold can lighten what it holds, for as long as it holds it.
+        bool lightenHeld = false; ue::UObject* heldMesh = nullptr; int32_t heldIndex = -1; std::vector<std::pair<ue::FName, float>> heldScales;
+        int massCheckIn = 0;    // ticks until the log says what the class's weight came to
+        ClassPiece footR, footL, handR, handL;
+        bool loggedMissing = false;
+    };
+    void ApplyClassStats(ue::UObject* willie, const ClassSheet& sheet, ClassTracks& tracks);
+    void ApplyClassWeight(ue::UObject* willie, double base, const ClassSheet& sheet, ClassTracks& tracks);   // Strength and Muscle
+    ue::UObject* HeldFighterMesh(ue::UObject* willie);
+    void LightenHeld(ue::UObject* target, ClassTracks& tracks);
+    void ReadLiveStats(ue::UObject* willie, double& run, double& strength);   // what's on the fighter now; 0: couldn't read
+    bool SetMusclesLook(ue::UObject* willie, double value);   // skin only (match/hsm_class.h ClassLookMuscles); false: no body material yet
+    void ClearPain(ue::UObject* willie);   // every frame for a class that feels none: the game flinches the moment a value passes its limit
     // Brawl: every fighter spawned from now on (own body, stand-ins, whatever loadout it was sent) has no armour and
     // holds no weapon. Done on the fighter's own copy of the passport, so no save and no uploaded loadout changes.
     void SetBare(bool on) { bare_ = on; }
@@ -269,6 +292,7 @@ public:
     // Host: a stock NPC fighter with a passport from the game's random generator (Enum_Ranks tier 0..7).
     ue::UObject* SpawnAbyssNpc(const ue::FVector& at);   // the Abyss level's own enemy spawner; null elsewhere
     ue::UObject* SpawnBot(int rank, const ue::FVector& at, double yawDeg, int teamInt);
+    int DropHeldWeapons(ue::UObject* willie);   // real weapons out of both hands, as a dropped weapon leaves; fists stay
     // The Willie's own passport serialized like ExportPassport (bots are relayed as blobs too).
     bool ExportPassportOf(ue::UObject* willie, std::vector<uint8_t>& out);
     // Per tick: UI_DED / UI_DeathDoor / UI_WinScreen / UI_WIN never construct while on. ownerMatch (owner sync) also
@@ -308,6 +332,21 @@ public:
     std::vector<ue::UObject*> StuckTargets(ue::UObject* willie);
     void KeepAudioListener(ue::UObject* mine);          // player 0's audio listener back on my fighter's head
     std::wstring SaveGamesDir();   // <Saved>/SaveGames/ (sweeps temporary slots left by a crash the first time); empty before the engine is up
+    // A blank SG_GameProgress_C (CreateSaveGameObject), nullptr when it cannot be made. Unreferenced: use it within the call
+    // that made it, before the engine collects garbage (the save guard holds the player's passports in one over a load).
+    ue::UObject* NewSaveObject();
+    // A Progression fight's end on this machine's career (session/hsm_career.h). Whole-number career fields (Player Funds,
+    // Reputation on Rank, Due Reward) are 4 or 8 bytes by the reflected size; false when the field is missing or neither.
+    bool GetCareerInt(const char* field, int64_t& out);
+    bool SetCareerInt(const char* field, int64_t value);
+    bool ReadCareerRank(hsm::CareerRank& out);                // funds, reputation, tier, permanent tier
+    bool WriteCareerRank(const hsm::CareerChange& change);    // and on a Tourney won: nemeses cleared, board, merchant and people renewed
+    int CareerGameMode();                                     // GI "Current Game Mode enum", -1 unreadable
+    int CareerCombatMode();                                   // GI "Current Combat Mode", -1 unreadable
+    bool SkipTimeStep();                                      // GI "Skip Time Event" at no price: the time of day one step on
+    int CareerArrayNum(const char* field);                    // the length of a GI array (e.g. "Available Combatants"), -1 unreadable
+    // A Tourney's final round: the level's game manager generates the champion into Available Combatants (UI_NextFIght NF:97).
+    bool GenerateTourneyChampion(int tier);
 
 private:
     struct Parked {

@@ -24,6 +24,8 @@
 namespace hsm {
 namespace {
 std::atomic<int> g_logged{0};
+char g_lastBlow[160] = {};                // the last blow from another player: what was happening if this is the crash
+std::atomic<uint64_t> g_lastBlowAtMs{0};
 std::atomic<uintptr_t> g_last{0};   // the same fault again (a crash reporter retrying it): logged once
 std::atomic<bool> g_dumped{false};  // one minidump per process: the first fault logged (later ones are the crash reporter's)
 std::atomic<uint32_t> g_faultSeq{0};      // faults logged so far; the last one's time and thread below
@@ -199,6 +201,7 @@ LONG CALLBACK OnFault(EXCEPTION_POINTERS* ep) {
         ? (r.ExceptionInformation[0] == 0 ? " reading" : r.ExceptionInformation[0] == 1 ? " writing" : " executing") : "";
     LogTry("crash: fault 0x%08lX at %s+0x%llX%s 0x%llX (thread %lu); the game may close now",
            r.ExceptionCode, name, (unsigned long long)off, op, target, GetCurrentThreadId());
+    if (const uint64_t blow = g_lastBlowAtMs.load(); blow && GetTickCount64() - blow < 5000) LogTry("crash: the last blow from another player, %llu ms ago: %s", (unsigned long long)(GetTickCount64() - blow), g_lastBlow);
     g_faultAtMs.store(GetTickCount64());
     g_faultThread.store(GetCurrentThreadId());
     g_faultSeq.fetch_add(1);
@@ -228,6 +231,11 @@ void NoteGameCarriedOn() {
     g_dumped.store(false);   // a later fault gets its own dump
     HSM_LOG("crash: the game still runs %llu s after the fault on thread %lu",
             (unsigned long long)(kFaultSurvivedMs / 1000), (unsigned long)g_faultThread.load());
+}
+
+void NoteLastBlow(int attacker, int striker, int source, const char* component, const char* bone) {
+    std::snprintf(g_lastBlow, sizeof g_lastBlow, "e%d (striker %d, source %d, %s on %s)", attacker, striker, source, component, bone);
+    g_lastBlowAtMs.store(GetTickCount64());
 }
 
 void InstallCrashLog() {

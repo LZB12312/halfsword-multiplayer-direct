@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace hsm {
@@ -30,15 +31,18 @@ struct PoseMsg {
 };
 
 inline std::vector<uint8_t> Encode(const PoseMsg& m) {
-    Writer w; w.header(MsgType::Pose);
+    Writer w; w.buf.reserve(kPoseMsgHeaderBytes + m.pose.size()); w.header(MsgType::Pose);
     w.u8(m.entity); w.u8(m.epoch); w.f32(m.rootX); w.f32(m.rootY); w.f32(m.rootZ); w.f32(m.yawDeg);
     w.u16(uint16_t(m.pose.size()));                 // kPoseFrameMaxBytes fits (static_assert below)
     w.buf.insert(w.buf.end(), m.pose.begin(), m.pose.end());
-    return w.buf;
+    return std::move(w.buf);
 }
-// Also checks the pose payload decodes (frame, when given, receives it), so a relay never forwards garbage.
-inline bool Decode(const uint8_t* d, size_t n, PoseMsg& m, sync::PoseFrame* frame = nullptr) {
-    if (n > kMaxPacket) return false;
+// Cheap transport admission only: validates framing, identity range and finite root/yaw, without decoding the
+// skeleton or copying payload bytes. The session MUST call DecodePoseFrame before applying or relaying a pose.
+// m receives the envelope fields only; its owning payload is cleared, including when a previous packet used it.
+inline bool DecodePoseEnvelope(const uint8_t* d, size_t n, PoseMsg& m) {
+    m.pose.clear();
+    if (!d || n > kMaxPacket) return false;
     Reader r(d, n); MsgType t; if (!r.header(t) || t != MsgType::Pose) return false;
     m.entity = r.u8(); m.epoch = r.u8(); m.rootX = r.f32(); m.rootY = r.f32(); m.rootZ = r.f32(); m.yawDeg = r.f32();
     const size_t len = r.u16();
@@ -46,9 +50,21 @@ inline bool Decode(const uint8_t* d, size_t n, PoseMsg& m, sync::PoseFrame* fram
     if (std::fabs(m.rootX) > kMaxRootCoord || std::fabs(m.rootY) > kMaxRootCoord || std::fabs(m.rootZ) > kMaxRootCoord) return false;
     if (std::fabs(m.yawDeg) > 720.f) return false;
     if (len == 0 || len > sync::kPoseFrameMaxBytes || n != kPoseMsgHeaderBytes + len) return false;   // payload = the rest
-    m.pose.assign(d + kPoseMsgHeaderBytes, d + n);
+    return true;
+}
+
+// Complete validation and decoding directly from the received bytes, with no payload allocation. The same path
+// is used for host relays, direct mesh traffic and detour payloads; callers still check sender/lease/epoch.
+inline bool DecodePoseFrame(const uint8_t* d, size_t n, PoseMsg& m, sync::PoseFrame& frame) {
+    return DecodePoseEnvelope(d, n, m) && sync::DecodePose(d + kPoseMsgHeaderBytes, n - kPoseMsgHeaderBytes, frame);
+}
+
+// Owning protocol API: retain the exact payload for callers which need to re-encode it. Never copy invalid data.
+inline bool Decode(const uint8_t* d, size_t n, PoseMsg& m, sync::PoseFrame* frame = nullptr) {
     sync::PoseFrame scratch;
-    return sync::DecodePose(m.pose.data(), m.pose.size(), frame ? *frame : scratch);
+    if (!DecodePoseFrame(d, n, m, frame ? *frame : scratch)) return false;
+    m.pose.assign(d + kPoseMsgHeaderBytes, d + n);
+    return true;
 }
 
 static_assert(sync::kPoseFrameMaxBytes <= 0xFFFF, "pose payload length is a u16");

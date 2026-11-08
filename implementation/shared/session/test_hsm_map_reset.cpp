@@ -11,7 +11,7 @@ static void TestCodec() {
     MapResetMsg m; m.seq = 0xBEEF; m.round = 7; m.flags = kMapResetRematch;
     const auto b = Encode(m);
     CHECK(b.size() == 4 + 2 + 2 + 1);
-    CHECK(b[3] == 54 && b[2] == kProtocolRevision && kProtocolRevision == 39);
+    CHECK(b[3] == 54 && b[2] == kProtocolRevision && kProtocolRevision == 41);
     MapResetMsg back;
     CHECK(Decode(b.data(), b.size(), back) && back.seq == 0xBEEF && back.round == 7 && back.flags == kMapResetRematch);
     for (size_t cut = 0; cut < b.size(); ++cut) CHECK(!Decode(b.data(), cut, back));           // every truncation

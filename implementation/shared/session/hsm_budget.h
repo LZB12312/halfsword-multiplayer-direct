@@ -39,7 +39,11 @@ inline BudgetClass BudgetClassOf(MsgType t) {
         case MsgType::ModMap: return BudgetClass::Control;   // rev 27: a host sends one per map pick (and one to each joiner)
         case MsgType::LobbySecret: return BudgetClass::Control;   // rev 35: host -> client only, one per password change (and one to each joiner)
         case MsgType::ProgressionVote: return BudgetClass::Control;   // rev 36: the Tavern's next-fight vote: a state change or a second, a pick per click
+        case MsgType::ProgressionResult: return BudgetClass::Control;   // rev 41: host -> client only, one per Progression fight
         case MsgType::LevelSeed: return BudgetClass::Control;   // rev 28: host -> client only, one per travel (and one to each joiner)
+        case MsgType::ModList: case MsgType::ModAnswer:          // rev 40: one per mod change / per code challenge (60..180 s)
+        case MsgType::SessionMods: case MsgType::ModChallenge:
+            return BudgetClass::Control;
         case MsgType::HandOff: case MsgType::HandOffAsk:          // rev 32: a few per grab or stab (an ask every kAskEveryMs while unanswered)
             return BudgetClass::Combat;
         case MsgType::Forward: return BudgetClass::Detour;

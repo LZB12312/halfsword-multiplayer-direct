@@ -121,7 +121,12 @@ struct Backend {
                 if(!clean.empty() && members[sender].name!=clean) { members[sender].name=clean; Changed(); }
                 return;
             }
-            if(!r.Done() || (key!="ready" && key!="hsm_team" && key!="hsm_ver" && key!="hsm_mod")) return;
+            if(!r.Done()) return;
+            // Pre40 publishes these per-player fields. The connection still determines
+            // whose row is updated, and lobby rule keys remain host-only.
+            if(key!="ready" && key!="hsm_team" && key!="hsm_ver" && key!="hsm_mod" &&
+               key!="hsm_card" && key!="hsm_sheet" && key!="hsm_live" && key!="hsm_claw" && key!="hsm_official") return;
+            if(value.size()>512) return;
             if(members[sender].data[key]!=value) { members[sender].data[key]=value; Changed(); }
             return;
         }

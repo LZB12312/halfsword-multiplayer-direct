@@ -110,6 +110,54 @@ static void TestPoseRejects() {
     CHECK(!Decode(b.data(), b.size(), o));
 }
 
+static void TestPoseAdmissionAndFrameDecode() {
+    const PoseMsg original = SomePose();
+    const auto good = Encode(original);
+    PoseMsg envelope = original;   // reuse must never expose a previous packet's owning payload
+    CHECK(DecodePoseEnvelope(good.data(), good.size(), envelope));
+    CHECK(envelope.pose.empty() && envelope.entity == original.entity && envelope.epoch == original.epoch);
+    CHECK(envelope.rootX == original.rootX && envelope.rootY == original.rootY && envelope.rootZ == original.rootZ);
+    CHECK(envelope.yawDeg == original.yawDeg);
+    PoseFrame actual, expected;
+    CHECK(DecodePoseFrame(good.data(), good.size(), envelope, actual));
+    CHECK(envelope.pose.empty());
+    CHECK(sync::DecodePose(original.pose.data(), original.pose.size(), expected));
+    CHECK(sync::EncodePose(actual) == sync::EncodePose(expected));
+
+    // An intact outer envelope is not permission to use/relay its payload. Bad codec/version/physics data must
+    // survive admission only to fail the full session decode; the owning Decode API must still reject it too.
+    auto refusesPayload = [&](const std::vector<uint8_t>& b) {
+        CHECK(DecodePoseEnvelope(b.data(), b.size(), envelope));
+        CHECK(!DecodePoseFrame(b.data(), b.size(), envelope, actual));
+        CHECK(envelope.pose.empty());
+        PoseMsg owned;
+        CHECK(!Decode(b.data(), b.size(), owned) && owned.pose.empty());
+    };
+    auto b = good; b[kPoseMsgHeaderBytes] ^= 0xFF; refusesPayload(b);   // wrong codec
+    b = good; b[kPoseMsgHeaderBytes + 7] = 8; refusesPayload(b);        // flail head without its weapon
+    b = good;                                                        // non-finite pelvis inside an otherwise valid envelope
+    const uint32_t nan = 0x7FC00000;
+    for (size_t i = 0; i < 4; ++i) b[kPoseMsgHeaderBytes + 10 + i] = uint8_t(nan >> (8 * i));
+    refusesPayload(b);
+    PoseMsg shortPose = original; shortPose.pose.resize(1); refusesPayload(Encode(shortPose));
+
+    // Every truncation, length mismatch, invalid root and invalid message identity fails the cheap gate too.
+    for (size_t n = 0; n < good.size(); ++n) {
+        CHECK(!DecodePoseEnvelope(good.data(), n, envelope));
+        CHECK(!DecodePoseFrame(good.data(), n, envelope, actual));
+    }
+    b = good; b.push_back(0); CHECK(!DecodePoseEnvelope(b.data(), b.size(), envelope));
+    b = good; b[4] = 0; CHECK(!DecodePoseEnvelope(b.data(), b.size(), envelope));
+    b = good; b[3] = uint8_t(MsgType::Vitals); CHECK(!DecodePoseEnvelope(b.data(), b.size(), envelope));
+    b = good; b[2] ^= 1; CHECK(!DecodePoseEnvelope(b.data(), b.size(), envelope));
+    PoseMsg invalid = original; invalid.rootX = std::numeric_limits<float>::infinity();
+    b = Encode(invalid); CHECK(!DecodePoseEnvelope(b.data(), b.size(), envelope));
+    invalid = original; invalid.yawDeg = 721.f;
+    b = Encode(invalid); CHECK(!DecodePoseEnvelope(b.data(), b.size(), envelope));
+    CHECK(!DecodePoseFrame(nullptr, good.size(), envelope, actual));
+    CHECK(!DecodePoseEnvelope(good.data(), kMaxPacket + 1, envelope));
+}
+
 static VitalsMsg SomeVitals() {
     VitalsMsg v;
     v.entity = 9; v.flags = 0x5; v.health = 77.5f; v.consciousness = 0.25f; v.stamina = 40.f; v.bleeding = 1.5f;
@@ -203,6 +251,7 @@ static void TestClaims() {
 int main() {
     TestPoseRoundTrip();
     TestPoseRejects();
+    TestPoseAdmissionAndFrameDecode();
     TestVitals();
     TestClaims();
     std::printf(g_fail ? "%d FAILED\n" : "all owner protocol tests passed\n", g_fail);

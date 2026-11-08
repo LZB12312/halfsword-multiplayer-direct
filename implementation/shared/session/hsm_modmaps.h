@@ -87,8 +87,14 @@ inline std::string SanitizePakName(std::string_view n) {
         const unsigned char u = static_cast<unsigned char>(c);
         const bool bad = u < 0x20 || u >= 0x7F || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
         s += bad ? '_' : c;
-        if (s.size() >= kMaxModPakName) break;
     }
+    // Whatever it's called, the result has to pass ModPakNameOk: the game loads a pak by any name, so a name mustn't be a way off the list.
+    // A tester's 800 MB pak hid behind a long name with control characters.
+    const bool isPak = s.size() >= 4 && modmaps_detail::EqNoCase(std::string_view(s).substr(s.size() - 4), ".pak");
+    if (isPak && s.size() > kMaxModPakName) s = s.substr(0, kMaxModPakName - 4) + ".pak";
+    else if (s.size() > kMaxModPakName) s.resize(kMaxModPakName);
+    for (size_t at; (at = s.find("..")) != std::string::npos;) s[at] = '_';
+    if (!s.empty() && s[0] == '.') s[0] = '_';
     return s;
 }
 

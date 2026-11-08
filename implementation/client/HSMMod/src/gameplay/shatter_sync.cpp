@@ -305,10 +305,97 @@ void ObjectSync::LogStructureSnap(const Prop& p, double worstCm) {
     HSM_LOG("props: structure %s snapped (%.0f cm off)", ObjectName(p.actor).c_str(), worstCm);
 }
 
+// A soft structure at rest was placed to the host's pose, or is held still after its lock. At most kRestLogsPerMinute lines a minute,
+// however many structures there are (the counters in the health line count every one).
+void ObjectSync::LogRestLock(const Prop& p, double errCm, bool placed) {
+    constexpr int kRestLogsPerMinute = 4;
+    const double now = SteadyNowMs();
+    if (now - restLogWindowMs_ >= 60000.0 || now < restLogWindowMs_) { restLogWindowMs_ = now; restLogCount_ = 0; }
+    if (restLogCount_++ >= kRestLogsPerMinute) return;
+    if (placed) HSM_LOG("props: structure %s placed to the host's rest pose (%.0f cm off), held still", ObjectName(p.actor).c_str(), errCm);
+    else HSM_LOG("props: structure %s held still at rest (%.0f cm off)", ObjectName(p.actor).c_str(), errCm);
+}
 // A structure's first broken joint (any later one is part of the same break): its loose bodies stream from here on.
 void ObjectSync::LogStructureBreak(const Prop& p, size_t constraint) {
-    if (p.brokenMask) return;
+    if (p.brokenMask || p.localBroken || p.bodyOffHere || BreaksHeld(p.heldJoints, p.heldBodies)) return;
     HSM_LOG("props: structure %s broke (constraint %zu); its loose bodies stream", ObjectName(p.actor).c_str(), constraint);
+}
+
+// The 0.8.0-pre29 breakables lines share one budget: at most kStructLogsPerMinute a minute (the health line counts every one).
+bool ObjectSync::StructLogBudget() {
+    constexpr int kStructLogsPerMinute = 12;
+    const double now = SteadyNowMs();
+    if (now - structLogWindowMs_ >= 60000.0 || now < structLogWindowMs_) { structLogWindowMs_ = now; structLogCount_ = 0; }
+    return structLogCount_++ < kStructLogsPerMinute;
+}
+
+// A level actor the host's walk found after the census (breakables do not simulate yet when it runs). It is a structure when it
+// has the shape of one, and it is driven only when its body count is the host's.
+void ObjectSync::MarkFound(uint64_t id, Prop& p, size_t hostBodies, size_t localBodies) {
+    if (IsWeaponId(id) || p.sub || env_.syncStructures == StructureMode::Full) return;
+    p.found = true;
+    p.shapeDiffers = !env_.host && !ShapesAgree(hostBodies, localBodies);   // the host's copy is the shape everyone is compared with
+    if (p.shapeDiffers) {
+        ++n_.shapeMismatch;
+        if (StructLogBudget())
+            HSM_LOG("props: %s body count differs (host %zu, here %zu); left to the physics here", ObjectName(p.actor).c_str(), hostBodies, localBodies);
+    }
+    if (!OwnCopy(id, p)) return;
+    if (StructLogBudget()) {
+        HSM_LOG("props: %s found late (%016llx), synced as a structure (%zu bodies, %zu joints)", ObjectName(p.actor).c_str(),
+                static_cast<unsigned long long>(id), p.bodies.size(), p.constraints.size());
+        LogStructureJoints(p);
+    }
+}
+
+// A structure as it was bound here: how many of its bodies simulate, hang on another of its bodies, and how many of its joints
+// are broken already. Two machines' lines for the same structure show whether their copies started alike (a plank's anchor
+// joints are traced at its BeginPlay on each machine).
+void ObjectSync::LogStructureJoints(const Prop& p) {
+    size_t sim = 0, hung = 0, broken = 0, gone = 0;
+    for (size_t b = 0; b < p.bodies.size(); ++b) {
+        const BodyRef& r = p.bodies[b];
+        if (!adapter_->StillValid(r.comp, r.index)) continue;
+        if (p.attachedMask & (uint64_t(1) << b)) ++hung;
+        RootCalls* c = CallsFor(r.comp);
+        if (!c) continue;
+        c->simulating.put(0, FName{});
+        if (c->simulating.invoke(r.comp) && c->simulating.take<bool>(1)) ++sim;
+    }
+    for (const ConstraintRef& c : p.constraints) {
+        if (!adapter_->StillValid(c.comp, c.index)) { ++gone; continue; }
+        Call ib(c.comp, "IsBroken");
+        if (ib.invoke() && ib.get<bool>("ReturnValue")) ++broken;
+    }
+    HSM_LOG("props:   %s: %zu bodies (%zu simulate, %zu hang on another), %zu joints (%zu broken, %zu gone)", ObjectName(p.actor).c_str(),
+            p.bodies.size(), sim, hung, p.constraints.size(), broken, gone);
+}
+
+// A break of this copy that is not passed on: not scanned again, and the copy is no longer steered as a whole (SoftDrive).
+void ObjectSync::KeepBreakHere(const Prop& p, const char* what, size_t index, LocalBreak why) {
+    LogLocalBreak(p, what, index, why);
+    ++n_.jointsKeptLocal;
+}
+
+// A break that waits to be passed on (NextBreakStep): PollEvents comes back to it.
+void ObjectSync::HoldBreakHere(const Prop& p, const char* what, size_t index, LocalBreak why) {
+    ++n_.breaksHeld;
+    if (StructLogBudget())
+        HSM_LOG("props: structure %s %s %zu broke here (%s); held, it goes to everyone shortly", ObjectName(p.actor).c_str(), what, index,
+                LocalBreakName(why));
+}
+
+// A joint broke or a body came off in this machine's copy of a structure that another machine streams.
+void ObjectSync::LogLocalBreak(const Prop& p, const char* what, size_t index, LocalBreak share, bool afterHold) {
+    if (!StructLogBudget()) return;
+    const char* follow = p.following ? " while it follows the host copy" : "";
+    if (share == LocalBreak::Share)
+        HSM_LOG("props: structure %s %s %zu broke here%s; passed on to everyone%s", ObjectName(p.actor).c_str(), what, index, follow,
+                afterHold ? " after a hold" : "");
+    else
+        HSM_LOG("props: structure %s %s %zu broke here%s (%s); kept on this screen, the copy %s", ObjectName(p.actor).c_str(), what,
+                index, follow, LocalBreakName(share), FollowsWhenBroken(env_.syncStructures, env_.structureFollowBroken, p.found, p.shapeDiffers)
+                                                  ? "follows the host body by body" : "is no longer corrected");
 }
 
 }  // namespace hsm::game

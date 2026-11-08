@@ -204,12 +204,32 @@ public:
         return out;
     }
 
+    // Whether this proposal would make a new object, rather than answer for one already known. Propose decides the same way.
+    bool WouldCreate(const ObjectAnnounceMsg& p, double nowMs) const {
+        if (answers_.count(p.objId)) return false;
+        for (const auto& [id, k] : known_) {
+            if (k.classHash != p.classHash) continue;
+            float kx = k.px, ky = k.py, kz = k.pz;
+            if (nowMs >= 0.0 && k.atMs >= 0.0) ExtrapolatePlace(kx, ky, kz, k.vx, k.vy, k.vz, nowMs - k.atMs);
+            const float tol = nowMs >= 0.0 ? ProposalTolUu(tol_, SpeedOf(k.vx, k.vy, k.vz)) : tol_;
+            const float dx = p.px - kx, dy = p.py - ky, dz = p.pz - kz;
+            if (dx * dx + dy * dy + dz * dz <= tol * tol) return false;
+        }
+        return true;
+    }
+
     // The host's own spawn (or an object it adopts by migration): a canonical id in the host's slot. 0 when the table is full.
     uint64_t SpawnLocal(uint32_t classHash, float px, float py, float pz, uint8_t bodyCount, uint64_t parentId = 0) {
         if (classHash == 0 || bodyCount == 0 || bodyCount > kMaxAnnounceBodies || !CensusPlaceOk(px, py, pz) || known_.size() >= kMaxKnownObjects) return 0;
         const uint64_t id = minter_.Mint();
         if (id) known_[id] = Known{classHash, px, py, pz, bodyCount, parentId};
         return id;
+    }
+    // The host's own body count of an object a client proposed (the proposal carries the proposer's): what later announces
+    // say, so every machine compares its copy with the host's.
+    void SetBodyCount(uint64_t objId, uint8_t bodyCount) {
+        auto it = known_.find(objId);
+        if (it != known_.end() && bodyCount >= 1 && bodyCount <= kMaxAnnounceBodies) it->second.bodyCount = bodyCount;
     }
     // Keep a known object's place current (from its BodyState stream), so a late proposal still finds it where it moved to.
     // This form carries no velocity: the place is exact and nothing is carried forward from it.

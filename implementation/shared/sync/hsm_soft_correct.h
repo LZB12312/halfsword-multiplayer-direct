@@ -38,6 +38,9 @@ constexpr double kStuckMs = 2000.0;
 constexpr double kSnapGapMs = 5000.0;        // a structure is snapped at most this often
 constexpr double kSnapCoherentMs = 300.0;    // the snapshot's states arrived within this of each other ...
 constexpr double kSnapFreshMs = 500.0;       // ... and the newest is no older than this
+constexpr double kSnapSettleMs = 6000.0;     // no snap this soon after the structure was bound here (it settles)
+constexpr double kRestCmS = 3.0;             // a body slower than this (and turning slower than kRestDegS) is at rest
+constexpr double kRestDegS = 3.0;
 
 // ---------------------------------------------------------------- quaternion helpers (x, y, z, w; Q4 is unit)
 inline Q4 QMul(const Q4& a, const Q4& b) {
@@ -114,6 +117,15 @@ inline SoftSteer Steer(const V3& curPos, const Q4& curRot, const SoftTarget& t, 
     return out;
 }
 
+// A body inside the dead band whose host state and local state are both at rest keeps its own velocity: writing the host's
+// (near zero) velocity on every state wakes a body the physics engine put to sleep, and a woken pile of planks jiggles. Until
+// 0.8.0-pre29 every received state wrote it.
+inline bool KeepLocalVelocity(const SoftSteer& st, const V3& hostVel, const V3& hostAngVel, const V3& localVel,
+                              const V3& localAngVel) {
+    return !st.corrected && VLen(hostVel) < kRestCmS && VLen(hostAngVel) < kRestDegS && VLen(localVel) < kRestCmS &&
+           VLen(localAngVel) < kRestDegS;
+}
+
 // ---------------------------------------------------------------- when the whole structure is placed at once
 // Tracks how long some body of a structure has been further than kStuckCm from its target.
 struct StuckTimer {
@@ -136,5 +148,8 @@ inline bool SnapReady(double oldestAgeMs, double newestAgeMs) {
 inline bool ShouldSnap(bool snapshotReady, double worstErrCm, double stuckMs, double sinceSnapMs) {
     return snapshotReady && sinceSnapMs >= kSnapGapMs && (worstErrCm > kSnapCm || stuckMs >= kStuckMs);
 }
+
+// A snap needs a structure that had time to settle since it was bound here.
+inline bool SnapAllowed(double sinceSettledMs) { return sinceSettledMs >= kSnapSettleMs; }
 
 }  // namespace hsm::sync

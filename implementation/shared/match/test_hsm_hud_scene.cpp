@@ -468,6 +468,9 @@ static void TestOneFight() {
     CHECK(s.pill.text == "FIGHT \xC2\xB7 2 LEFT");                      // opponents standing, no wave number
     MatchInfo b = Survival(); for (FighterEntry& f : b.fighters) if (f.team == kBotTeam) f.alive = false;
     CHECK(BuildHudScene(b, one, kAt).pill.text == "FIGHT");
+    b = Survival();                                                    // an opponent that gave up is out, alive or not
+    for (FighterEntry& f : b.fighters) if (f.team == kBotTeam && f.alive) { f.down = true; break; }
+    CHECK(BuildHudScene(b, one, kAt).pill.text == "FIGHT \xC2\xB7 1 LEFT");
     b = Survival(); b.phase = uint8_t(MatchPhase::SuddenDeath);
     CHECK(BuildHudScene(b, one, kAt).pill.text == "SUDDEN DEATH");
     LocalHud down = one; down.dead = true; down.diedAtMs = kAt;
@@ -481,7 +484,12 @@ static void TestOneFight() {
     CHECK(BuildHudScene(Survival(), tab, kAt).board.title == "PROGRESSION FIGHT");
     b = Survival(); b.phase = uint8_t(MatchPhase::Results); b.winner = kHumanTeam; b.timeLeftMs = 4200;
     s = BuildHudScene(b, one, kAt);
-    CHECK(s.board.footer == "BACK TO THE TAVERN IN 5" && s.pill.text == "PLAYERS WIN");
+    // won: the fight waits for G, as the stock game does (the report); a loss goes back by itself, as before
+    CHECK(s.board.footer == "FIGHT WON \xC2\xB7 HOLD G TO GO ON \xC2\xB7 OR IN 5" && s.pill.text == "PLAYERS WIN");
+    CHECK(s.hold.visible && s.hold.text == "FIGHT WON - HOLD G TO GO ON (OR IN 5)" && !s.hold.bar);
+    b.winner = kBotTeam;
+    s = BuildHudScene(b, one, kAt);
+    CHECK(s.board.footer == "BACK TO THE TAVERN IN 5" && !s.hold.visible);
 
     // Elsewhere it changes nothing: Survival keeps its waves, the other formats their rules.
     s = BuildHudScene(Survival(), Me(), kAt);

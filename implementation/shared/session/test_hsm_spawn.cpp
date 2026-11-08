@@ -298,7 +298,30 @@ static void TestStandableSpread() {
     for (size_t i = 2; i < e.size(); ++i) CHECK(e[i].x >= 0);           // ring picks stay on the standable side
 }
 
+// The report: NPCs spawned right on the players at a Doubles start. The Cellar: four spawners; the player stood at one, the
+// mercenary and the two opponents at the other three. A client's spread slot near the player is never one by another spawner.
+static void TestCoopStart() {
+    const Point3 player{722, 442, 120};
+    const std::vector<Point3> spawners = {{700, 400, 100}, {722, 742, 100}, {-600, 0, 100}, {0, -600, 100}};
+    std::vector<Point3> taken = CoopStartTaken(player, {player}, spawners);
+    CHECK(taken.size() == 1 + 3);                                         // the fighter, and every spawner but the player's own
+    for (const Point3& t : taken) CHECK(!(t.x == 700 && t.y == 400));    // the player's own spawner is no hazard
+    bool mercenarySpawner = false;
+    for (const Point3& t : taken) mercenarySpawner = mercenarySpawner || (t.x == 722 && t.y == 742);
+    CHECK(mercenarySpawner);
+    auto stands = [](const Point3&, const Point3&) { return true; };
+    SpawnArea area;                                                       // no arena bound
+    for (size_t e = 2; e <= 4; ++e) {                                     // three clients
+        const Point3 p = StandableSpot(player, taken, e, kMinFighterGapCm, area, stands);
+        for (const Point3& t : taken) CHECK(FlatDist2(p, t) >= kMinFighterGapCm * kMinFighterGapCm - 1e-6);
+        taken.push_back(p);
+    }
+    CHECK(CoopStartTaken(player, {}, {}).empty());
+    CHECK(CoopStartTaken(player, {}, {{1, 1, 0}}).empty());               // a lone spawner is the player's own
+}
+
 int main() {
+    TestCoopStart();
     TestLine(); TestDistinctAndSpread(); TestFewerCandidatesAndDeterminism();
     TestSpreadSlotsKeepTheGap(); TestSpreadPositions(); TestFreeSpot(); TestSaneStandOffset(); TestStandableRing();
     TestNavigableRing(); TestFloorFits(); TestAreaOf(); TestStandableSpotPit(); TestStandableSpotFallback();

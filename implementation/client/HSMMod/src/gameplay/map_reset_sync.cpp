@@ -195,7 +195,7 @@ size_t ObjectSync::ClearMovedProps(double nowMs) {
         c.bornInMatch = p.bornMs > baselineMs_ + kBaselineGraceMs;
         c.held = p.attachedSent || ObjectField(p.actor, 0) != nullptr;
         c.denied = p.denied; c.sub = p.sub;
-        c.structure = IsStructure(id, p.sub, p.bodies.size(), p.constraints.size());   // by shape, whatever sync_structures says
+        c.structure = IsStructure(id, p.sub, p.bodies.size(), p.constraints.size(), p.found);   // by shape, whatever sync_structures says
         c.unmoved = true;                                  // a body that cannot be read counts as at rest: kept
         for (size_t b = 0; b < p.bodies.size() && b < p.start.size(); ++b) {
             if (!p.start[b].ok || p.bodies[b].detached) continue;

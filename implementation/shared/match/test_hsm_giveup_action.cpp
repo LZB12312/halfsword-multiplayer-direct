@@ -66,7 +66,28 @@ static void TestNotFought() {
     CHECK(Alive(Info(Format::PlayersVsBots, MatchPhase::Countdown, 5000)) == GiveUpAction::None);   // a gap outside a fight is not a break
 }
 
+// The report: a Progression fight won should wait for G, as the stock game does, not go back on its own.
+static void TestClaimWin() {
+    MatchInfo won = Info(Format::PlayersVsBots, MatchPhase::Results); won.winner = kHumanTeam;
+    CHECK(Alive(won, true) == GiveUpAction::ClaimWin && Out(won, true) == GiveUpAction::ClaimWin);   // the dead go on too
+    CHECK(CoopFightWon(won, true) && !CoopFightWon(won, false));
+    CHECK(Alive(won) == GiveUpAction::None);                                                  // Survival's results: as before
+    MatchInfo lost = won; lost.winner = kBotTeam;
+    CHECK(Alive(lost, true) == GiveUpAction::None && !CoopFightWon(lost, true));              // a loss goes back by itself
+    MatchInfo live = won; live.phase = uint8_t(MatchPhase::Live);
+    CHECK(Alive(live, true) == GiveUpAction::GiveUpFight);                                    // in the fight G still gives it up
+    MatchInfo duel = won; duel.format = uint8_t(Format::Duel);
+    CHECK(Alive(duel, true) == GiveUpAction::None);
+    CHECK(StatusLine(won, 1, true).find("hold G") != std::string::npos && StatusLine(lost, 1, true).find("Tavern") != std::string::npos);
+    // blows still count while the won fight waits for G (the report: the opponents who gave up were invincible)
+    auto blows = [](const MatchInfo& m, bool oneFight) { return BlowsCount(Format(m.format), MatchPhase(m.phase), m.winner, oneFight); };
+    CHECK(blows(won, true) && blows(live, true) && blows(live, false));
+    CHECK(!blows(won, false) && !blows(lost, true) && !blows(duel, true));                     // other results: no blows, as before
+    for (MatchPhase p : {MatchPhase::Idle, MatchPhase::Countdown}) { MatchInfo m = won; m.phase = uint8_t(p); CHECK(!blows(m, true)); }
+}
+
 int main() {
+    TestClaimWin();
     TestSurvivalWave();
     TestSurvivalBreak();
     TestZombies();

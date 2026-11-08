@@ -78,13 +78,32 @@ Protocol revision 37: 0.8.0-pre23 connects only to pre23. In-game test steps: do
 ## New in 0.7.0 (pre-release)
 
 - **Name tags** above other fighters, team colours in team formats; they fade out behind walls (a visibility trace from the camera, 10 times a second per fighter) and `name_tags=0` under `[net]` hides them.
+- **Classes on fighters**: in a Classes lobby, a second name tag line gives each fighter's class, Strength, Weight and Bones (`class_tags=0` under `[net]` hides it), and, while the lobby holds everyone to the tier's build, their muscles show their class's Strength on every screen (`class_look=0` leaves the game's own look).
 - **Same strength for everyone** (from 0.8.0-pre20; `force_strength=0` under `[net]` turns it off, the host's setting rules the match): every player is built like a fighter of the lobby's tier (Brawl: always tier 5), whatever their own character, so nobody is heavier or has a stronger grip than another and a grab works the same both ways. The lobby's Tier row sets it, with your own gear too. Survival and Zombies have a Gear row (own loadouts, random by tier, everyone identical), kept for the whole run. `force_strength=0`: everyone keeps their own build.
 - **Scabbard fix** (on by default after 0.8.0-pre18; `scabbard_fix=0` under `[net]` turns it off): belt weapons that hang in
   a scabbard (most swords and maces) stay at the other player's hip on host physics and owner sync alike, and a belt weapon
   that ends up far from its socket is put back. `scabbard_fix=0` gives the 0.8.0-pre18 behaviour.
+- **No more invisible wall behind other players** (`standin_box_fix=0` under `[net]` turns it off): your arms and body no
+  longer stop in mid-air behind another player.
+- **Hidden body parts test** (`standin_parts_off=1` under `[net]`, off by default): turns off collision on hidden parts of
+  the other players' bodies in your game. It is a test switch: use it when asked to help track down blows that stop in
+  mid-air, then set it back to `0`.
+- **Armour holds against stuck blades** (from 0.8.0-pre30; `stuck_armor_gate=0` under `[net]` turns it off): a blade
+  that lodges in you on the attacker's screen does no stuck damage in your game when your own armour stopped that blow.
+  The attacker sees you a little late, so a blade could lodge there through armour that held in your game. Your setting
+  applies to blows on you.
 - **Grab drag** (on by default after 0.8.0-pre16; `grab_drag=0` under `[net]` turns it off): a grab on any part of
   another player drags them the way a grab on a down body's foot does; the held part follows the hand without the
   rest of the body pulling it apart.
+- **Two-handed weapon playback** (`standin_two_hand_pose=1` under `[net]`, default): aligns the other player's
+  two-handed weapon and arm targets when both arms can follow the received pose, including ordinary character
+  heights. It reinitializes the existing grip joints once when taking over a grip, then updates their reference
+  frames while preserving configured limits and drives. `0` restores earlier playback for comparison. Each machine's
+  setting affects the fighters it receives. This candidate needs in-game testing, especially grip changes and drops;
+  see `docs/HUMAN_TESTING.md`, issue #1596. Detailed `twohand:` measurements are recorded only with Help improve
+  enabled; they measure local playback error against the received target, not network delay.
+  While this playback holds a weapon, both hands lock onto it (`standin_two_hand_lock=1`, default), so they stay
+  on the shaft; `0` lets the off hand slide and turn on the shaft as before, for comparison.
 - **Structures stream softly** (from 0.8.0-pre18; `sync_structures` under `[net]`): things built of several parts joined
   together, such as the Pit's bridge or the Cellar's chains, are simulated by the host and sent to the others as one
   snapshot, 20 times a second while any part moves. The other players' games never teleport a part: they steer it toward
@@ -94,6 +113,18 @@ Protocol revision 37: 0.8.0-pre23 connects only to pre23. In-game test steps: do
   leaves it as it is, and when a part breaks off it breaks for everyone and then moves as any loose piece.
   `sync_structures=soft` (default), `local` (nothing is sent: every game simulates its own copy) or `full` (as
   0.8.0-pre17: sent and teleported like loose pieces). An old `sync_structures=0` reads as `soft` and `1` as `full`.
+  A barrel or crate that breaks on your screen alone follows the host piece by piece; `structure_follow_broken=0` under
+  `[net]` leaves it to your own physics instead. A break that lands just after your copy was put back in place now reaches
+  everyone a second later; `structure_share_held_breaks=0` under `[net]` keeps it on your screen. While the host copy of a
+  late-found barrel, plank or board moves, your copy is placed from the host states as a rock is, not only steered;
+  `structure_follow_moving=0` under `[net]` goes back to steering. A level prop is matched to the host's
+  list by where it lay early in the fight, so a roll before the match does not cost it its place; `prop_census_snapshot=0` under `[net]`
+  matches it where it is at the first match, as 0.8.0-pre34. A soft structure that is at rest on the host is placed once to its rest
+  pose on your screen and then held still; `structure_rest_lock=0` under `[net]` turns that off. Hanging bridges are placed at rest and
+  follow the host while moving too, all their parts at once; `structure_bridges_follow=0` under `[net]` steers them as 0.8.0-pre35. A
+  barrel plank that came off on another screen comes off on yours by the barrel's own code, so its collision, sound and Health match;
+  `structure_game_break=0` under `[net]` only takes it off, as 0.8.0-pre35. A hit in the first seconds after a prop loads now reaches
+  everyone as well.
 - **Lock-on under host sync** (on by default after 0.8.0-pre18; `host_lock_on=0` under `[net]` turns it off, per machine): a client
   in a Host-sync match gets the camera lock back: guarding with the camera lock on turns your camera towards the fighter
   in front of you, and your fighter faces it on every screen. Short key taps (back, run, jump) are no longer lost
@@ -248,7 +279,13 @@ Protocol revision 37: 0.8.0-pre23 connects only to pre23. In-game test steps: do
 3. Start the game once to create `HSMMod.ini` (same folder; default `role=steam`). Direct IP (`role=host`, `role=client`, `host=`, `port=`) was removed in 0.8.0: an old
    value is logged once as ignored and Steam is used. Players join through Steam lobbies.
 4. Logs go to `HSMMod.log` in the same folder.
-   **UE4SS (optional):** install UE4SS as usual, then copy HSMMod's `dwmapi.dll` over UE4SS's `dwmapi.dll`. HSMMod
+   **UE4SS:** nothing to install. `dwmapi.dll` carries a UE4SS build (`third_party/ue4ss`) and unpacks it to `ue4ss/` next
+   to the exe, keeping any file already in that folder. An older accepted build in `ue4ss/` gets its DLL swapped. A
+   build the mod doesn't know gets a popup at start: Yes swaps it, No keeps and loads it, and online play refuses it.
+   `ue4ss_keep` under `[mod]` holds the hash you said no to; remove it to be asked again. An old-layout `UE4SS.dll` or
+   a 2.x `xinput1_3.dll` gets `.off` on its name, and mods in an old `Mods` folder beside the exe don't move. The
+   console and cheat manager mods are off in the unpacked `mods.txt`. The log says `ue4ss: bundled build installed`
+   or `replaced another build`. HSMMod
    chain-loads UE4SS from its worker thread (`ue4ss_load.cpp`, never DllMain): `ue4ss/UE4SS.dll` (UE4SS 3.x layout),
    else `UE4SS.dll` next to the exe. Updating UE4SS later overwrites HSMMod's proxy, so copy ours back (the
    multiplayer page warns when the `dwmapi.dll` next to the exe is not ours). `[mod]` in `HSMMod.ini`: `ue4ss=1`
@@ -260,6 +297,10 @@ Protocol revision 37: 0.8.0-pre23 connects only to pre23. In-game test steps: do
    order is unproven until the in-game spike.
 5. Every player needs the same HSMMod build. The lobby names anyone on another build ("Bob on 0.6.5 - update") and the
    host cannot start a match until it matches; `allow_build_mismatch=1` in `HSMMod.ini` overrides this for testing.
+   From 0.8.0-pre26 the build ends with the first 12 hex digits of the SHA-256 of the mod's own `dwmapi.dll`
+   (`0.8.0-pre26 (3dc8f7c) #1a2b3c4d5e6f`, logged at startup as `build: ...`), so only identical DLLs match: everyone
+   on the same release matches, a DLL built yourself does not. Two people building the same commit get different
+   hashes too; use `allow_build_mismatch=1` on the host when testing such builds together.
 
 ## Matches, teams and bots (Phase 3)
 
@@ -288,6 +329,28 @@ Protocol revision 37: 0.8.0-pre23 connects only to pre23. In-game test steps: do
   when every player is down at the same time.
 - **Progression**: fights are co-op against the event's opponents (synced as bots). When they are all down, or every
   player is, the host returns everyone to the Tavern hub.
+- **Multiplayer career** (`progression_save=1` under `[net]`, the default; `session/hsm_mp_career.h`): a session's
+  Progression plays on a career of its own, `HSMMP_Progression.sav` next to `GameProgress.sav`, one per machine. The
+  first time starts a new character (character creation in the Tavern, no tutorial); after that it is read in when the
+  session enters Progression, and written in the Tavern after each fight, when the session leaves Progression and when
+  it ends (the one before the last write is kept as `HSMMP_Progression.prev.sav`). The single-player save is never
+  changed: the game's own Load Game and Save Game borrow its slot for a moment, and the player's save goes straight
+  back. The log says `career: ...` at every step. `progression_save=0`: the session plays on the single-player career in
+  memory and keeps nothing.
+- **A co-op fight's end on every career** (`progression_fight_end=1` under `[net]`, the default; ProgressionResult 69,
+  `session/hsm_career.h`): the host tells every player how the fight went, and each machine does what the stock end
+  screens would have to its own career. The game's own capture runs (each limb heals 10, between 25 and 100; a clean win
+  keeps the gear held and worn); a win pays every player the whole purse and half of it as reputation; a Tourney won
+  ranks every player up; the time moves one step on the host's clock (a travel carries its Day Time and Day Count). The
+  next fight starts with those injuries; the Innkeeper heals them. A death is a hard loss: no Hell, no new character.
+  `progression_fight_end=0`: only the host's purse is paid.
+- **A co-op fight as the stock game plays it**: a fight is won once every opponent is out (dead, given up or downed); a
+  hired mercenary fights on the players' side and need not fall, and Carnage's NPCs fight each other too (each adopted
+  fighter keeps its stock side). After the win the fight waits for any player to hold G, at most 2 min, and blows still
+  count (`progression_claim_g`). A multi-round contest plays its rounds in the same arena, the purse paid after the last,
+  a time step every third round, a Tourney's champion before its final (`progression_rounds`). A Brawl starts everyone in
+  pants, Blossfechten in its training gear. The host starts where the stock spawner put the player, the others round it
+  clear of every fighter and spawner. Both options under `[net]`, the host's, default 1; `0` is the old behaviour.
 - **One world for everyone**: stock fighters that are not part of the match are removed on every machine, and the
   stock death/win screens are blocked during a session match (no slow motion, no input lock, and no Progression
   career reset on death).
@@ -319,6 +382,45 @@ Chat commands, run by the session host (the console of a `role=server` host take
 - `server_admins=` (Steam IDs) may kick and ban from the chat; `votekick=0` (or `server_votekick=0`) turns votes off.
 
 A kicked or banned player goes back to the main menu, and the multiplayer page opens with the reason in red.
+
+## Lobby mod rules
+
+The host of a lobby chooses which mods its players may run, in `HSMMod.ini` under `[mod]`:
+
+- `mod_rule=vanilla`: no mods. UE4SS alone is fine; its mods and its stock console mods aren't. `maps` (default): custom map paks (a pak with a map that replaces no stock file and has nothing under `/Game/Mods`) and known cosmetic mods. `bundle`:
+  exactly the files of the lobby's modpack (`pack=`). `custom`: the list in `mod_allow=` (or, when it is empty,
+  whatever the host runs). `anything`: no limit.
+- `mod_cheats=block` (default) refuses anyone running a known cheat mod (HS Enhancer, the UE4SS cheat mods); `allow`
+  lets them in. A host who runs a cheat mod itself cannot block cheats, and the lobby list names it ("host runs
+  HSEnhancer").
+- `mod_official=1` takes official HSMMod releases only (checked against the release's `dwmapi.dll` by the update
+  check). A self-built HSMMod cannot turn it on.
+- `mod_allow=A.pak, B*1a2b3c4d, +Needed.pak`: the custom list. `*` pins the first 8 hex digits of the file's SHA-256,
+  `+` makes a mod required.
+
+These four keys can be edited while the game runs: save `HSMMod.ini` and the lobby takes the new rule within 2 s.
+The host can also change the first three on the lobby's MODS tab; the tab writes them back to `HSMMod.ini`.
+
+What players see:
+
+- The lobby list marks a lobby whose rule refuses your mods, with the reason ("Blocks HSEnhancer", "Vanilla only",
+  "Remove Foo.pak +2", which means two more mods have to go as well). A rule other than the default shows next to the map ("mods: Vanilla").
+- Every player needs the same HSMMod file as the host. Someone on another build is refused at the join with both
+  build hashes, unless the host sets `allow_build_mismatch=1`.
+- After joining, your HSMMod sends the host the names and hashes of your mods (paks under `Content/Paks`, enabled
+  UE4SS mods, proxy DLLs next to the game, a detected HS Enhancer). Nothing else is read. Proxy DLLs such as ReShade's
+  `dxgi.dll` are listed but never refused by a rule. You get your fighter once the host has checked the list; until
+  then you can chat, but chat commands and votes wait. If your mods do not fit, you go back to the menu and the
+  multiplayer page says what to remove or install.
+- If the host changes the rule during a session, everyone sees the new rule in the chat. A player who no longer fits
+  has 60 seconds to fix it before the host removes them. A removal is not a kick or a ban, so they can join again
+  once they fit.
+- Players on the same HSMMod build as the host also answer a check of HSMMod's own code every few minutes. A player
+  who fails it three times is removed. `mod_challenge=0` on the host turns this off.
+- The lobby's MODS tab shows the rule in force and every mod anyone in the session runs: its kind, what HSMMod
+  knows about it (cheat, gameplay, cosmetic, map), who runs it, and why the rule refuses it. Everyone in the lobby
+  sees the list (file names and hashes only). The host also sees who it is still checking.
+- `mod_rules=0` turns all of it off on that machine: no rule for your lobbies, no build check, no lobby-list marks.
 
 ## In-game bug reports
 
@@ -359,8 +461,9 @@ NO THANKS or Esc leaves it off; `help_improve_asked=1` records the answer). It i
 When on, your HSMMod log (same redaction as above: Steam IDs, IPs and your Windows user name removed; player names
 stay) is sent to
 the bug report server whenever someone in your lobby files a report, without waiting for you to type `/sendlog`. And if
-your last session crashed (`crash: fault` in `HSMMod.prev.log`), the next start files a crash report by itself: its
-public text is the crash line only, both logs go privately. When that report is filed in the menu, it is shared with
+your last session crashed (`crash: fault` in `HSMMod.prev.log`), the next start files a crash report by itself: the
+report server passes the crash line, the match facts and the end of that session's log to Sentry, the private crash
+tracker the maintainers use, and nothing goes on a public issue. When that report is filed in the menu, it is shared with
 the next session you join within 30 minutes, so the players there who also turned it on add their logs (their logs
 still hold the crashed session if they kept playing). Off, nothing is sent unless you type the command; after a crash
 the chat says once where the button is. When on, the session health lines also carry a hit audit (`hit audit (help
@@ -463,7 +566,8 @@ writes `HSMTest.json` next to the exe. Check it from the repo root:
   lighting classes), and whether setting it before the level loads changes anything. It needs a look at the game's
   Blueprints before any code is written.
 - Loadouts with no fabric armor show no team colour (adding a tabard is not done yet).
-- Progression rewards (payout, rank points, injuries) are not yet applied to clients' own saves after co-op fights.
+- Progression co-op: a fight's end does not yet add the opponent who beat you to your nemeses or give a Lord's Tourney its
+  Baron armour, and a contest's next round reloads the arena, so what lies on the ground does not carry over.
 - Direct IP (ENet) was removed in 0.8.0; servers and players use Steam lobbies.
 - Next: a spectator host (`role=server`): the retail game plus this mod hosting with no fighter of its own and
   automatic match start/rotation. It is a hosted retail instance, not a dedicated server build.

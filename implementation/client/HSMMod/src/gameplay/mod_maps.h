@@ -10,6 +10,7 @@
 //             which maps it knows; a map the pak index did not name is listed without a pak
 // Game thread only, except the worker, which touches only its own state and the mutex-guarded results.
 #pragma once
+#include "session/hsm_mod_rules.h"
 #include "session/hsm_modmaps.h"
 #include "session/hsm_modpack.h"
 #include <string>
@@ -21,8 +22,11 @@ void Tick();      // each frame: starts the first scan, takes the worker's resul
 void Rescan();    // files may have been dropped in since the start: list again (a hash already known is not recomputed)
 
 const std::vector<ModMapEntry>& Maps();   // the custom maps, sorted; ModMapEntry::pak indexes Paks()
+std::vector<std::string> Unchecked();   // what the last scan couldn't vouch for, for the online check
 const std::vector<ModPak>& Paks();        // the mod paks found, hashed or not yet
 const std::vector<LocalPack>& Packs();    // the packs installed under Paks/~mods/<pack>/ (HSMPack.ini), valid or not
+const std::vector<ModKind>& PakKinds();   // per Paks()[i]: MapPak or ContentPak (session/hsm_mod_rules.h ClassifyPak)
+uint32_t ScanVersion();                   // changes whenever Paks(), PakKinds() or the hashes change
 bool Listed();                            // the file listing is complete (hashing may still run)
 bool AllHashed();                         // every pak listed has its SHA-256
 

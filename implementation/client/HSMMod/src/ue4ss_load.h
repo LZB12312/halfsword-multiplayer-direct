@@ -3,6 +3,7 @@
 // and the mods.txt reading are in shared/session/hsm_ue4ss.h.
 #pragma once
 #include <string>
+#include <vector>
 #include "config.h"
 
 namespace hsm::ue4ss {
@@ -19,4 +20,7 @@ std::string ReportVersion();
 std::string ReportMods();
 // A warning for the multiplayer page when the dwmapi.dll next to the exe is not HSMMod's, else empty.
 std::string Notice();
+// The enabled mod folders under modsDir (".../Mods" with a trailing backslash): mods.txt and enabled.txt, as UE4SS reads
+// them (session/hsm_ue4ss.h). The mod report (gameplay/mod_rules.cpp) lists them. Any thread.
+std::vector<std::string> EnabledModNames(const std::wstring& modsDir);
 }  // namespace hsm::ue4ss

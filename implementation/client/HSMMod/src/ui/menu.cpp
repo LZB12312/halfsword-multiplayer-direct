@@ -5,6 +5,8 @@
 #include "util/hsm_names.h"
 #include "gameplay/damage_pin.h"
 #include "gameplay/mod_maps.h"
+#include "gameplay/mod_rules.h"
+#include "enhancer.h"
 #include "gameplay/mod_pack.h"
 #include "gameplay/session.h"
 #include "log.h"
@@ -13,15 +15,19 @@
 #include "net/update_check.h"
 #include "net/address_service.h"
 #include "ui/loadout_editor.h"
+#include "match/hsm_class.h"
 #include "match/hsm_hud_style.h"
+#include "match/hsm_lobby_mods.h"
 #include "match/hsm_lobby_scene.h"
 #include "match/hsm_menu_pick.h"
 #include "session/hsm_password.h"
 #include "util/hsm_bmp.h"
+#include "paths.h"
 #include <windows.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -54,7 +60,7 @@ struct BrowserView { Card card; Text name, detail, players, note; };
 struct ChatRow { Box row; Text name, text; };
 struct MemberView { Card card; Icon swatch, avatar, ready; Text name, badge, team; };
 struct HostView { Card card; Text name, blurb; };
-struct TabView { Card card; Text label; Panel line; };   // MODE | RULES | MAP: the chosen one underlined in the accent
+struct TabView { Card card; Text label; Panel line; };   // MODE | RULES | MAP | MODS: the chosen one underlined in the accent
 
 // A player's Steam avatar as an engine texture, made once and kept while the engine keeps it (an Image's brush holds
 // it; one no row shows any more is collected, and made again when it is needed).
@@ -68,6 +74,7 @@ struct Avatar {
 };
 constexpr int kAvatarTries = 20;                     // once a second while Steam fetches it
 struct StepperView { Box box; Text label, value, hint; Flat prev, next; };
+struct ClassRow { Box box; Flat name; Text value; Flat prev, next; };
 // The Damage row's value (0.8.0-pre26): a slider (0..200%) with the number beside it; a click on the number swaps in a
 // text box for a custom value up to 1000% (Enter applies, Esc or clicking away cancels). Host only.
 struct DamageView {
@@ -77,7 +84,11 @@ struct DamageView {
     bool editing = false, hadFocus = false, focused = false, enterDown = false, escDown = false, dragging = false;
     float shown = -1;                                // where the slider was last put (-1: not yet)
 };
-constexpr size_t kTabCount = 3;                      // MODE, RULES, MAP
+// MODS tab: one mod: its name, "kind · who runs it", why the lobby refuses it; the verdict on the right.
+struct ModItemView { Box box; Text name, detail, note, verdict; };
+constexpr size_t kModItemRows = 48;                  // more: "+N more" (the host's log has the whole list)
+constexpr size_t kTabCount = 5;                      // MODE, RULES, MAP, MODS, CLASSES
+constexpr size_t kModsTab = 3, kClassesTab = 4;
 constexpr size_t kSectionCount = size_t(LobbySection::Count);
 
 struct State {
@@ -91,6 +102,43 @@ struct State {
     mp::Maker maker;
     TextButton openButton;
     Panel panel;                             // the full-screen multiplayer page (a Border over the whole menu)
+    // The CLASSES tab, which YOUR CLASS and the lobby's CHANGE go to: the classes, what the picked one does, and what each row means.
+    Text className, classNote, classInfoName, classInfo;
+    std::vector<Flat> classPicks;            // one per class, in ClassPickName's order
+    std::vector<ClassRow> classFields;
+    Bar classAttack, classSpeed, classTough;
+    Text classBudget;
+    std::vector<Flat> classTabs;              // the dropdown's items; classTabButton opens it
+    Flat classTabButton, classNew, classDelete, warnOn, warnCancel;
+    Box classTabList;
+    bool classTabOpen = false, classDeleteArmed = false, warnOpen = false;
+    Panel warn;                               // the Unrestricted disclaimer
+    Flat classUnrestricted, classAllowHse;
+    Text warnTitle, warnBody, warnMods;
+    bool warnIsHse = false;                   // the warning panel is asking about HS Enhancer, not Unrestricted
+    Text classWhere, classTabNote;
+    int classTab = kClassTabPlain;
+    uint32_t classFrame = 0;
+    Panel block;                              // the unsupported mods overlay
+    Box blockList;
+    Text blockIntro;
+    std::vector<Text> blockLines;
+    Flat blockFolder, blockClose, blockTurnOff;
+    Text blockDone;
+    std::vector<std::string> blockModsTxt, blockDlls;    // what the button can turn off, and set aside
+    bool blockOpen = false, blockShownOnce = false;
+    ULONGLONG blockNextCheck = 0;
+    int blockChecks = 0;
+    Box classNameRow;
+    EditBox classNameBox;
+    Flat classNameSave;
+    std::string classNameFor, classNameNote;  // the class the box was filled for; why its name was refused
+    bool classNameEnterDown = false, classNameFocused = false;
+    Flat classContinue, classOpen, classChange;
+    Box classRow;                            // in a lobby that uses classes: the class we fight as, and CHANGE
+    Text classRowText;
+    bool classShown = false;                 // not in a lobby: YOUR CLASS has put the classes in the right column
+    int classFieldSel = 8;                   // the row the description box explains
     Box updateRow;                           // the update notice and its UPDATE NOW button (net/update_check.h)
     Flat updateNow;
     Text title, me, badge, status, notice, updateNote, pillText, playersTitle, idleHint, hostOnly, waiting, summary;
@@ -98,12 +146,15 @@ struct State {
     // Not in a lobby: HOST on the left, the browser on the right. In one: players and chat left, the tabs right.
     Box mainRow, idleLeft, inLeft, idleRight, inRight, settingsView;
     HostView hostFriends, hostPublic;
-    Flat refresh, invite, readyUp, balance, leave, close, settingsOpen;
+    Flat refresh, invite, readyUp, balance, leave, close, settingsOpen, alone;
+    bool aloneArmed = false;
     std::array<Flat, kFilterChips> chips;
     Text browserCount, browserEmpty;
     BrowserFilter filter;                    // the chips' state, kept while the game runs
     std::array<TabView, kTabCount> tabs;
     std::array<Box, kTabCount> tabPages;
+    Box tabBar, tabFoot;                     // the tabs, and the summary with START: only in a lobby, unlike the classes
+    Fixed tabRule;
     size_t tab = 0;
     std::array<Text, kSectionCount> sectionTitles;
     std::array<Box, kSectionCount> sections;
@@ -162,6 +213,12 @@ struct State {
     Card start;
     Text startLabel;
     LobbyScene scene;                        // the last drawn: what the clicks act on
+    // MODS tab: the lobby's mod rule (the host steps it), the session's mods, who the host is still checking.
+    std::array<StepperView, kModRuleRows> modRules;
+    Text modSummary, modStatus, modEmpty, modMore, modTruncated, modPendingTitle, modPrivacy;
+    std::vector<ModItemView> modItems;       // kModItemRows, always in the tree (hidden when unused)
+    std::array<Text, game::kMaxLobbyMembers> modPending;
+    LobbyModsScene modsScene;                // the last drawn: what the clicks act on
 } g;
 bool requestOpen=false;
 
@@ -489,6 +546,15 @@ void BuildInLeft() {
         AddFlatH(actions1, g.invite, 8); AddFlatH(actions1, g.readyUp, 0);
         AddFlatH(actions2, g.balance, 8); AddFlatH(actions2, g.leave, 0);
     }
+    g.classRow = g.kit.MakeRow();
+    g.classRowText = NewText("", 15, style::kMenuText);
+    g.classChange = MakeFlat("CHANGE", 15, {14, 5, 14, 5});
+    if (g.classRow && g.classRowText && g.classChange.card) {
+        AddToHorizontalBox(g.classRow, g.classRowText, 1, 8).Align(HAlign::Fill, VAlign::Center);
+        AddFlatH(g.classRow, g.classChange, 0);
+        AddToVerticalBox(col, g.classRow, 14);
+        g.classRow.Show(false);
+    }
     BuildPasswordRow(col);
     g.editLoadout=MakeFlat("EDIT LOADOUT",15);
     AddToVerticalBox(col,g.editLoadout.card.button,8);
@@ -539,6 +605,173 @@ void BuildAsk(Canvas& root) {
 
 // The password question (a locked lobby: clicked in the browser, an invite, or a wrong password): the same modal as the
 // help-improve question, with a text box. JOIN (or Enter) tries the password, CANCEL (or Esc) drops the join.
+// What keeps this machine out of online play, and how to take it out. Made to read like the launcher, which does the same job for those who use it.
+constexpr size_t kBlockLinesShown = 8;
+void BuildBlock(Canvas& root) {
+    g.block = g.kit.MakePanel();
+    Fixed width = g.kit.MakeFixed();
+    Panel frame = g.kit.MakePanel(), face = g.kit.MakePanel();
+    Box column = g.kit.MakeColumn(), buttons = g.kit.MakeRow();
+    g.blockList = g.kit.MakeColumn();
+    Text title = NewText("UNSUPPORTED MODS", 30, style::kMenuAccentInk);
+    g.blockIntro = NewText("", 17, style::kMenuText);
+    Text easy = NewText("THE EASY WAY: open the Half Sword launcher and press I. It sets them aside for you, and can put them back. Restart the game afterwards.", 17, style::kMenuWarn);
+    Text manual = NewText("BY HAND: do what each line says, in the folder below, then restart the game.", 16, style::kMenuDim);
+    Text folder = NewText("", 14, style::kMenuDim);
+    g.blockFolder = MakeFlat("OPEN THE FOLDER", 18);
+    g.blockClose = MakeFlat("PLAY ALONE", 18);
+    g.blockTurnOff = MakeFlat("TURN THEM OFF AND RESTART", 18);
+    g.blockDone = NewText("", 16, style::kMenuOk);
+    if (!g.block || !width || !frame || !face || !column || !buttons || !g.blockList || !title || !g.blockIntro || !easy || !manual || !folder || !g.blockFolder.card || !g.blockClose.card) {
+        HSM_LOG("ui: the unsupported mods overlay could not be made; the lobby's status line still says why");
+        g.block = Panel{};
+        return;
+    }
+    root.Add(g.block).Anchor({{0, 0}, {1, 1}}, {0, 0}).Offsets({0, 0, 0, 0}).Z(112);
+    g.block.Color({0, 0, 0, 0.85f});
+    g.block.ContentAlign(HAlign::Center, VAlign::Center);
+    g.block.Content(width);
+    width.Width(860);
+    width.Content(frame);
+    frame.Color(style::kMenuAccent);
+    frame.Padding({2, 2, 2, 2});
+    frame.Content(face);
+    face.Color(style::kMenuPanel);
+    face.Padding({36, 28, 36, 28});
+    face.Content(column);
+    title.Font(30, 1, {0, 0, 0, 0.85f});
+    AddToVerticalBox(column, title, 0);
+    g.blockIntro.Wrap(true); AddToVerticalBox(column, g.blockIntro, 12);
+    easy.Wrap(true); AddToVerticalBox(column, easy, 12);
+    manual.Wrap(true); AddToVerticalBox(column, manual, 12);
+    folder.Wrap(true); {
+        const std::wstring path = ModFilePath(L"");
+        char text[1024] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, text, sizeof text - 1, nullptr, nullptr);
+        folder.Set(text);
+    } AddToVerticalBox(column, folder, 4);
+    AddToVerticalBox(column, g.blockList, 8);
+    for (size_t i = 0; i < kBlockLinesShown + 1; ++i) {
+        Text t = NewText("", 15, style::kMenuText);
+        if (!t) continue;
+        t.Wrap(true);
+        AddToVerticalBox(g.blockList, t, 6);
+        g.blockLines.push_back(t);
+    }
+    AddToVerticalBox(column, buttons, 20);
+    if (g.blockDone) { g.blockDone.Wrap(true); AddToVerticalBox(column, g.blockDone, 10); }
+    if (g.blockTurnOff.card) AddToHorizontalBox(buttons, g.blockTurnOff.card.button, 0, 14);
+    AddToHorizontalBox(buttons, g.blockFolder.card.button, 0, 14);
+    AddToHorizontalBox(buttons, g.blockClose.card.button, 0, 0);
+    g.block.Show(false);
+}
+
+constexpr const char* kUnrestrictedWarning = "This turns off class balance in the lobbies you host. Fighters can go far past what the game was built for: up to five times most stats. Expect broken fights, "
+                                             "physics glitches and possibly crashes, for you and everyone who joins. Only play this with people who know what they're joining.";
+
+// What Unrestricted or allowing HS Enhancer means, before it's on.
+void BuildWarn(Canvas& root) {
+    g.warn = g.kit.MakePanel();
+    Fixed width = g.kit.MakeFixed();
+    Panel frame = g.kit.MakePanel(), face = g.kit.MakePanel();
+    Box column = g.kit.MakeColumn(), buttons = g.kit.MakeRow();
+    Text title = g.warnTitle = NewText("", 30, style::kMenuAccentInk);
+    Text body = g.warnBody = NewText("", 17, style::kMenuText);
+    Text mods = g.warnMods = NewText("", 16, style::kMenuDim);
+    g.warnOn = MakeFlat("TURN IT ON", 18);
+    g.warnCancel = MakeFlat("CANCEL", 18);
+    if (!g.warn || !width || !frame || !face || !column || !buttons || !title || !body || !mods || !g.warnOn.card || !g.warnCancel.card) {
+        HSM_LOG("ui: the Unrestricted warning could not be made, so the checkbox stays off");
+        g.warn = Panel{};
+        return;
+    }
+    root.Add(g.warn).Anchor({{0, 0}, {1, 1}}, {0, 0}).Offsets({0, 0, 0, 0}).Z(112);
+    g.warn.Color({0, 0, 0, 0.85f});
+    g.warn.ContentAlign(HAlign::Center, VAlign::Center);
+    g.warn.Content(width);
+    width.Width(720);
+    width.Content(frame);
+    frame.Color(style::kMenuAccent);
+    frame.Padding({2, 2, 2, 2});
+    frame.Content(face);
+    face.Color(style::kMenuPanel);
+    face.Padding({36, 28, 36, 28});
+    face.Content(column);
+    title.Font(30, 1, {0, 0, 0, 0.85f});
+    AddToVerticalBox(column, title, 0);
+    body.Wrap(true); AddToVerticalBox(column, body, 14);
+    mods.Wrap(true); AddToVerticalBox(column, mods, 10);
+    AddToVerticalBox(column, buttons, 20);
+    AddToHorizontalBox(buttons, g.warnOn.card.button, 0, 14);
+    AddToHorizontalBox(buttons, g.warnCancel.card.button, 0, 0);
+    g.warn.Show(false);
+}
+
+// While it's open it's all that takes clicks. true: it is.
+bool HandleBlock(Session& session) {
+    if (g.warnOpen) {
+        const bool on = Clicked(g.warnOn.card), cancel = Clicked(g.warnCancel.card) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        Paint(g.warnOn.card); Paint(g.warnCancel.card);
+        if (on) { if (g.warnIsHse) session.SetAllowHse(true); else session.SetClassesUnrestricted(true); }
+        if (on || cancel) { g.warnOpen = false; g.warn.Show(false); }
+        return g.warnOpen;
+    }
+    if (!g.block) return false;
+    if (g.blockOpen) {
+        const bool close = Clicked(g.blockClose.card) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        if (Clicked(g.blockFolder.card)) {
+            // Explorer by process: this DLL loads too early in the game's start to import the shell.
+            std::wstring line = L"explorer.exe \"" + ModFilePath(L"") + L"\"";
+            STARTUPINFOW si{}; si.cb = sizeof si;
+            PROCESS_INFORMATION pi{};
+            if (CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+        }
+        if (g.blockTurnOff.card && !(g.blockModsTxt.empty() && g.blockDlls.empty()) && Clicked(g.blockTurnOff.card)) {
+            const bool ok = game::modrules::TurnOffForNextGame(g.blockModsTxt, g.blockDlls);
+            // The game restarts by itself; if it can't, the player restarts it. Everything comes back when that next game closes.
+            const bool restarting = ok && session.RestartGame(false);
+            g.blockDone.Set(!ok ? "That didn't work. Do it by hand: each line says how."
+                            : restarting ? "Restarting the game without them. They come back when that game closes, and no files were deleted."
+                                         : "Done, but the game couldn't restart itself: restart it to play online. Everything comes back when that game closes.");
+            if (ok) g.blockTurnOff.card.button.Show(false);
+        }
+        if (g.blockTurnOff.card) Paint(g.blockTurnOff.card);
+        Paint(g.blockFolder.card); Paint(g.blockClose.card);
+        if (close) { g.blockOpen = false; g.block.Show(false); }
+        return g.blockOpen;
+    }
+    // At the menu, unless the settings say only a Classes lobby matters. The mod list can take a moment after the game starts.
+    bool ask = session.TakeBlockAttempt();
+    const ULONGLONG now = GetTickCount64();
+    if (!ask && session.ModBlockAlways() && !g.blockShownOnce && !session.lobby().InLobby() && g.blockChecks < 30 && now >= g.blockNextCheck) {
+        g.blockNextCheck = now + 2000;
+        ++g.blockChecks;
+        ask = true;
+    }
+    if (!ask) return false;
+    const std::vector<ModBlockLine> lines = session.ModBlock();
+    if (lines.empty()) return false;
+    g.blockShownOnce = true;
+    g.blockModsTxt.clear();
+    g.blockDlls.clear();
+    for (const ModBlockLine& l : lines) {
+        if (!l.modsTxtName.empty()) g.blockModsTxt.push_back(l.modsTxtName);
+        if (!l.setAsideFile.empty()) g.blockDlls.push_back(l.setAsideFile);
+    }
+    if (g.blockTurnOff.card) g.blockTurnOff.card.button.Show(!g.blockModsTxt.empty() || !g.blockDlls.empty());
+    if (g.blockDone) g.blockDone.Set("");
+    g.blockIntro.Set(ModBlockIntro(lines, session.ModBlockAlways()));
+    for (size_t i = 0; i < g.blockLines.size(); ++i) {
+        if (i < lines.size() && i < kBlockLinesShown) g.blockLines[i].Set(lines[i].what + ": " + lines[i].how);
+        else if (i == kBlockLinesShown && lines.size() > kBlockLinesShown) g.blockLines[i].Set("and " + std::to_string(lines.size() - kBlockLinesShown) + " more, the same way.");
+        else g.blockLines[i].Set("");
+    }
+    g.blockOpen = true;
+    g.block.Show(true);
+    HSM_LOG("ui: showing the unsupported mods overlay (%u items)", unsigned(lines.size()));
+    return true;
+}
+
 void BuildPassword(Canvas& root) {
     g.pw = g.kit.MakePanel();
     Fixed width = g.kit.MakeFixed();
@@ -623,6 +856,28 @@ bool BuildDamageValue(Fixed& cell) {
     return true;
 }
 
+// A stepper row, "label and hint | < | value | >" (the RULES and MODS tabs). The caller puts the value cell's content
+// in `valueBox` (v.value, or the Damage slider) and adds v.box to its column. Empty when a widget could not be made.
+StepperView MakeStepper(Fixed& valueBox) {
+    StepperView v;
+    v.box = g.kit.MakeRow();
+    Box text = g.kit.MakeColumn();
+    valueBox = g.kit.MakeFixed();
+    v.label = NewText("", 17, style::kMenuText); v.value = NewText("", 17, style::kMenuText); v.hint = NewText("", 13, style::kMenuDim);
+    v.prev = MakeFlat("<", 17, {12, 2, 12, 2}); v.next = MakeFlat(">", 17, {12, 2, 12, 2});
+    if (!v.box || !text || !valueBox || !v.label || !v.value || !v.hint || !v.prev.card || !v.next.card) return StepperView{};
+    v.value.Align(Justify::Center);
+    v.hint.Wrap(true);
+    valueBox.Width(230);
+    AddToVerticalBox(text, v.label, 0);
+    AddToVerticalBox(text, v.hint, 2);
+    AddToHorizontalBox(v.box, text, 1, 16).Align(HAlign::Fill, VAlign::Center);
+    AddToHorizontalBox(v.box, v.prev.card.button, 0, 6).Align(HAlign::Left, VAlign::Center);
+    AddToHorizontalBox(v.box, valueBox, 0, 6).Align(HAlign::Fill, VAlign::Center);
+    AddToHorizontalBox(v.box, v.next.card.button, 0, 0).Align(HAlign::Left, VAlign::Center);
+    return v;
+}
+
 // RULES tab: a stepper per setting, "label and hint | < | value | >", in its section (MATCH, TEAMS, GEAR, WORLD).
 void BuildRulesTab(Box& page) {
     for (size_t sct = 0; sct < kSectionCount; ++sct) {
@@ -631,27 +886,14 @@ void BuildRulesTab(Box& page) {
         if (g.sections[sct]) AddToVerticalBox(page, g.sections[sct], 2);
     }
     for (int i = 0; i <= int(LobbyRow::Sync); ++i) {
-        StepperView v;
         Box& home = g.sections[size_t(SectionOf(LobbyRow(i)))];
-        v.box = g.kit.MakeRow();
-        Box text = g.kit.MakeColumn();
-        Fixed valueBox = g.kit.MakeFixed();
-        v.label = NewText("", 17, style::kMenuText); v.value = NewText("", 17, style::kMenuText); v.hint = NewText("", 13, style::kMenuDim);
-        v.prev = MakeFlat("<", 17, {12, 2, 12, 2}); v.next = MakeFlat(">", 17, {12, 2, 12, 2});
-        if (!home || !v.box || !text || !valueBox || !v.label || !v.value || !v.hint || !v.prev.card || !v.next.card) { g.steppers.push_back(StepperView{}); continue; }
-        v.value.Align(Justify::Center);
-        v.hint.Wrap(true);
-        valueBox.Width(230);
+        Fixed valueBox;
+        StepperView v = MakeStepper(valueBox);
+        if (!home || !v.box) { g.steppers.push_back(StepperView{}); continue; }
         // The Damage row shows the slider instead: its value text is in no tree, so garbage collection frees it, and a
         // later Set on it crashed (0.8.0-pre26). Drop it; the UpdatePanel writes to an empty Text are no-ops.
         if (LobbyRow(i) == LobbyRow::Damage && BuildDamageValue(valueBox)) v.value = Text{};
         else valueBox.Content(v.value).Align(HAlign::Fill, VAlign::Center);
-        AddToVerticalBox(text, v.label, 0);
-        AddToVerticalBox(text, v.hint, 2);
-        AddToHorizontalBox(v.box, text, 1, 16).Align(HAlign::Fill, VAlign::Center);
-        AddToHorizontalBox(v.box, v.prev.card.button, 0, 6).Align(HAlign::Left, VAlign::Center);
-        AddToHorizontalBox(v.box, valueBox, 0, 6).Align(HAlign::Fill, VAlign::Center);
-        AddToHorizontalBox(v.box, v.next.card.button, 0, 0).Align(HAlign::Left, VAlign::Center);
         AddToVerticalBox(home, v.box, 10);
         g.steppers.push_back(v);
     }
@@ -682,15 +924,69 @@ void BuildMapTab(Box& page) {
     if (g.noMaps) { g.noMaps.Wrap(true); AddToVerticalBox(page, g.noMaps, 6); g.noMaps.Show(false); }
 }
 
-// In a lobby, right: the MODE | RULES | MAP tabs, the chosen tab's page, and the summary with START at the foot.
+// MODS tab: RULE (three steppers, the host's to change) and the rule in force; IN THIS LOBBY (a row per mod anyone
+// runs); WAITING (host: who it is still checking); the privacy line. Every row is made here and only hidden: a widget
+// out of the tree is freed by garbage collection (0.8.0-pre26).
+void BuildModsTab(Box& page) {
+    Section(page, "RULE", 0);
+    for (size_t i = 0; i < kModRuleRows; ++i) {
+        Fixed valueBox;
+        StepperView v = MakeStepper(valueBox);
+        if (!v.box) continue;
+        valueBox.Content(v.value).Align(HAlign::Fill, VAlign::Center);
+        AddToVerticalBox(page, v.box, i ? 10 : 2);
+        g.modRules[i] = v;
+    }
+    g.modSummary = NewText("", 15, style::kMenuText);
+    g.modStatus = NewText("", 14, style::kMenuWarn);
+    for (Text* t : {&g.modSummary, &g.modStatus}) if (*t) { t->Wrap(true); AddToVerticalBox(page, *t, 8); }
+    g.classUnrestricted = MakeFlat("[  ] UNRESTRICTED", 15, {10, 4, 10, 4});
+    AddFlat(page, g.classUnrestricted, 12);
+    g.classAllowHse = MakeFlat("[  ] ALLOW HS ENHANCER", 15, {10, 4, 10, 4});
+    AddFlat(page, g.classAllowHse, 6);
+    Section(page, "IN THIS LOBBY", 18);
+    for (size_t i = 0; i < kModItemRows; ++i) {
+        ModItemView v;
+        v.box = g.kit.MakeRow();
+        Box text = g.kit.MakeColumn();
+        v.name = NewText("", 16, style::kMenuText); v.detail = NewText("", 13, style::kMenuDim);
+        v.note = NewText("", 13, style::kMenuWarn); v.verdict = NewText("", 14, style::kMenuDim);
+        if (!v.box || !text || !v.name || !v.detail || !v.note || !v.verdict) { g.modItems.push_back(ModItemView{}); continue; }
+        v.detail.Wrap(true); v.note.Wrap(true);
+        AddToVerticalBox(text, v.name, 0);
+        AddToVerticalBox(text, v.detail, 1);
+        AddToVerticalBox(text, v.note, 1);
+        AddToHorizontalBox(v.box, text, 1, 12).Align(HAlign::Fill, VAlign::Center);
+        AddToHorizontalBox(v.box, v.verdict, 0, 0).Align(HAlign::Right, VAlign::Top);
+        AddToVerticalBox(page, v.box, i ? 8 : 4);
+        v.box.Show(false);
+        g.modItems.push_back(v);
+    }
+    g.modEmpty = NewText("", 14, style::kMenuDim);
+    g.modMore = NewText("", 14, style::kMenuDim);
+    g.modTruncated = NewText("", 14, style::kMenuWarn);
+    for (Text* t : {&g.modEmpty, &g.modMore, &g.modTruncated}) if (*t) { t->Wrap(true); AddToVerticalBox(page, *t, 6); }
+    g.modPendingTitle = Section(page, "WAITING", 18);
+    for (Text& t : g.modPending) {
+        t = NewText("", 14, style::kMenuWarn);
+        if (t) { t.Wrap(true); AddToVerticalBox(page, t, 4); t.Show(false); }
+    }
+    g.modPrivacy = NewText("", 13, style::kMenuDim);
+    if (g.modPrivacy) { g.modPrivacy.Wrap(true); AddToVerticalBox(page, g.modPrivacy, 18); }
+}
+
+void BuildClassView(Box& rowOf);
+
+// In a lobby, right: the MODE | RULES | MAP | MODS | CLASSES tabs, the chosen tab's page, and the summary with START at the foot.
 void BuildInRight() {
     Box& col = g.inRight;
     Box tabs = g.kit.MakeRow(), foot = g.kit.MakeRow(), footText = g.kit.MakeColumn();
     Fixed under = g.kit.MakeFixed();
     Panel underLine = g.kit.MakePanel();
     if (!tabs || !foot || !footText || !under || !underLine) { HSM_LOG("ui: the lobby tabs could not be made"); return; }
+    g.tabBar = tabs; g.tabRule = under; g.tabFoot = foot;
     AddToVerticalBox(col, tabs, 0);
-    static constexpr const char* kTabNames[kTabCount] = {"MODE", "RULES", "MAP"};
+    static constexpr const char* kTabNames[kTabCount] = {"MODE", "RULES", "MAP", "MODS", "CLASSES"};
     for (size_t i = 0; i < kTabCount; ++i) {
         TabView& t = g.tabs[i];
         Box body = g.kit.MakeColumn();
@@ -710,6 +1006,11 @@ void BuildInRight() {
     underLine.Color(style::kMenuFrame);
     AddToVerticalBox(col, under, 0);
     for (size_t i = 0; i < kTabCount; ++i) {
+        if (i == kClassesTab) {                 // no scroll box round this one: two of its columns scroll, and the third stays put
+            g.tabPages[i] = g.kit.MakeRow();
+            if (g.tabPages[i]) { FillVerticalBox(col, g.tabPages[i], 14); BuildClassView(g.tabPages[i]); }
+            continue;
+        }
         Box scroll = g.kit.MakeScroll();
         g.tabPages[i] = g.kit.MakeColumn();
         if (!scroll || !g.tabPages[i]) continue;
@@ -718,6 +1019,7 @@ void BuildInRight() {
         if (i == 0) BuildModeTab(g.tabPages[i]);
         if (i == 1) BuildRulesTab(g.tabPages[i]);
         if (i == 2) BuildMapTab(g.tabPages[i]);
+        if (i == kModsTab) BuildModsTab(g.tabPages[i]);
         g.tabPages[i] = scroll;                 // what the tab shows and collapses is the page's scroll box
     }
     AddToVerticalBox(col, foot, 14);
@@ -733,6 +1035,114 @@ void BuildInRight() {
         g.startLabel.Align(Justify::Center);
         AddToHorizontalBox(foot, g.start.button, 0, 0).Align(HAlign::Right, VAlign::Center);
     }
+}
+
+// A column of the CLASSES tab. It sits in the page's right panel, so it has no panel of its own.
+Box AddClassColumn(Box& row, float fill, float padRight, bool scroll) {
+    Box outer = scroll ? g.kit.MakeScroll() : g.kit.MakeColumn();
+    if (!outer) return Box{};
+    AddToHorizontalBox(row, outer, fill, padRight).Align(HAlign::Fill, VAlign::Fill);
+    if (!scroll) return outer;
+    Box inner = g.kit.MakeColumn();
+    if (inner) outer.Add(inner).Padding({0, 0, 12, 0});
+    return inner;
+}
+
+// A labelled bar: ATTACK, SPEED, TOUGHNESS.
+Bar AddClassBar(Box& col, const char* name) {
+    Box row = g.kit.MakeRow();
+    Fixed labelBox = g.kit.MakeFixed(), barBox = g.kit.MakeFixed();
+    Text label = NewText(name, 15, style::kMenuDim);
+    Bar bar = g.kit.MakeBar();
+    if (!row || !labelBox || !barBox || !label || !bar) return Bar{};
+    labelBox.Width(120);
+    labelBox.Content(label).Align(HAlign::Fill, VAlign::Center);
+    barBox.Width(240); barBox.Height(12);
+    barBox.Content(bar).Align(HAlign::Fill, VAlign::Fill);
+    bar.FillColor(style::kMenuAccentInk);   // the bar's unfilled part is pale, so a pale fill can't be seen on it
+    AddToHorizontalBox(row, labelBox, 0, 8).Align(HAlign::Left, VAlign::Center);
+    AddToHorizontalBox(row, barBox, 0, 0).Align(HAlign::Left, VAlign::Center);
+    AddToVerticalBox(col, row, 6);
+    return bar;
+}
+
+// Three columns: the classes, what the picked one does, and the description box. DONE, outside a lobby, goes back to the public lobbies.
+void BuildClassView(Box& rowOf) {
+    Box pickCol = AddClassColumn(rowOf, 0.65f, 16, true), statCol = AddClassColumn(rowOf, 1.35f, 16, true), infoCol = AddClassColumn(rowOf, 0.85f, 0, false);
+    if (!pickCol || !statCol || !infoCol) return;
+    Section(pickCol, "CHOOSE YOUR CLASS", 0);
+    g.classTabButton = MakeFlat("CLASSES  v", 16, {12, 5, 12, 5});
+    AddFlat(pickCol, g.classTabButton, 8);
+    g.classTabList = g.kit.MakeColumn();
+    if (g.classTabList) {
+        for (const ClassTab& t : ClassTabs()) {
+            Flat f = MakeFlat(t.title, 15, {18, 4, 12, 4});
+            AddFlat(g.classTabList, f, 2);
+            g.classTabs.push_back(f);
+        }
+        AddToVerticalBox(pickCol, g.classTabList, 2);
+        g.classTabList.Show(false);
+    }
+    g.classTabNote = NewText("", 14, style::kMenuDim);
+    if (g.classTabNote) { g.classTabNote.Wrap(true); AddToVerticalBox(pickCol, g.classTabNote, 6); }
+    for (int i = 0; i < ClassPickCount(); ++i) {
+        Flat f = MakeFlat(ClassPickName(i), 17, {14, 5, 14, 5});
+        AddFlat(pickCol, f, 6);
+        g.classPicks.push_back(f);
+    }
+    g.classNew = MakeFlat("+ NEW CLASS", 16, {14, 5, 14, 5});
+    AddFlat(pickCol, g.classNew, 8);
+    g.classWhere = NewText("Classes only count in Classes lobbies. In any other lobby you fight as the game's plain fighter.", 14, style::kMenuDim);
+    if (g.classWhere) { g.classWhere.Wrap(true); AddToVerticalBox(pickCol, g.classWhere, 8); }
+    g.className = NewText("", 28, style::kMenuText);
+    g.classNote = NewText("", 15, style::kMenuDim);
+    if (g.className) AddToVerticalBox(statCol, g.className, 0);
+    if (g.classNote) { g.classNote.Wrap(true); AddToVerticalBox(statCol, g.classNote, 6); }
+    g.classNameRow = g.kit.MakeRow();
+    g.classNameBox = g.kit.MakeEditBox();
+    g.classNameSave = MakeFlat("SAVE NAME", 14, {10, 3, 10, 3});
+    if (g.classNameRow && g.classNameBox && g.classNameSave.card) {
+        g.classNameBox.Hint("Name this class");
+        AddToHorizontalBox(g.classNameRow, g.classNameBox, 1, 8).Align(HAlign::Fill, VAlign::Center);
+        AddToHorizontalBox(g.classNameRow, g.classNameSave.card.button, 0, 8).Align(HAlign::Left, VAlign::Center);
+        g.classDelete = MakeFlat("DELETE", 14, {10, 3, 10, 3});
+        if (g.classDelete.card) AddToHorizontalBox(g.classNameRow, g.classDelete.card.button, 0, 0).Align(HAlign::Left, VAlign::Center);
+        AddToVerticalBox(statCol, g.classNameRow, 8);
+        g.classNameRow.Show(false);
+    }
+    Section(statCol, "AT A GLANCE", 16);
+    g.classAttack = AddClassBar(statCol, "ATTACK");
+    g.classSpeed = AddClassBar(statCol, "SPEED");
+    g.classTough = AddClassBar(statCol, "TOUGHNESS");
+    Section(statCol, "STATS", 18);
+    for (int i = 0; i < kClassFieldCount; ++i) {
+        ClassRow v;
+        v.box = g.kit.MakeRow();
+        Fixed valueBox = g.kit.MakeFixed();
+        v.value = NewText("", 15, style::kMenuText);
+        v.name = MakeFlat(ClassField(ClassSheet{}, i).label, 14, {8, 2, 8, 2});
+        v.prev = MakeFlat("<", 15, {10, 1, 10, 1}); v.next = MakeFlat(">", 15, {10, 1, 10, 1});
+        if (!v.box || !valueBox || !v.value || !v.name.card || !v.prev.card || !v.next.card) { g.classFields.push_back(ClassRow{}); continue; }
+        v.value.Align(Justify::Center);
+        valueBox.Width(120);
+        valueBox.Content(v.value).Align(HAlign::Fill, VAlign::Center);
+        AddToHorizontalBox(v.box, v.name.card.button, 1, 12).Align(HAlign::Fill, VAlign::Center);
+        AddToHorizontalBox(v.box, v.prev.card.button, 0, 4).Align(HAlign::Left, VAlign::Center);
+        AddToHorizontalBox(v.box, valueBox, 0, 4).Align(HAlign::Fill, VAlign::Center);
+        AddToHorizontalBox(v.box, v.next.card.button, 0, 0).Align(HAlign::Left, VAlign::Center);
+        AddToVerticalBox(statCol, v.box, 3);
+        g.classFields.push_back(v);
+    }
+    // Here and not by the bars, because this column doesn't scroll: it stays on screen while the stats are being changed.
+    g.classBudget = NewText("", 20, style::kMenuText);
+    if (g.classBudget) { g.classBudget.Wrap(true); AddToVerticalBox(infoCol, g.classBudget, 0); }
+    Section(infoCol, "WHAT THIS DOES", 16);
+    g.classInfoName = NewText("", 20, style::kMenuText);
+    g.classInfo = NewText("", 16, style::kMenuDim);
+    if (g.classInfoName) AddToVerticalBox(infoCol, g.classInfoName, 8);
+    if (g.classInfo) { g.classInfo.Wrap(true); AddToVerticalBox(infoCol, g.classInfo, 8); }
+    g.classContinue = MakeFlat("DONE", 20, {22, 12, 22, 12});
+    AddFlat(infoCol, g.classContinue, 28);
 }
 
 // SETTINGS (the footer button): help improve the mod and voice chat, in place of the lobby while it is open.
@@ -869,6 +1279,8 @@ bool BuildPanel() {
     g.settingsView.Show(false);
     BuildAsk(root);
     BuildPassword(root);
+    BuildBlock(root);
+    BuildWarn(root);
 
     // REPORT A BUG opens a text box over the footer: SEND and CANCEL; the text becomes a public GitHub issue
     // (net/report_client).
@@ -889,8 +1301,10 @@ bool BuildPanel() {
     AddToVerticalBox(page, footer, 14);
     g.close = MakeFlat("BACK", 16);
     g.settingsOpen = MakeFlat("SETTINGS", 16);
+    g.classOpen = MakeFlat("YOUR CLASS", 16);
     g.reportOpen = MakeFlat("REPORT A BUG", 16);
-    AddFlatH(footer, g.close, 10); AddFlatH(footer, g.settingsOpen, 10); AddFlatH(footer, g.reportOpen, 18);
+    g.alone = MakeFlat("PLAY ALONE, MOD OFF", 16);   // restarts the game without the mod; the next ordinary start has it again
+    AddFlatH(footer, g.close, 10); AddFlatH(footer, g.classOpen, 10); AddFlatH(footer, g.settingsOpen, 10); AddFlatH(footer, g.alone, 10); AddFlatH(footer, g.reportOpen, 18);
     g.reportHow = NewText("In a fight: press Enter and type /bug and what happened. Your HSMMod log goes with it.", 13, style::kMenuDim);
     if (g.reportHow) { g.reportHow.Wrap(true); AddToHorizontalBox(footer, g.reportHow, 1, 0).Align(HAlign::Fill, VAlign::Center); }
     g.panel.Show(false);
@@ -964,6 +1378,7 @@ LobbyLocal Local(game::Lobby& lobby) {
     for (const game::LobbyListing& f : lobby.listings()) {
         LobbyFound o;
         o.name = f.name; o.map = f.map; o.mode = f.mode; o.players = f.players; o.maxPlayers = f.maxPlayers; o.locked = f.locked; o.compatible = f.compatible; o.reason = f.reason;
+        o.mods = f.mods;
         if (f.pack.any()) {   // the host's modpack, against this machine's files now (the hashes may still be running)
             const PackVerdict v = game::modpack::Check(f.pack).verdict;
             o.pack = PackRowText(f.pack, v);
@@ -986,7 +1401,7 @@ void PaintTabs() {
         t.card.face.Color(kClear);
         t.label.Color(on ? style::kMenuAccentInk : hover ? style::kMenuText : style::kMenuDim);
         t.line.Color(on ? style::kMenuAccent : kClear);
-        if (g.tabPages[i]) g.tabPages[i].Show(on);
+        if (g.tabPages[i]) g.tabPages[i].Show(i == (g.scene.in ? g.tab : kClassesTab));   // outside a lobby this column only ever holds the classes
     }
 }
 
@@ -998,7 +1413,12 @@ const SettingRow* RowFor(const LobbyScene& s, size_t i) {
     return nullptr;
 }
 
+bool ClassesOpen(const LobbyScene& s) { return !g.settingsShown && (s.in ? g.tab == kClassesTab : g.classShown); }
+
 void Draw(const LobbyScene& s) {
+    // Nobody lands on the classes by arriving in a lobby or by coming out of one.
+    if (s.in) g.classShown = false;
+    else if (g.tab == kClassesTab) g.tab = 0;
     g.pillText.Set(s.pill.text);
     g.pillText.Color(s.pill.color);
     g.pillFrame.Color(style::Faded(s.pill.color, 0.7f));
@@ -1010,10 +1430,15 @@ void Draw(const LobbyScene& s) {
     g.mainRow.Show(!g.settingsShown);
     g.settingsView.Show(g.settingsShown);
     g.settingsOpen.card.selected = g.settingsShown;
+    g.classOpen.card.selected = ClassesOpen(s);
     g.idleLeft.Show(!s.in);
-    g.idleRight.Show(!s.in);
+    g.idleRight.Show(!s.in && !g.classShown);
     g.inLeft.Show(s.in);
-    g.inRight.Show(s.in);
+    g.inRight.Show(s.in || g.classShown);
+    if (g.tabBar) g.tabBar.Show(s.in);
+    if (g.tabRule) g.tabRule.Show(s.in);
+    if (g.tabFoot) g.tabFoot.Show(s.in);
+    if (g.classContinue.card) g.classContinue.card.button.Show(!s.in);
 
     for (HostView* h : {&g.hostFriends, &g.hostPublic}) Live(h->card, s.idle);
     g.idleHint.Show(!s.in);
@@ -1068,8 +1493,10 @@ void Draw(const LobbyScene& s) {
     g.readyUp.label.Color(s.readyOn ? style::kMenuOk : style::kMenuText);   // the dot's green
     g.readyUp.card.selected = s.readyOn;
     g.balance.card.button.Show(s.balance);
+    if (g.classRow) { g.classRow.Show(!s.classLine.empty()); g.classRowText.Set(s.classLine); }
     if (g.pwHostBox) { g.pwHostBox.Show(s.hostPassword); g.pwHostNote.Set(s.passwordNote); }
     g.leave.card.button.Show(s.in);
+    g.alone.card.button.Show(!s.in);   // not from a lobby: quitting there would drop everyone in it
 
     for (size_t i = 0; i < g.modes.size() && i < s.modes.size(); ++i) {
         ModeView& v = g.modes[i];
@@ -1188,10 +1615,103 @@ void DrawChat(bool in) {
     if (ChatLinesAdded() != g.chatSeen) { g.chatSeen = ChatLinesAdded(); g.chatScroll.ScrollToEnd(); }
 }
 
+// The MODS tab's input: the session's list (Session::ModsView), and the rule: the host's own (HostRule, its INI choice),
+// a member's from the lobby data.
+LobbyModsLocal ModsLocal(Session& session, game::Lobby& lobby) {
+    LobbyModsLocal l = session.ModsView();
+    l.host = lobby.IsHost();
+    l.rulesOn = game::modrules::Enabled();
+    if (l.host) {
+        l.rule = game::modrules::HostRule(lobby);
+        l.chosen = game::modrules::Chosen();
+    } else {
+        l.rule = lobby.RoomRule(&l.hostHasRule);
+        // A host with mod_rules=0 announces Anything with cheats allowed (modrules::LobbyTick) and sends no SessionMods.
+        // Until a list comes, that rule means it checks nothing: say so rather than wait. A host that chose the same rule
+        // sends the list on admission, and from then on the tab shows it like any other.
+        const ModRule open = [] { ModRule r = NoRule(); r.blockCheats = false; return r; }();
+        if (l.rule == open && !l.haveList) l.hostHasRule = false;
+    }
+    return l;
+}
+
+Rgba ModToneColor(ModTone t) {
+    switch (t) {
+        case ModTone::Ok: return style::kMenuOk;
+        case ModTone::Warn: return style::kMenuWarn;
+        case ModTone::Bad: return style::kMenuAccentInk;
+        case ModTone::Dim: break;
+    }
+    return style::kMenuDim;
+}
+
+void DrawMods(const LobbyModsScene& s) {
+    for (size_t i = 0; i < kModRuleRows; ++i) {
+        StepperView& v = g.modRules[i];
+        if (!v.box) continue;
+        const ModRuleView& r = s.rules[i];
+        v.label.Set(r.label);
+        v.label.Color(r.enabled ? style::kMenuText : style::kMenuDim);
+        v.value.Set(r.value);
+        v.hint.Set(r.hint);
+        v.hint.Show(!r.hint.empty());
+        for (Flat* f : {&v.prev, &v.next}) Live(f->card, r.enabled, 0.3f);
+    }
+    g.modSummary.Set(s.summary);
+    g.modSummary.Show(!s.summary.empty());
+    g.modStatus.Set(s.status);
+    g.modStatus.Show(!s.status.empty());
+    static const std::string kDot = " \xC2\xB7 ";
+    for (size_t i = 0; i < g.modItems.size(); ++i) {
+        ModItemView& v = g.modItems[i];
+        if (!v.box) continue;
+        const bool show = i < s.items.size();
+        v.box.Show(show);
+        if (!show) continue;
+        const ModRowView& r = s.items[i];
+        v.name.Set(r.name);
+        v.name.Color(r.refused ? style::kMenuAccentInk : style::kMenuText);
+        v.detail.Set(r.kind + kDot + r.holders);
+        v.note.Set(r.note);
+        v.note.Color(r.refused ? style::kMenuAccentInk : style::kMenuWarn);
+        v.note.Show(!r.note.empty());
+        v.verdict.Set(r.verdict);
+        v.verdict.Color(ModToneColor(r.tone));
+    }
+    const size_t more = s.items.size() > g.modItems.size() ? s.items.size() - g.modItems.size() : 0;
+    g.modMore.Set(more ? "+" + std::to_string(more) + " more (the host's log lists them all)" : std::string());
+    g.modMore.Show(more > 0);
+    g.modEmpty.Set(s.empty);
+    g.modEmpty.Show(!s.empty.empty());
+    g.modTruncated.Set(s.truncated);
+    g.modTruncated.Show(!s.truncated.empty());
+    if (g.modPendingTitle) g.modPendingTitle.Show(!s.pending.empty());
+    for (size_t i = 0; i < g.modPending.size(); ++i) {
+        Text& t = g.modPending[i];
+        if (!t) continue;
+        const bool show = i < s.pending.size();
+        t.Show(show);
+        if (show) t.Set(s.pending[i]);
+    }
+    g.modPrivacy.Set(s.privacy);
+    g.modsScene = s;
+}
+
+// The classes may never be opened, so they can't be what moves a pick that can't fight. Runs with the page open, and in a lobby at the
+// menu: an invite joins without the page.
+void FixClassPick(Session& session) {
+    const std::string picked = session.ClassName();
+    const std::optional<std::string> moved = ClassFallback(picked, session.HasWolverine(), session.ClassesOff());
+    if (!moved) return;
+    HSM_LOG("classes: %s can't fight with the mods that are on; moved to %s", picked.c_str(), moved->c_str());
+    session.SetClassName(*moved);
+}
+
 void UpdatePanel(Session& session) {
     game::Lobby& lobby = session.lobby();
     LobbyLocal local = Local(lobby);
     local.filter = g.filter;
+    if (lobby.InClassesLobby()) local.myClass = session.ClassesOff() ? std::string(kHseClassName) : session.ClassLabel(session.ClassName());
     const LobbyScene scene = BuildLobbyScene(local);
     // Each shown row joins the listing it came from (the filters and the sort reorder them).
     const auto& list = lobby.listings();
@@ -1202,6 +1722,8 @@ void UpdatePanel(Session& session) {
     const auto& mem = lobby.members();
     for (size_t i = 0; i < g.memberIds.size(); ++i) g.memberIds[i] = lobby.InLobby() && i < mem.size() ? mem[i].id : 0;
     Draw(scene);
+    if (lobby.InLobby()) DrawMods(BuildLobbyMods(ModsLocal(session, lobby)));
+    else g.modsScene = LobbyModsScene{};
     DrawChat(lobby.InLobby());
     std::string notice = update::Notice();
     if (const std::string install = update::InstallStatus(); !install.empty()) notice += (notice.empty() ? "" : "\n") + install;
@@ -1365,6 +1887,9 @@ void HandleClicks(Session& session) {
     Paint(g.openButton.card);
     auto openPage = [&] {
         g.panelOpen = true; g.panel.Show(true); g.nextText = 0; game::modmaps::Rescan();
+        g.classShown = false;
+        if (g.tab == kClassesTab) g.tab = 0;   // MULTIPLAYER never opens on the classes
+        g.settingsShown = false;
         if (lobby.state() == game::Lobby::State::Idle) lobby.RefreshList();   // the browser is filled on arrival
     };
     if (g.askOpen) {                            // the one-time question: nothing else on the menu until it is answered
@@ -1423,8 +1948,18 @@ void HandleClicks(Session& session) {
     auto act = [&](bool clicked, bool allowed) { bool go = clicked && allowed; acted = acted || go; return go; };
 
     // The footer.
-    if (Clicked(g.close.card)) { ClosePage(); return; }
-    if (act(Clicked(g.settingsOpen.card), true)) { g.settingsShown = !g.settingsShown; if (!g.settingsShown) g.voice.StopBinding(); }
+    if (Clicked(g.close.card)) { ClosePage(); g.aloneArmed = false; g.alone.label.Set("PLAY ALONE, MOD OFF"); return; }
+    if (act(Clicked(g.alone.card), !s.in)) {   // two clicks: the first says what happens
+        if (!g.aloneArmed) { g.aloneArmed = true; g.alone.label.Set("SURE? THE GAME RESTARTS"); }
+        else { g.aloneArmed = false; g.alone.label.Set(session.RestartGame(true) ? "RESTARTING..." : "COULDN'T RESTART (SEE LOG)"); }
+    }
+    if (act(Clicked(g.settingsOpen.card), true)) { g.settingsShown = !g.settingsShown; g.classShown = false; if (!g.settingsShown) g.voice.StopBinding(); }
+    if (act(Clicked(g.classOpen.card), true)) {
+        g.settingsShown = false; g.voice.StopBinding();
+        if (s.in) g.tab = kClassesTab; else g.classShown = !g.classShown;
+    }
+    if (act(Clicked(g.classContinue.card), g.classShown)) g.classShown = false;
+    if (act(Clicked(g.classChange.card), s.in && !s.classLine.empty())) g.tab = kClassesTab;
     g.reportOpen.card.button.Show(report::Enabled());
     g.reportHow.Show(report::Enabled());
     if (act(Clicked(g.reportOpen.card), report::Enabled())) {
@@ -1457,6 +1992,161 @@ void HandleClicks(Session& session) {
     g.helpToggle.card.selected = help;
     if (act(Clicked(g.updateNow.card), update::CanInstall())) update::StartInstall();
     if (act(Clicked(g.helpToggle.card), g.settingsShown)) session.SetHelpImprove(!help);
+    // MODS: the checkboxes for this machine's lobbies, while that tab is what's on screen.
+    if (s.in && g.tab == kModsTab && !g.settingsShown) {
+        const bool unrestricted = session.ClassesUnrestricted();
+        // The checkbox. A guest sees the host's choice, and can't change it.
+        const bool canSet = session.CanSetUnrestricted();
+        g.classUnrestricted.label.Set(std::string(unrestricted ? "[X]" : "[  ]") + " UNRESTRICTED");
+        g.classUnrestricted.label.Color(canSet ? style::kMenuText : style::kMenuDim);
+        if (act(Clicked(g.classUnrestricted.card), canSet)) {
+            if (unrestricted) session.SetClassesUnrestricted(false);
+            else if (g.warn) {   // it says what this is first. HandleBlock takes the answer
+                g.warnIsHse = false;
+                g.warnTitle.Set("UNRESTRICTED CLASSES");
+                g.warnBody.Set(kUnrestrictedWarning);
+                g.warnMods.Set("Outside mods and HS Enhancer stay blocked unless you allow it. The Half Wolverine options still need Half Wolverine.");
+                g.warnOpen = true; g.warn.Show(true);
+            }
+        }
+        const bool allowHse = session.AllowHse();
+        if (g.classAllowHse.card) {
+            g.classAllowHse.label.Set(std::string(allowHse ? "[X]" : "[  ]") + " ALLOW HS ENHANCER");
+            g.classAllowHse.label.Color(canSet ? style::kMenuText : style::kMenuDim);
+            if (act(Clicked(g.classAllowHse.card), canSet)) {
+                if (allowHse) session.SetAllowHse(false);
+                else if (g.warn) {
+                    g.warnIsHse = true;
+                    g.warnTitle.Set("ALLOW HS ENHANCER");
+                    g.warnBody.Set("The true unrestricted. Players with HS Enhancer can use all of it in the lobbies you host: any value, and spawning things. Classes are off for them, and no limits hold them. "
+                                   "Everyone else plays Unrestricted Classes. Expect crashes, and only do this with people you trust.");
+                    g.warnMods.Set("This also turns on Unrestricted. Everyone who joins is told, and the K card shows what each player reports running. Other mods stay blocked.");
+                    g.warnOpen = true; g.warn.Show(true);
+                }
+            }
+            Paint(g.classAllowHse.card);
+        }
+        Paint(g.classUnrestricted.card);
+    }
+    if (ClassesOpen(s) && g.className) {
+        const std::string picked = session.ClassName();
+        const bool unrestricted = session.ClassesUnrestricted(), wolverine = session.HasWolverine();
+        g.classFrame++;
+        // The mods that are on decide what can fight, so it opens on those.
+        if ((g.classTab == kClassTabHacker && !unrestricted) || !ClassTabUsable(g.classTab, wolverine)) g.classTab = ClassHomeTab(wolverine);
+        const bool classesOff = session.ClassesOff();
+        // The dropdown: a mod's entry is greyed out until the mod is on, and the hacker entry stays hidden outside Unrestricted.
+        g.classTabButton.label.Set(std::string(ClassTabs()[size_t(g.classTab)].title) + (g.classTabOpen ? "  ^" : "  v"));
+        if (act(Clicked(g.classTabButton.card), true)) g.classTabOpen = !g.classTabOpen;
+        Paint(g.classTabButton.card);
+        if (g.classTabList) g.classTabList.Show(g.classTabOpen);
+        for (size_t i = 0; i < g.classTabs.size() && i < ClassTabs().size(); ++i) {
+            Flat& f = g.classTabs[i];
+            const ClassTab& t = ClassTabs()[i];
+            const bool shown = !t.unrestrictedOnly || unrestricted, grey = !ClassTabUsable(int(i), wolverine);
+            f.card.button.Show(shown);
+            if (f.label) {
+                f.label.Color(grey ? style::kMenuDim : style::kMenuText);
+                f.label.Set(std::string(t.title) + (!grey ? "" : wolverine ? "  (Half Wolverine is on)" : "  (needs Half Wolverine)"));
+            }
+            f.card.selected = int(i) == g.classTab;
+            if (g.classTabOpen && shown && Clicked(f.card)) {
+                if (grey) g.classTabNote.Set(ClassTabRefusal(int(i), wolverine));
+                else { g.classTab = int(i); g.classTabOpen = false; g.classTabNote.Set(""); acted = true; }
+            }
+            Paint(f.card);
+        }
+        const std::vector<std::string> tabPicks = ClassTabPicks(g.classTab);
+        if (g.classWhere) g.classWhere.Set(unrestricted ? "UNRESTRICTED: no class balance. Expect glitches, and possibly crashes, for everyone in the lobby."
+                                                        : "Classes only count in Classes lobbies. In any other lobby you fight as the game's plain fighter.");
+        if (g.classNew.card) {
+            g.classNew.card.button.Show(g.classTab == kClassTabCustom);
+            if (act(Clicked(g.classNew.card), g.classTab == kClassTabCustom)) {
+                if (session.NewClass()) { g.classNameBox.Clear(); g.classNameBox.Focus(); g.classNameFor = session.ClassName(); g.classNameNote = "Name your class, then change its stats."; }
+                else g.classTabNote.Set("All your class slots are used. Delete one first.");
+            }
+            Paint(g.classNew.card);
+        }
+        g.className.Set(classesOff ? std::string(kHseClassName) : session.ClassLabel(picked));
+        // The player's own classes can be named. Enter saves too, as in the password box, which may already have let go of the keyboard.
+        const bool nameable = CustomClassSlot(picked) >= 0;
+        if (g.classNameRow) {
+            g.classNameRow.Show(nameable);
+            // Two clicks, because it can't be undone.
+            if (g.classDelete.card) {
+                if (act(Clicked(g.classDelete.card), nameable)) {
+                    if (g.classDeleteArmed) { session.DeleteClass(); g.classDeleteArmed = false; }
+                    else g.classDeleteArmed = true;
+                }
+                if (g.classNameFor != picked) g.classDeleteArmed = false;
+                g.classDelete.label.Set(g.classDeleteArmed ? "SURE?" : "DELETE");
+                Paint(g.classDelete.card);
+            }
+            if (g.classNameFor != picked) { g.classNameFor = picked; g.classNameNote.clear(); g.classNameBox.Set(session.ClassOwnName()); }
+            const bool focused = g.classNameBox.Focused();
+            const bool enter = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0, enterEdge = enter && !g.classNameEnterDown;
+            g.classNameEnterDown = enter;
+            const bool save = Clicked(g.classNameSave.card) || (enterEdge && (focused || g.classNameFocused));
+            g.classNameFocused = focused;
+            Paint(g.classNameSave.card);
+            if (act(save, nameable)) {
+                const std::string typed = g.classNameBox.Value();
+                g.classNameNote = session.NameClass(typed);
+                if (!g.classNameNote.empty()) g.classNameBox.Focus();   // left as typed, to fix; nothing was saved
+            }
+        }
+        g.classNote.Set(g.classNameNote.empty() ? session.ClassNote() : g.classNameNote);
+        for (int i = 0; i < int(g.classPicks.size()); ++i) {
+            Flat& f = g.classPicks[size_t(i)];
+            const std::string name = ClassPickName(i);
+            const bool inTab = std::find(tabPicks.begin(), tabPicks.end(), name) != tabPicks.end() && (CustomClassSlot(name) < 0 || session.ClassSlotUsed(name));
+            f.card.button.Show(inTab);
+            if (!inTab) continue;
+            const bool pickable = !classesOff && ClassPickable(name, wolverine);
+            if (f.label) { f.label.Set(session.ClassLabel(name)); f.label.Color(pickable ? style::kMenuText : style::kMenuDim); }
+            f.card.selected = name == picked;
+            if (act(Clicked(f.card), pickable)) session.SetClassName(name);
+            Paint(f.card);
+        }
+        ClassSheet sheet = session.ClassValue();
+        const ClassBars bars = ClassBarsFor(sheet);
+        if (g.classBudget) {
+            const ClassBudgetView budget = ClassBudget(sheet, unrestricted);
+            g.classBudget.Set(budget.text);
+            g.classBudget.Color(budget.over ? style::kMenuAccentInk : style::kMenuText);
+        }
+        const bool glitch = unrestricted;
+        g.classAttack.Percent(glitch ? GlitchedBar(bars.attack, g.classFrame) : bars.attack);
+        g.classSpeed.Percent(glitch ? GlitchedBar(bars.speed, g.classFrame + 5) : bars.speed);
+        g.classTough.Percent(glitch ? GlitchedBar(bars.toughness, g.classFrame + 11) : bars.toughness);
+        for (Bar* bar : {&g.classAttack, &g.classSpeed, &g.classTough}) bar->FillColor(glitch ? (g.classFrame / 3 % 7 == 0 ? style::kMenuDim : style::kBloodInk) : style::kMenuAccentInk);
+        // The player's own classes can be changed here. The built-ins are the same for everyone, so theirs are only shown.
+        const bool own = CustomClassSlot(picked) >= 0 && !classesOff;
+        for (size_t i = 0; i < g.classFields.size(); ++i) {
+            ClassRow& v = g.classFields[i];
+            if (!v.box) continue;
+            const bool rowShown = ClassFieldShown(int(i), g.classTab);
+            v.box.Show(rowShown);
+            if (!rowShown) { if (g.classFieldSel == int(i)) g.classFieldSel = 8; continue; }
+            const ClassFieldView f = ClassField(sheet, int(i));
+            v.value.Set(f.value);
+            v.name.card.selected = int(i) == g.classFieldSel;
+            if (act(Clicked(v.name.card), true)) g.classFieldSel = int(i);
+            int dir = Clicked(v.prev.card) ? -1 : 0;
+            if (Clicked(v.next.card)) dir = 1;
+            if (dir != 0) g.classFieldSel = int(i);
+            const bool locked = ClassFieldLocked(sheet, int(i), wolverine);
+            if (v.name.label) v.name.label.Color(locked ? style::kMenuDim : style::kMenuText);
+            if (act(dir != 0, own && !locked)) { ClassFieldStep(sheet, int(i), dir, unrestricted); session.SetCustomClass(sheet); }
+            v.prev.card.button.Show(own); v.next.card.button.Show(own);
+            Paint(v.name.card); Paint(v.prev.card); Paint(v.next.card);
+        }
+        g.classInfoName.Set(ClassField(sheet, g.classFieldSel).label);
+        g.classInfo.Set(ClassFieldInfo(g.classFieldSel));
+    }
+    if (g.classOpen.card) Paint(g.classOpen.card);
+    if (g.classContinue.card) Paint(g.classContinue.card);
+    if (g.classChange.card) Paint(g.classChange.card);
     if (g.settingsShown) g.voice.Tick(session);
     HandleChat(session, s.in && !g.settingsShown);
     g.severRow.Show(s.in && !g.settingsShown);
@@ -1499,6 +2189,7 @@ void HandleClicks(Session& session) {
     if (s.idle && g.connectText.Focused()) SetLobbyTyping(true);
     HandlePassword(session, s.hostPassword && !g.settingsShown);
     HandleDamage(lobby, s, acted);               // after the two boxes: its own text box keeps the hotkeys off too
+    if (ClassesOpen(s) && g.classNameBox && g.classNameBox.Focused()) SetLobbyTyping(true);   // and the class name's, after all of them
 
     // Not in a lobby: hosting, the browser and its filters.
     if (act(Clicked(g.hostFriends.card), s.idle)) lobby.Host(direct::LobbyType::FriendsOnly);
@@ -1554,6 +2245,15 @@ void HandleClicks(Session& session) {
             lobby.SetConfig(c);
         }
     }
+    for (size_t i = 0; i < kModRuleRows; ++i) {   // MODS: the host's rule steppers; written to HSMMod.ini [mod]
+        StepperView& v = g.modRules[i];
+        if (!v.box) continue;
+        int dir = Clicked(v.prev.card) ? -1 : 0;
+        if (Clicked(v.next.card)) dir = 1;
+        const ModRuleView& row = g.modsScene.rules[i];
+        if (!act(dir != 0, g.tab == kModsTab && s.in && row.enabled && lobby.IsHost())) continue;
+        game::modrules::SetChoice(StepModRule(game::modrules::Chosen(), row.id, dir));
+    }
     for (size_t i = 0; i < g.maps.size(); ++i)
         if (act(Clicked(g.maps[i].card), g.tab == 2 && i < s.maps.size() && s.maps[i].enabled))
             lobby.SetMapPick(s.maps[i].modded ? s.maps[i].path : std::string(MapAt(s.maps[i].index).path));
@@ -1569,7 +2269,7 @@ void HandleClicks(Session& session) {
     }
 
     // Paint after the polls (a card's Hovered() is the one its Clicked() just saw).
-    for (Flat* f : {&g.refresh, &g.invite, &g.readyUp, &g.balance, &g.leave, &g.close, &g.settingsOpen, &g.reportOpen,
+    for (Flat* f : {&g.refresh, &g.invite, &g.readyUp, &g.balance, &g.leave, &g.close, &g.settingsOpen, &g.alone, &g.reportOpen,
                     &g.reportSend, &g.reportCancel, &g.chatSend, &g.helpToggle, &g.updateNow}) Paint(f->card);
     for (Flat& f : g.chips) Paint(f.card);
     for (HostView* h : {&g.hostFriends, &g.hostPublic}) Paint(h->card);
@@ -1577,6 +2277,7 @@ void HandleClicks(Session& session) {
     for (MemberView& v : g.members) Paint(v.card);
     for (ModeView& v : g.modes) Paint(v.card);
     for (StepperView& v : g.steppers) { Paint(v.prev.card); Paint(v.next.card); }
+    for (StepperView& v : g.modRules) { Paint(v.prev.card); Paint(v.next.card); }
     Paint(g.damage.number.card);
     for (MapView& v : g.maps) Paint(v.card);
     PaintTabs();
@@ -1590,6 +2291,7 @@ void Tick(Session& session, UObject* worldContext) {
     if (!session.steamMode()) return;
     if(loadout::IsOpen()) return;
     game::modmaps::Tick();                       // the modded-map scan (worker results, asset registry); cheap when idle
+    game::modrules::Tick();                      // the mod report (UE4SS mods, proxies, Enhancer) for the mod rules
     if (worldContext != g.worldContext) { Reset(); g.worldContext = worldContext; }
     ULONGLONG now = GetTickCount64();
     const bool alive = StillAlive(g.menu, g.menuIndex, g.menuClass);
@@ -1618,8 +2320,13 @@ void Tick(Session& session, UObject* worldContext) {
         g.notice.Set(why); g.notice.Show(true);
         g.panelOpen = true; g.panel.Show(true); g.nextText = 0;
     }
-    HandleClicks(session);
-    if (now >= g.nextText) { g.nextText = now + 250; UpdateOpenLabel(session); if (g.panelOpen) UpdatePanel(session); }
+    if (!HandleBlock(session)) HandleClicks(session);
+    if (now >= g.nextText) {
+        g.nextText = now + 250;
+        if (g.panelOpen || session.lobby().InLobby()) FixClassPick(session);
+        UpdateOpenLabel(session);
+        if (g.panelOpen) UpdatePanel(session);
+    }
 }
 
 // Fight levels: no main menu belongs on screen. A client that joined with the multiplayer page open kept the page over

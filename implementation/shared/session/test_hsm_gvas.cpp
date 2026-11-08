@@ -174,6 +174,43 @@ static void TestEveryTruncation() {
     }
 }
 
+// The multiplayer career's file (session/hsm_mp_career.h): a whole SG_GameProgress_C save of this engine, with properties
+// the passport check would refuse.
+static void TestCareerSave() {
+    auto ok = [](const Bytes& b) { return CheckCareerSave(b.data(), b.size()); };
+    auto why = [](const Bytes& b) { std::string w; CheckCareerSave(b.data(), b.size(), &w); return w; };
+    CHECK(ok(Good()));
+    {   // a career's own fields, and more of them than a passport may carry
+        Writer w = Header();
+        Prop(w, "Player Inventory", "StructProperty(Str_Inventory(/Game/Blueprints/Structure/Inventory/Str_Inventory),56ede05e-4678-b389-4f60-08b3af6d676b)", Bytes(5000, 7));
+        Prop(w, "Reputation on Rank", "IntProperty", {9, 0, 0, 0});
+        Prop(w, "Available Combatants", "ArrayProperty(IntProperty)", Bytes(300 * 1024, 2));
+        End(w);
+        CHECK(ok(w.b));
+        CHECK(!CheckPassportSave(w.b.data(), w.b.size()));
+    }
+    { Writer w = Header(); End(w); CHECK(ok(w.b)); }                                     // a save of defaults only
+    // the tail: "None", then at most 8 zero bytes
+    { Bytes b = Good(); b.resize(b.size() - 4); CHECK(ok(b)); }
+    { Bytes b = Good(); for (int i = 0; i < 4; ++i) b.push_back(0); CHECK(ok(b)); }
+    { Bytes b = Good(); for (int i = 0; i < 5; ++i) b.push_back(0); CHECK(why(b) == "no end of properties"); }
+    { Bytes b = Good(); b.back() = 1; CHECK(why(b) == "no end of properties"); }
+    { Bytes b = Good(); b.push_back(7); CHECK(why(b) == "no end of properties"); }
+    { Writer w = Header(); Prop(w, "Day Count", "IntProperty", {1, 0, 0, 0}); CHECK(why(w.b) == "no end of properties"); }
+    // the header and the class, as for a passport: the class decides what LoadGameFromSlot makes
+    { Bytes b = Good(); b[0] = 'X'; CHECK(why(b) == "not a save file"); }
+    { Options o; o.cls = "/Script/Engine.SaveGame"; Writer w = Header(o); End(w); CHECK(why(w.b) == "save class"); }
+    { Options o; o.minor = 5; Writer w = Header(o); End(w); CHECK(why(w.b) == "engine version"); }
+    { Options o; o.control = 1; Writer w = Header(o); End(w); CHECK(why(w.b) == "serialization control"); }
+    CHECK(!CheckCareerSave(nullptr, 0));
+    CHECK(why(Bytes(10, 0)) == "size");
+    { Bytes b = Good(); CHECK(!CheckCareerSave(b.data(), b.size(), nullptr, b.size() - 1)); }
+    // cut short (only the zeros after "None" may go), and every flipped byte read in bounds
+    const Bytes b = Good();
+    for (size_t n = 0; n + 4 < b.size(); ++n) CHECK(!CheckCareerSave(b.data(), n));
+    for (size_t i = 0; i < b.size(); ++i) { Bytes x = b; x[i] ^= 0xFF; CheckCareerSave(x.data(), x.size()); }
+}
+
 static void TestSample() {
     const char* path = std::getenv("HSM_GVAS_SAMPLE");
     if (!path) return;
@@ -187,6 +224,9 @@ static void TestSample() {
     bool ok = CheckPassportSave(b.data(), b.size(), &why, 4 * 1024 * 1024);
     std::printf("sample %s (%zu bytes): %s %s\n", path, b.size(), ok ? "accepted" : "REJECTED", why.c_str());
     CHECK(ok);
+    const bool career = CheckCareerSave(b.data(), b.size(), &why);
+    std::printf("sample as a career save: %s %s\n", career ? "accepted" : "REJECTED", career ? "" : why.c_str());
+    CHECK(career);
 }
 
 int main() {
@@ -194,6 +234,7 @@ int main() {
     TestHeaderRejects();
     TestPropertyRejects();
     TestEveryTruncation();
+    TestCareerSave();
     TestSample();
     if (g_fail) { std::printf("test_hsm_gvas: %d failure(s)\n", g_fail); return 1; }
     std::printf("test_hsm_gvas: ok\n");

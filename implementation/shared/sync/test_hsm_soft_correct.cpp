@@ -172,7 +172,31 @@ static void TestStuckTimer() {
     CHECK(s.Update(2400, 80) == 100);
 }
 
+static void TestRestingBodiesKeepTheirVelocity() {
+    SoftTarget t{};
+    t.rot = Q4{};
+    const V3 still{}, slow{1, 0, 0}, moving{50, 0, 0}, spin{0, 0, 20};
+    SoftSteer in = Steer(V3{0.5, 0, 0}, Q4{}, t, 0.05);              // 0.5 cm off: inside the dead band
+    CHECK(!in.corrected);
+    CHECK(KeepLocalVelocity(in, still, still, still, still));      // asleep on both machines: not woken
+    CHECK(KeepLocalVelocity(in, slow, still, slow, still));        // drifting under kRestCmS is still at rest
+    CHECK(!KeepLocalVelocity(in, moving, still, still, still));    // the host's copy moves: follow it
+    CHECK(!KeepLocalVelocity(in, still, still, moving, still));    // ours moves where the host's rests: stop it
+    CHECK(!KeepLocalVelocity(in, still, spin, still, still));      // turning counts too
+    SoftSteer off = Steer(V3{30, 0, 0}, Q4{}, t, 0.05);              // 30 cm off: corrected, whatever the speeds
+    CHECK(off.corrected);
+    CHECK(!KeepLocalVelocity(off, still, still, still, still));
+}
+
+static void TestSnapNeedsBodiesAndASettledCopy() {
+    CHECK(!SnapAllowed(kSnapSettleMs - 1));                        // just bound: its joints and anchors still settle
+    CHECK(SnapAllowed(kSnapSettleMs));
+    CHECK(SnapAllowed(1e18));
+}
+
 int main() {
+    TestRestingBodiesKeepTheirVelocity();
+    TestSnapNeedsBodiesAndASettledCopy();
     TestPendulumConvergesWithoutOvershoot();
     TestIrregularIntervalsStillNoOvershoot();
     TestDeadBandKeepsHostVelocity();

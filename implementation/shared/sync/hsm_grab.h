@@ -342,6 +342,9 @@ inline uint32_t DragYieldBones(int bone) {
 // under grab_drag: a smaller share, so the body comes along and the held bone is not pulled out of its joints alone,
 // while the fighter can still struggle free. grab_drag=0: none, as up to 0.8.0-pre16.
 constexpr double kGrabStandSpread = 0.25;
+// Who's carried rather than held on a soft spring: a body that can't struggle, and anyone held by a Grappler, which is the perk: the pull is a
+// change in velocity, so it doesn't care what the body weighs.
+inline bool GrabCarried(bool down, bool grabberIsGrappler) { return down || grabberIsGrappler; }
 inline double GrabSpread(bool down, bool drag) { return down ? kGrabDownSpread : drag ? kGrabStandSpread : 0.0; }
 
 // A stand-in my fighter holds is not snapped onto its owner's pose (grab_drag) unless its pelvis was this far off at the

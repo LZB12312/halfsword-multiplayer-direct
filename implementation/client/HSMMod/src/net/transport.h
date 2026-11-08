@@ -1,5 +1,6 @@
-// Transports. ITransport is what the session uses; DirectTransport (ENet UDP through the host) implements it. Incoming payloads are validated
-// before they are queued for the game thread.
+// Transports. ITransport is what the session uses; DirectTransport (ENet through the host) implements it. Incoming payloads are validated
+// before they are queued for the game thread. Pose admission checks the envelope only; the session fully decodes
+// the skeleton after its receive budget and before applying or relaying it.
 #pragma once
 #include <atomic>
 #include <chrono>
@@ -32,11 +33,14 @@ public:
     using Validator = std::function<bool(const uint8_t* data, size_t size, uint8_t channel)>;
     virtual ~ITransport() = default;
     virtual void Stop() = 0;
-    virtual void Send(uint32_t peer, uint8_t channel, std::vector<uint8_t> data, bool reliable) = 0;
-    virtual void Broadcast(uint8_t channel, std::vector<uint8_t> data, bool reliable) = 0;
+    // Synchronous sends: the implementation consumes bytes during the call, never retains the borrowed buffer.
+    virtual void Send(uint32_t peer, uint8_t channel, const std::vector<uint8_t>& data, bool reliable) = 0;
+    virtual void Broadcast(uint8_t channel, const std::vector<uint8_t>& data, bool reliable) = 0;
     virtual void Disconnect(uint32_t peer) = 0;
     virtual bool Poll(NetEvent& out) = 0;
     virtual uint32_t RoundTripMs(uint32_t peer) = 0;
+    // The peer's route ("direct", "relayed via fra") when it is new or has changed since the last call; empty otherwise.
+    virtual std::string RouteChange(uint32_t) { return {}; }
 };
 
 }  // namespace hsm

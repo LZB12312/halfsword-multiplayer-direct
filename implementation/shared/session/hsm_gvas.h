@@ -96,6 +96,28 @@ struct Cursor {
         return ok ? name + ")" : std::string();
     }
 };
+
+// The GVAS header of an SG_GameProgress_C save from this engine, up to its first property tag (the caller checked that
+// at least 64 bytes are there). nullptr when it is one, else the first problem.
+inline const char* ReadSaveHeader(Cursor& c) {
+    if (std::memcmp(c.d, "GVAS", 4) != 0) return "not a save file";
+    c.skip(4);
+    int32_t saveVersion = c.i32();
+    if (saveVersion != 3) return "save version";
+    int32_t ue4 = c.i32(), ue5 = c.i32();
+    if (ue4 < 500 || ue4 > 1000 || ue5 < 1000 || ue5 > 2000) return "package version";
+    uint16_t major = c.u16(), minor = c.u16();
+    c.u16(); c.i32();
+    if (major != 5 || minor != 4) return "engine version";
+    c.str(128);                                                   // branch
+    if (c.i32() != 3) return "custom version format";
+    int32_t customs = c.i32();
+    if (!c.ok || customs < 0 || customs > 256) return "custom versions";
+    c.skip(size_t(customs) * 20);                                 // FGuid + int32 each
+    if (c.str(256) != kPassportSaveClass || !c.ok) return "save class";
+    if (c.u8() != 0) return "serialization control";              // UE 5.4 class serialization control extension: none
+    return nullptr;
+}
 }  // namespace gvas_detail
 
 // true: `d` is a passport save this build would write. `why` names the first problem otherwise.
@@ -103,22 +125,7 @@ inline bool CheckPassportSave(const uint8_t* d, size_t n, std::string* why = nul
     auto fail = [why](const char* w) { if (why) *why = w; return false; };
     if (!d || n < 64 || n > maxBytes) return fail("size");
     gvas_detail::Cursor c{d, n};
-    if (std::memcmp(d, "GVAS", 4) != 0) return fail("not a save file");
-    c.skip(4);
-    int32_t saveVersion = c.i32();
-    if (saveVersion != 3) return fail("save version");
-    int32_t ue4 = c.i32(), ue5 = c.i32();
-    if (ue4 < 500 || ue4 > 1000 || ue5 < 1000 || ue5 > 2000) return fail("package version");
-    uint16_t major = c.u16(), minor = c.u16();
-    c.u16(); c.i32();
-    if (major != 5 || minor != 4) return fail("engine version");
-    c.str(128);                                                   // branch
-    if (c.i32() != 3) return fail("custom version format");
-    int32_t customs = c.i32();
-    if (!c.ok || customs < 0 || customs > 256) return fail("custom versions");
-    c.skip(size_t(customs) * 20);                                 // FGuid + int32 each
-    if (c.str(256) != kPassportSaveClass || !c.ok) return fail("save class");
-    if (c.u8() != 0) return fail("serialization control");        // UE 5.4 class serialization control extension: none
+    if (const char* bad = gvas_detail::ReadSaveHeader(c)) return fail(bad);
     bool seen[kGameProgressPropertyCount] = {};
     for (int props = 0;; ++props) {
         std::string name = c.str(256);
@@ -146,6 +153,26 @@ inline bool CheckPassportSave(const uint8_t* d, size_t n, std::string* why = nul
     if (n - c.p > 8) return fail("trailing data");
     for (size_t i = c.p; i < n; ++i) if (d[i] != 0) return fail("trailing data");
     return true;
+}
+
+// The multiplayer career's file (session/hsm_mp_career.h): a whole SG_GameProgress_C save from this engine. This
+// machine's own game wrote it (Save Game into the slot, copied out), so only its shape is checked: the header and save
+// class, and that it ends as a save does, "None" with at most 8 zero bytes after it. That is no proof the file is whole
+// (structs inside end with "None" too); the atomic write that made it sees to that. Its properties are not walked: a
+// career carries far more than a passport (CheckPassportSave is the one for peers' bytes).
+constexpr size_t kMaxCareerSaveBytes = size_t(32) << 20;
+inline bool CheckCareerSave(const uint8_t* d, size_t n, std::string* why = nullptr, size_t maxBytes = kMaxCareerSaveBytes) {
+    auto fail = [why](const char* w) { if (why) *why = w; return false; };
+    if (!d || n < 64 || n > maxBytes) return fail("size");
+    gvas_detail::Cursor c{d, n};
+    if (const char* bad = gvas_detail::ReadSaveHeader(c)) return fail(bad);
+    static constexpr uint8_t kNone[] = {5, 0, 0, 0, 'N', 'o', 'n', 'e', 0};   // FString "None", the end of the properties
+    for (size_t zeros = 0; zeros <= 8; ++zeros) {                // the tail tried: the last `zeros` bytes, all zero
+        if (zeros > 0 && d[n - zeros] != 0) break;               // the byte this try adds is not zero: nothing further back
+        if (n - c.p < zeros + sizeof kNone) break;               // "None" would reach into the header
+        if (std::memcmp(d + n - zeros - sizeof kNone, kNone, sizeof kNone) == 0) return true;
+    }
+    return fail("no end of properties");
 }
 
 }  // namespace hsm

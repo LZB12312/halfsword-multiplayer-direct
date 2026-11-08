@@ -46,6 +46,7 @@ struct LobbyFound {                     // a public lobby from Find
     bool compatible = false;
     std::string reason;                 // why not, when !compatible
     std::string pack;                   // "pack ArenaPack" (session/hsm_modpack.h PackRowText), with a mark when this machine lacks it; empty: no pack
+    std::string mods;                   // the lobby's mod rule when not the default, "mods: Vanilla" (session/hsm_mod_rules.h LobbyRuleTag)
 };
 
 struct LobbyModMap { std::string path, display, pak; };   // a custom map from a mod pak (session/hsm_modmaps.h); pak empty when unknown
@@ -69,6 +70,7 @@ struct LobbyLocal {
     std::vector<LobbyFound> found;
     BrowserFilter filter;
     int maxPlayers = 8;                 // in a lobby: the host's player limit (Lobby::MaxPlayers)
+    std::string myClass;                // the class we fight as, set only where classes count (Lobby::InClassesLobby)
 };
 
 // Each section shows its rows in this order. Sync last: ui/menu.cpp makes one stepper per row up to it.
@@ -170,6 +172,7 @@ struct LobbyScene {
     bool hostPassword = false;          // the host's password box (SET and CLEAR), in a lobby
     std::string passwordNote;           // beside it: locked or open, and that changing it kicks nobody
     bool balance = false;               // Auto-balance: the host, in the formats with teams
+    std::string classLine;              // in a lobby that uses classes: which one we fight as, beside CHANGE; empty: no row
     std::vector<ModeCard> modes;        // the grid's reading order, two to a row
     std::vector<SettingRow> settings;
     SettingRow playerLimit;             // the Players stepper (LobbyRow::Players): the host steps it, members read it; in a lobby only
@@ -623,6 +626,7 @@ inline LobbyScene BuildLobbyScene(const LobbyLocal& l) {
     }
     s.idle = l.phase == LobbyPhase::Idle;
     s.in = l.phase == LobbyPhase::InLobby;
+    if (s.in && !l.myClass.empty()) s.classLine = "YOUR CLASS: " + l.myClass;
     if (!s.in) s.status = l.status;
     if (s.idle) {
         s.filters = FilterChips(l.filter);
@@ -647,6 +651,7 @@ inline LobbyScene BuildLobbyScene(const LobbyLocal& l) {
             r.detail = f.map;
             if (!f.mode.empty()) r.detail += (r.detail.empty() ? "" : " \xC2\xB7 ") + f.mode;
             if (!f.pack.empty()) r.detail += (r.detail.empty() ? "" : " \xC2\xB7 ") + f.pack;
+            if (!f.mods.empty()) r.detail += (r.detail.empty() ? "" : " \xC2\xB7 ") + f.mods;
             if (!f.compatible) r.note = {f.reason.empty() ? std::string("Incompatible") : f.reason, style::kWarn};
             else if (LobbyIsFull(f.players, f.maxPlayers)) r.note = {"Full", style::kWarn};
             else { r.note = {"Join", style::kOk}; r.joinable = true; }

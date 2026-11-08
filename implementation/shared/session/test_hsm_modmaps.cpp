@@ -64,6 +64,10 @@ static void TestNames() {
     CHECK(SanitizePakName("a/b\\c:d.pak") == "a_b_c_d.pak");
     CHECK(SanitizePakName(std::string(300, 'x')).size() == kMaxModPakName);
     CHECK(ModPakNameOk(SanitizePakName("caf\xC3\xA9.pak")));
+    // A pak's name can't hide it: this is the one a tester used, left-to-right mark, escapes and all.
+    const std::string sneaky = "\xE2\x80\x8E'z'." + std::string(300, '5') + ".pak";
+    CHECK(ModPakNameOk(SanitizePakName(sneaky)) && SanitizePakName(sneaky).size() == kMaxModPakName);
+    CHECK(ModPakNameOk(SanitizePakName("..\\..\\a.pak")) && ModPakNameOk(SanitizePakName(".hidden.pak")) && ModPakNameOk(SanitizePakName("a..b.pak")));
 
     CHECK(ModMapDisplayName("/Game/Maps/Custom/My_Cool-Map") == "My Cool Map");
     CHECK(ModMapDisplayName("/Game/Maps/X_") == "X");

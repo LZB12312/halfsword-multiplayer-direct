@@ -1,5 +1,6 @@
 // Unit tests for hsm_pose_codec.h. Run via implementation/shared/run_tests.sh test_hsm_pose_codec.
 #include "sync/hsm_pose_codec.h"
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -635,7 +636,20 @@ static void TestFlailHeadHostileValuesStayFinite() {
     CHECK(rel.x > 2000.0 && rel.y < -2000.0 && std::fabs(rel.z) < 0.1);
 }
 
+static void TestMuDecodePreservesEveryCode() {
+    for (double max : {kVLinMax, kVAngMax, 1234.5}) {
+        for (uint32_t c = 0; c < 256; ++c) {
+            const double m = double(c & 0x7Fu) / 127.0;
+            const double magnitude = (std::pow(1.0 + kMuLaw, m) - 1.0) / kMuLaw * max;
+            const double expected = (c & 0x80u) ? -magnitude : magnitude;
+            // Exact decoded values are the compatibility contract, including negative zero and the fallback scale.
+            CHECK(std::bit_cast<uint64_t>(detail::MuDecode(c, max)) == std::bit_cast<uint64_t>(expected));
+        }
+    }
+}
+
 int main() {
+    TestMuDecodePreservesEveryCode();
     TestPropertyRoundTrip();
     TestDislocatedBoneOverridesExactly();
     TestEncodedSize();

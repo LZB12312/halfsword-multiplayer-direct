@@ -63,6 +63,9 @@ int main() {
     }
     mp.Bind(11, 5); mp.Bind(33, 6); mp.Bind(44, 7); mp.Bind(10, 8);
     CHECK(mp.SlotOfPeer(5) == 1 && mp.SlotOfPeer(6) == 3);
+    // A client finds another player's fighter by SteamID for their claws: it has no roster of its own.
+    CHECK(mp.SlotOfSteam(11) == 1 && mp.SlotOfSteam(33) == 3);
+    CHECK(mp.SlotOfSteam(22) == 0xFF && mp.SlotOfSteam(10) == 0xFF && mp.SlotOfSteam(99) == 0xFF);   // this machine, the host, a stranger
     CHECK(mp.SlotOfPeer(7) == 0xFF && mp.SlotOfPeer(8) == 0xFF && mp.SlotOfPeer(99) == 0xFF);   // unnamed peers, the host, strangers
     CHECK(mp.Peers().size() == 2 && mp.Named() == 2);
     PeerMapMsg b2; b2.peers = {pe(3, 33), pe(4, 44)};                  // slot 1 left, slot 4 joined

@@ -1,4 +1,5 @@
 #include "gameplay/gear.h"
+#include "gameplay/owner_sync.h"
 #include "log.h"
 #include "match/hsm_gear_names.h"
 #include "match/hsm_match.h"
@@ -92,6 +93,10 @@ std::vector<uint8_t> RandomPassportBlob(Adapter& a, int tier, WeaponFilter weapo
         return blob;
     }
 
+    // Each loadout stalls the host's frame about 110 ms (playtest 2026-11-05: every 100+ ms spike while hosting Pit matched one). Where it goes
+    // decides what can be done about it, so the log says.
+    const double t0 = SteadyNowMs();
+    double tSpawn = t0, tMake = t0, tSave = t0;
     FTransform t;
     Call begin(statics, "BeginDeferredActorSpawnFromClass");
     begin.set<UObject*>("WorldContextObject", a.World()).set<UClass*>("ActorClass", gen).set("SpawnTransform", t)
@@ -126,14 +131,18 @@ std::vector<uint8_t> RandomPassportBlob(Adapter& a, int tier, WeaponFilter weapo
             }
             HSM_LOG("gear: weapon filter %s -> game byte %u on %zu field(s)", WeaponFilterName(weapons), unsigned(gameByte), scope->found());
         }
+        tSpawn = SteadyNowMs();
         ok = make.invoke();
+        tMake = SteadyNowMs();
     }
     if (ok) ok = SerializePassport(a, statics, sgClass, make.paramPtr("Character Passport"), make.function(), blob);
     else HSM_LOG("gear: Generate Character failed (tier %d)", rank);
+    tSave = SteadyNowMs();
     a.DestroyActor(g);
     if (!ok) { blob.clear(); HSM_LOG("gear: no loadout generated for tier %d", rank); }
     else {
-        HSM_LOG("gear: generated random tier %d loadout (%zu bytes)", rank, blob.size());
+        HSM_LOG("gear: generated random tier %d loadout (%zu bytes) in %.1f ms: spawn %.1f, Generate Character %.1f, save %.1f, destroy %.1f", rank,
+                blob.size(), SteadyNowMs() - t0, tSpawn - t0, tMake - tSpawn, tSave - tMake, SteadyNowMs() - tSave);
         if (weapons != WeaponFilter::Any) {            // what the filter produced: the asset names the passport carries
             std::string names;
             for (const std::string& n : BlobAssetNames(blob)) names += (names.empty() ? "" : " | ") + n;

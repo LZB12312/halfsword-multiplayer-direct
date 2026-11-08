@@ -29,6 +29,7 @@ public:
         std::function<uint8_t(const ue::UObject*)> standInEntity;          // the entity a stand-in Willie shows, 0 if none
         std::function<ue::UObject*(uint8_t)> standInActor;                 // an entity's stand-in, nullptr if none
         std::function<bool(uint8_t)> dead;                                  // a remote entity's latest vitals say dead
+        std::function<bool(uint8_t)> grappler;                              // that entity's class has the Grappler perk
         std::function<bool(uint8_t)> down;                                  // ... say dead, fallen, knocked out or 0 health
         std::function<void(const std::vector<uint8_t>&, bool reliable)> send;   // a GrabState made here (the session routes it)
         std::function<void(uint8_t held, uint8_t grabber, uint8_t hand)> sendBreak;   // my fighter broke free: the grabber's owner lets go (item 7)

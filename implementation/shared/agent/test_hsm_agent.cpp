@@ -42,6 +42,12 @@ static void TestJsonEscape() {
 
 int main() {
     TestCmdArg(); TestParseCommand(); TestJsonEscape();
+    // The mod-off relaunch keeps the player's own arguments and drops the exe, an old role and a Steam join.
+    CHECK(RelaunchArgs("\"F:\\Steam Library\\HalfSwordUE5-Win64-Shipping.exe\" -dx12 \"-log=my log.txt\"", 42, true) == "-dx12 \"-log=my log.txt\" -hsmrole=off -hsmwaitfor=42");
+    CHECK(RelaunchArgs("game.exe -hsmrole=steam +connect_lobby 1098 -hsmwaitfor=7 -windowed", 9, true) == "-windowed -hsmrole=off -hsmwaitfor=9");
+    CHECK(RelaunchArgs("game.exe", 1, true) == "-hsmrole=off -hsmwaitfor=1" && RelaunchArgs("", 1, true) == "-hsmrole=off -hsmwaitfor=1");
+    CHECK(RelaunchArgs("game.exe -hsmrole=off -dx12", 5, false) == "-dx12 -hsmwaitfor=5");   // a restart with the mod on drops an old off
+    CHECK(CmdArg(RelaunchArgs("game.exe -x", 77, true), "hsmrole") == std::optional<std::string>("off") && CmdArgInt(RelaunchArgs("g", 77, true), "hsmwaitfor", 0, 1, 1 << 30) == 77);
     std::printf(g_fail ? "%d FAILED\n" : "all agent tests passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -76,7 +76,17 @@ static void TestEventAndReject() {
         Reject rk; rk.reason = k; auto kb = Encode(rk); Reject ko;
         CHECK(Decode(kb.data(), kb.size(), ko) && ko.reason == k);
     }
-    CHECK(kMaxRejectReason == 8 && uint8_t(RejectReason::WrongPassword) == 7 && uint8_t(RejectReason::TooManyTries) == 8);
+    CHECK(kMaxRejectReason == 11 && uint8_t(RejectReason::WrongPassword) == 7 && uint8_t(RejectReason::TooManyTries) == 8);
+    CHECK(uint8_t(RejectReason::ModBuild) == 9 && uint8_t(RejectReason::ModsNotAllowed) == 10 && uint8_t(RejectReason::ModifiedClient) == 11);   // rev 40
+    {   // rev 40: a detail line, printable ASCII, at most kMaxRejectDetail bytes (a longer one is cut by the encoder).
+        Reject rd; rd.reason = RejectReason::ModsNotAllowed; rd.detail = "This lobby blocks cheats: remove HSEnhancer.";
+        auto db = Encode(rd); Reject dout;
+        CHECK(Decode(db.data(), db.size(), dout) && dout.reason == RejectReason::ModsNotAllowed && dout.detail == rd.detail);
+        for (size_t cut = 0; cut < db.size(); ++cut) CHECK(!Decode(db.data(), cut, dout));
+        auto ctl = db; ctl[7] = 0x07; CHECK(!Decode(ctl.data(), ctl.size(), dout));
+        rd.detail = std::string(300, 'x'); db = Encode(rd); CHECK(Decode(db.data(), db.size(), dout) && dout.detail.size() == kMaxRejectDetail);
+        CHECK(ro.detail.empty());
+    }
     { auto bad = rb; bad[4] = 0; CHECK(!Decode(bad.data(), bad.size(), ro)); bad[4] = kMaxRejectReason + 1; CHECK(!Decode(bad.data(), bad.size(), ro)); }
     Welcome w; w.snapshotHz = 0; auto wb = Encode(w); Welcome wo; CHECK(!Decode(wb.data(), wb.size(), wo));
     w.snapshotHz = 30; w.map = "/Game/Maps/Arenas/Map_Arena_Yard"; wb = Encode(w); CHECK(Decode(wb.data(), wb.size(), wo) && wo.map == w.map);
@@ -289,7 +299,7 @@ static void TestMatchInfoAndKill() {
     k.flags = 16; kb = Encode(k); CHECK(Decode(kb.data(), kb.size(), ko) && ko.flags == 16);
     k.flags = 63; kb = Encode(k); CHECK(Decode(kb.data(), kb.size(), ko) && ko.flags == 63);
     k.flags = 64; kb = Encode(k); CHECK(!Decode(kb.data(), kb.size(), ko));
-    CHECK(kMaxWillies >= 18 && kProtocolRevision == 39);   // rev 39: Tag bare-fisted, one-round Tournament fights; rev 38: Spawn kSpawnZombie, HitClaim source Ammo; rev 37: formats 10-15, CtfEvent 62, ModeEvent 63, ProgressionVote 66, MatchInfo.tagIt/fuseLeftMs/objectives/queueOrder/bracketWinners/fightWinsA/fightWinsB/streak; rev 36: FighterEntry.role, Format TeamDuel/Riot/Juggernaut, MatchInfo.teamKit/freeCam/crossbows, Spawn.flags, LoadoutChange; rev 35: GroundClear, LobbySecret, Hello.password, MatchInfo.teams, Format::LastManStanding; rev 34: MatchInfo.forceStrength; rev 33: Input/RelayInput toggle counts and lock-on target; rev 32: HandOff, HandOffAsk, Pose/Vitals epoch; rev 31: MatchInfo.physics; rev 25: HitClaim Stuck + rawDamage; rev 24: Voice flags NoCut, Everyone (voice per player); rev 23: Voice ADPCM flag, VoiceMode, kWelcomeVoiceAll, RouteTable, Forward; rev 22: 8 players, PingTable, kWelcomePeerPing; rev 21: MatchInfo.gear Fists (Brawl); rev 20: Reject Kicked/Banned, server chat lines; rev 19: Spawn.life, victimLife, PeerMap, MeshHeard, Welcome.flags; rev 18: ReportShare; rev 17: drawn rounds, flail head, mod build in Hello and Welcome, fighters down in MatchInfo; rev 16: GiveUp; rev 15: PaintFx Voice, HitSound, Armor, ArmorOn; rev 14: pose codec v2 (grip state); rev 13: prop HitClaims, MatchInfo rounds/gear/ping/alive; rev 12: SeverNotice, PropCensus
+    CHECK(kMaxWillies >= 18 && kProtocolRevision == 41);   // rev 41: ProgressionResult 69 (next-round and time-step flags), Day Count in travels; rev 40: ModList, SessionMods, ModChallenge, ModAnswer, Reject.detail, RejectReason 9-11; rev 39: Tag bare-fisted, one-round Tournament fights; rev 38: Spawn kSpawnZombie, HitClaim source Ammo; rev 37: formats 10-15, CtfEvent 62, ModeEvent 63, ProgressionVote 66, MatchInfo.tagIt/fuseLeftMs/objectives/queueOrder/bracketWinners/fightWinsA/fightWinsB/streak; rev 36: FighterEntry.role, Format TeamDuel/Riot/Juggernaut, MatchInfo.teamKit/freeCam/crossbows, Spawn.flags, LoadoutChange; rev 35: GroundClear, LobbySecret, Hello.password, MatchInfo.teams, Format::LastManStanding; rev 34: MatchInfo.forceStrength; rev 33: Input/RelayInput toggle counts and lock-on target; rev 32: HandOff, HandOffAsk, Pose/Vitals epoch; rev 31: MatchInfo.physics; rev 25: HitClaim Stuck + rawDamage; rev 24: Voice flags NoCut, Everyone (voice per player); rev 23: Voice ADPCM flag, VoiceMode, kWelcomeVoiceAll, RouteTable, Forward; rev 22: 8 players, PingTable, kWelcomePeerPing; rev 21: MatchInfo.gear Fists (Brawl); rev 20: Reject Kicked/Banned, server chat lines; rev 19: Spawn.life, victimLife, PeerMap, MeshHeard, Welcome.flags; rev 18: ReportShare; rev 17: drawn rounds, flail head, mod build in Hello and Welcome, fighters down in MatchInfo; rev 16: GiveUp; rev 15: PaintFx Voice, HitSound, Armor, ArmorOn; rev 14: pose codec v2 (grip state); rev 13: prop HitClaims, MatchInfo rounds/gear/ping/alive; rev 12: SeverNotice, PropCensus
     // rev 9: Welcome says who simulates the fighters (0 host, 1 owner); nothing else is a mode
     Welcome sm; sm.snapshotHz = 60; sm.map = "m"; Welcome smo;
     CHECK(sm.syncMode == 0);                                                   // host authority unless the host says so
@@ -302,9 +312,9 @@ static void TestMatchInfoAndKill() {
     sm.syncMode = 2; smb = Encode(sm); CHECK(!Decode(smb.data(), smb.size(), smo));
     sm.syncMode = 0xFF; smb = Encode(sm); CHECK(!Decode(smb.data(), smb.size(), smo));
     sm.syncMode = 1; smb = Encode(sm); smb.pop_back(); CHECK(!Decode(smb.data(), smb.size(), smo));   // the mode byte is required
-    // Reserved for M4-M6: numbers fixed, no decoder. A Welcome with the reserved flag 32 is rejected until M4 lands.
+    // Reserved for M5-M6: numbers fixed, no decoder (ModList and SessionMods have one from rev 40, session/hsm_mod_rules.h). A Welcome with the reserved flag 32 is rejected until M4 lands.
     CHECK(uint8_t(MsgType::ModList) == 48 && uint8_t(MsgType::SessionMods) == 49 && uint8_t(MsgType::ModMsg) == 50
-          && uint8_t(MsgType::PackList) == 51 && uint8_t(MsgType::PackStatus) == 52 && uint8_t(MsgType::ModMap) == 53 && uint8_t(MsgType::MapReset) == 54 && uint8_t(MsgType::LevelSeed) == 55 && uint8_t(MsgType::RemoteWrite) == 56 && uint8_t(MsgType::HandOff) == 57 && uint8_t(MsgType::HandOffAsk) == 58 && uint8_t(MsgType::GroundClear) == 59 && uint8_t(MsgType::LobbySecret) == 60 && uint8_t(MsgType::LoadoutChange) == 61 && uint8_t(MsgType::CtfEvent) == 62 && uint8_t(MsgType::ModeEvent) == 63 && uint8_t(MsgType::ProgressionVote) == 66 && kLastDecodedMsgType == 66 && kLastReservedMsgType == 66);
+          && uint8_t(MsgType::PackList) == 51 && uint8_t(MsgType::PackStatus) == 52 && uint8_t(MsgType::ModMap) == 53 && uint8_t(MsgType::MapReset) == 54 && uint8_t(MsgType::LevelSeed) == 55 && uint8_t(MsgType::RemoteWrite) == 56 && uint8_t(MsgType::HandOff) == 57 && uint8_t(MsgType::HandOffAsk) == 58 && uint8_t(MsgType::GroundClear) == 59 && uint8_t(MsgType::LobbySecret) == 60 && uint8_t(MsgType::LoadoutChange) == 61 && uint8_t(MsgType::CtfEvent) == 62 && uint8_t(MsgType::ModeEvent) == 63 && uint8_t(MsgType::ProgressionVote) == 66 && uint8_t(MsgType::ModChallenge) == 67 && uint8_t(MsgType::ModAnswer) == 68 && uint8_t(MsgType::ProgressionResult) == 69 && kLastDecodedMsgType == 69 && kLastReservedMsgType == 69);
     {
         Welcome w; w.snapshotHz = 30; w.map = "m"; w.flags = 32;
         auto wb = Encode(w); Welcome back; CHECK(!Decode(wb.data(), wb.size(), back));

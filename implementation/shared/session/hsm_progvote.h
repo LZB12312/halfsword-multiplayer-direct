@@ -12,7 +12,7 @@
 //   tied[seed % tied.size()] (the tied options in list order); no votes at all is a tie of every option
 //
 // Own inventory. Every player fights in the career kit they bring, never a generated or the host's (ProgressionConfig).
-// Rewards are not written into the clients' saves.
+// A fight's end goes on every player's own multiplayer career (session/hsm_career.h, ProgressionResult 69).
 //
 // Wire: ProgressionVote 66, reliable, one type with three kinds:
 //   State  (host -> client)  seq, seconds left, this client's pick, voters, voted, then the options (name, votes)
@@ -47,6 +47,13 @@ inline MatchConfig ProgressionConfig(MatchConfig c) {
     c.crossbows = 0;
     c.scenario = 0;
     return c;
+}
+
+// Whether the host starts a match on a fight level: two players or more, or one against bots. A Progression fight is one
+// against bots whatever the lobby's format says (ProgressionConfig), so a host alone in its lobby gets its match too. Without
+// it a lobby of one stalled after its fight: the stock end screens are kept off in a session and no match was there to end it.
+inline bool HostMatchWanted(size_t players, bool botFormat, bool progression) {
+    return players >= 2 || botFormat || progression;
 }
 
 // ------------------------------------------------------------------ the vote engine

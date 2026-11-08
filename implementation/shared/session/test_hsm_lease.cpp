@@ -8,6 +8,7 @@
 #include "session/hsm_lease.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 static int g_fail = 0;
@@ -730,6 +731,47 @@ static void TestPropStreamDue() {
     CHECK(PropStreamDue(LeaseLevel::Touch, -1.0e9, true, 0.0));           // never sent
 }
 
+// States sent in 10 s by a stream due every periodMs, checked once a frame at fps (noise: +-noise ms of float jitter on
+// alternate frames, as frame dt reads at 60 fps). carry: lastSentMs moves by NextSentMs; otherwise to nowMs (pre29).
+static int SendsIn10s(double fps, double periodMs, bool carry, double noise = 0.0) {
+    double last = -1e18, now = 0.0;
+    int sends = 0;
+    for (int f = 0; now < 10000.0; ++f) {
+        now += 1000.0 / fps + ((f & 1) ? noise : -noise);
+        if (now - last < periodMs) continue;
+        ++sends;
+        last = carry ? NextSentMs(last, periodMs, now) : now;
+    }
+    return sends;
+}
+
+// 0.8.0-pre29: a prop's stream rate no longer depends on the frame rate (the remainder carries, as for poses in PR 8).
+static void TestPropStreamCadence() {
+    CHECK(PropStreamPeriodMs(LeaseLevel::Hold, true) == kLeaseStreamMs);
+    CHECK(PropStreamPeriodMs(LeaseLevel::Touch, true) == kFreeIdleMs);
+    CHECK(PropStreamPeriodMs(LeaseLevel::Free, false) == kFreeStreamMs);
+    const double hz = 1000.0 / kFreeStreamMs;   // 62.5
+    for (double fps : {90.0, 120.0, 144.0, 165.0, 240.0}) {
+        const int n = SendsIn10s(fps, kFreeStreamMs, true);
+        CHECK(n >= int(hz * 10) - 2 && n <= int(hz * 10) + 2);
+    }
+    // Slower frames than the rate: one state a frame, never two (no catch-up burst).
+    CHECK(std::abs(SendsIn10s(60.0, kFreeStreamMs, true, 0.05) - 600) <= 2);
+    CHECK(std::abs(SendsIn10s(30.0, kFreeStreamMs, true) - 300) <= 2);
+    // A 500 ms hitch sends one state and then one more, not thirty.
+    double last = 0.0;
+    CHECK(PropStreamDue(LeaseLevel::Hold, last, false, 500.0));
+    last = NextSentMs(last, kLeaseStreamMs, 500.0);
+    CHECK(last == 500.0 - kLeaseStreamMs);
+    CHECK(PropStreamDue(LeaseLevel::Hold, last, false, 507.0));
+    last = NextSentMs(last, kLeaseStreamMs, 507.0);
+    CHECK(!PropStreamDue(LeaseLevel::Hold, last, false, 514.0));
+    // At rest, once a second as before.
+    CHECK(std::abs(SendsIn10s(144.0, kFreeIdleMs, true) - 10) <= 1);
+    // NEGATIVE CONTROL: the pre29 rule (lastSentMs = nowMs) at 144 fps sends every third frame, 48 Hz.
+    CHECK(SendsIn10s(144.0, kFreeStreamMs, false) <= 490);
+}
+
 
 // A dropped weapon lying FREE for kIdleDespawnMs goes on every machine (the lag of a pile of them).
 // Spec revision (user, 2026-10-25): a fighter standing near no longer holds the minute back (fighters stand by the loot
@@ -812,7 +854,7 @@ static void TestLeaseCapPerSlot() {
 }
 
 int main() {
-    TestDropIdentity(); TestMintDropPropId(); TestDropEpoch(); TestDropSignature(); TestDropSignatureFirstGrantOnly(); TestLeaseSeqCurrent(); TestResolveDropNow(); TestPropStreamDue();
+    TestDropIdentity(); TestMintDropPropId(); TestDropEpoch(); TestDropSignature(); TestDropSignatureFirstGrantOnly(); TestLeaseSeqCurrent(); TestResolveDropNow(); TestPropStreamDue(); TestPropStreamCadence();
     TestDropNoticed(); TestDropNoticedFollowsTheTable(); TestContactClaimant(); TestIslandSource();
     TestPropStateRoundTrip(); TestPropStateRejects();
     TestPropLeaseRoundTrip(); TestPropLeaseRejects(); TestPropIdBoundsOnDecode(); TestRequestFreeIsNoOp();

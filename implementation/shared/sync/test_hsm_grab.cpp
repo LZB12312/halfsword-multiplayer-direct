@@ -713,6 +713,8 @@ int main() {
     TestDropTarget();
     TestPullLaw();
     TestDownCarry();
+    // A Grappler carries a fighter on its feet the way a body is carried, and nobody else does.
+    if (!(sync::GrabCarried(false, true) && sync::GrabCarried(true, false) && !sync::GrabCarried(false, false))) { std::printf("GrabCarried\n"); ++g_fail; }
     if (g_fail) { std::printf("test_hsm_grab: %d check(s) failed\n", g_fail); return 1; }
     std::printf("test_hsm_grab: all checks passed\n");
     return 0;

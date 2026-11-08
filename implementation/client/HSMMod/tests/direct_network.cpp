@@ -68,6 +68,8 @@ int main(int argc,char** argv) {
                 CHECK(!d::SetLobbyData(1,"hsm_sever","400"));
                 CHECK(d::LobbyData(1,"hsm_sever")=="250");
                 d::SetMemberData(1,"ready","1");
+                d::SetMemberData(1,"hsm_card","Militia\nMaps");
+                d::SetMemberData(1,"hsm_mrule","forged");
                 CHECK(d::SetDisplayName("Renamed-"+std::to_string(d::MyUserId())));
                 CHECK(d::SendLobbyChat(1,"hello from client"));
             }
@@ -92,8 +94,8 @@ int main(int argc,char** argv) {
             if(host) { CHECK(d::Send(m.from,m.channel,m.data.data(),uint32_t(m.data.size()),m.channel==0?d::kReliable:0)); if(m.channel==0) complete.insert(m.from); }
             if(m.channel==0) large=true; else unreliable=true;
         }
-        if(!host) ready=ready && d::MemberData(1,d::MyUserId(),"ready")=="1";
-        else ready=std::all_of(seen.begin(),seen.end(),[](auto id){ return d::MemberData(1,id,"ready")=="1" && d::PersonaName(id)=="Renamed-"+std::to_string(id); });
+        if(!host) ready=ready && d::MemberData(1,d::MyUserId(),"ready")=="1" && d::MemberData(1,d::MyUserId(),"hsm_card")=="Militia\nMaps";
+        else ready=std::all_of(seen.begin(),seen.end(),[](auto id){ return d::MemberData(1,id,"ready")=="1" && d::MemberData(1,id,"hsm_card")=="Militia\nMaps" && d::MemberData(1,id,"hsm_mrule").empty() && d::PersonaName(id)=="Renamed-"+std::to_string(id); });
         if(chat && large && unreliable && ready && (!host || complete.size()==2)) {
             if(!finished) finished=now;
         }

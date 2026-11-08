@@ -20,8 +20,11 @@ void HookFunction(UFunction* fn, PreHook hook);
 void HookFunctionsMatching(std::function<bool(const std::string& functionName)> match, PreHook hook);
 // Hook an arbitrary native function (MinHook). Safe to call before or after InstallProcessEventHook.
 bool HookNative(void* target, void* detour, void** original, const char* label);
-// Thread that made the first ProcessEvent call (the game thread); 0 before that.
+// The game thread: first a guess, the thread of the first ProcessEvent call (0 before it); NoteGameThread corrects it.
 unsigned long GameThreadId();
+// Called from an actor's ReceiveTick, which only the game thread runs. The bundled UE4SS makes the first ProcessEvent call
+// from its own thread, and with that guess every game-thread check (the script VM hooks: claims, fx, gore) refused the game.
+void NoteGameThread();
 // The pre-hooks' share of the game thread: calls that ran at least one hook, and the time spent in those hooks
 // (outermost calls only, so a hook's own ProcessEvent calls and the hooks they run are counted once, inside it).
 struct ProcessEventHookStats {

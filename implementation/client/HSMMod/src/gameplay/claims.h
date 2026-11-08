@@ -19,7 +19,9 @@
 // copy of the prop as the striker; my fighter struck by a copy driven from elsewhere is blocked, the streamer's claim
 // brings that blow.
 #pragma once
+#include "session/hsm_incoming_guard.h"
 #include "sync/hsm_remote.h"
+#include "combat/hsm_armor_gate.h"
 #include "combat/hsm_claim.h"
 #include "gameplay/adapter.h"
 #include "gameplay/owner_sync.h"
@@ -51,6 +53,9 @@ public:
         std::function<uint8_t()> myEntity;
         // Sync audit T3: a write the game made here onto a stand-in (a push, a teammate helped up), for its owner.
         std::function<void(const sync::RemoteWriteMsg&)> sendRemote;
+        // stuck_armor_gate (default on, 0.8.0-pre26): a stuck blade is not replayed on my fighter where my own replay of the
+        // blow found that my armour stopped the whole cut (combat/hsm_armor_gate.h).
+        bool armorGate = true;
     };
     // Installs the hooks (owner "claims"; they resolve on every level load). False when the script VM hook is
     // unavailable: nothing is guarded then (the host does not offer owner sync without it).
@@ -67,6 +72,7 @@ public:
         dedupe_.Forget(entity);
         coalescer_.Forget(entity);
         stuckLimiter_.Forget(entity);
+        armorGate_.Forget(entity);
         queue_.Forget(entity);                                       // blows queued against its old body are dropped
         if (entity <= kMaxWillies) { recent_[entity] = {}; resetDcdMs_[entity] = 0.0; }   // K4: a new body has no recent attacker
     }
@@ -81,10 +87,10 @@ private:
     struct Recent { uint8_t attacker = 0; double atMs = -1e18; };
     struct Counters {
         uint64_t sent = 0, gated = 0, limited = 0, friendly = 0, coalesced = 0, zeroImpulse = 0, capped = 0, replayed = 0,
-                 queued = 0, dropped = 0, dupes = 0, stale = 0, ageUnknown = 0, parried = 0, noVictim = 0, noBone = 0,
+                 refused = 0, queued = 0, dropped = 0, dupes = 0, stale = 0, ageUnknown = 0, parried = 0, noVictim = 0, noBone = 0,
                  noStriker = 0, failed = 0, blockedStandIn = 0, blockedOnMine = 0, blockedFlag = 0, getDamageBlocked = 0, effects = 0,
                  effectsSkipped = 0, clashes = 0, clashUnmatched = 0, propSent = 0, propReplayed = 0, blockedPropCopy = 0, badBone = 0,
-                 stuckSent = 0, stuckLimited = 0, stuckReplayed = 0, boltSent = 0, boltNoShooter = 0;
+                 stuckSent = 0, stuckLimited = 0, stuckReplayed = 0, stuckHeld = 0, armorStopped = 0, boltSent = 0, boltNoShooter = 0;
     };
     bool OnDealComplexDamage(ue::ScriptCall& c);
     bool OnGetDamage(ue::ScriptCall& c);
@@ -105,12 +111,19 @@ private:
     ue::UObject* HitBox(ue::UObject* victim, const combat::HitClaim& c, const combat::DcdInputs& in);
     bool CallGetDamage(ue::UObject* victim, ue::UObject* mesh, ue::UObject* striker, ue::FName bone, const combat::DcdInputs& in,
                        double rawDamage, ue::UObject* hitBox, double* damageOut);
+    // The game's own outputs of the call: Damage Out, Cutting Rate Out (the cut left after armour) and
+    // Material Density Out (set only when DCD runs to its end).
+    struct DcdOut { double damage = 0, cutRate = 0, density = 0; };
     bool CallDealComplexDamage(ue::UObject* victim, ue::UObject* mesh, ue::UObject* striker, ue::FName bone, const combat::DcdInputs& in,
-                               ue::UObject* hitBox, double* damageOut);
+                               ue::UObject* hitBox, DcdOut* out);
 
     bool active_ = false;
     Adapter* adapter_ = nullptr;
     StandIns* standIns_ = nullptr;
+    // What every Deal Complex Damage call on this machine was, for the log: what a tester's report can't say.
+    struct ContactLog { uint64_t all = 0, onStandIn = 0, onMine = 0, onOther = 0, byStandIn = 0, byMine = 0, byNobody = 0, afterZero = 0, afterSome = 0; uint32_t detailed = 0; };
+    ContactLog contacts_, contactsReported_;
+    std::string ContactLine();
     OwnerStreams* streams_ = nullptr;
     Env env_;
     mutable ue::PreparedCall components_;                            // Actor.K2_GetComponentsByClass (frees its last array)
@@ -119,8 +132,10 @@ private:
     bool boxFailLogged_ = false;
     combat::ClaimLimiter limiter_;
     combat::ClaimDedupe dedupe_;
+    BlowGate blowGate_;                      // what each attacker may land here (session/hsm_incoming_guard.h)
     combat::BlowCoalescer coalescer_;
     combat::StuckDamageLimiter stuckLimiter_;
+    combat::ArmorGate armorGate_;
     combat::ReplayQueue queue_;
     sync::PushGather pushes_;
     sync::RemoteGate reviveSent_;

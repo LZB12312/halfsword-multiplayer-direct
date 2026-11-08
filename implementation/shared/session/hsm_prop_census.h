@@ -7,7 +7,8 @@
 // level), and sends the list -- index, class and home, where the host first saw the prop -- to every client, in parts
 // (PropCensusMsg, SplitCensus) that a client puts back together (CensusAssembler). The client then finds its own actor
 // for each index: the nearest of its own physics props of the same class within kCensusMatchUu of the home, each used
-// once, nearest pairs first (MatchCensus). From then on that prop is MakeLevelPropId(index) in the lease table
+// once, nearest pairs first (MatchCensus), and each prop is placed where it lay early in the level when the client
+// recorded that (CensusMatchPlace). From then on that prop is MakeLevelPropId(index) in the lease table
 // (session/hsm_lease.h).
 #pragma once
 #include "hsm_protocol.h"
@@ -155,6 +156,13 @@ inline std::vector<int> MatchCensus(const std::vector<CensusEntry>& census, cons
         out[i] = int(j); used[j] = true;
     }
     return out;
+}
+
+// The place MatchCensus compares for one of the client's props: its snapshot place when it has one of the same class (where
+// it lay early in the level, before a roll or a carry moved it), else where it is now. nullptr: no snapshot.
+inline CensusCandidate CensusMatchPlace(const CensusCandidate& now, const CensusCandidate* snap) {
+    if (snap && snap->classHash == now.classHash) return CensusCandidate{now.classHash, snap->px, snap->py, snap->pz};
+    return now;
 }
 
 // ---------------------------------------------------------------- the host names its props
