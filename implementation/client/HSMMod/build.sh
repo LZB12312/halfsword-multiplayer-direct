@@ -20,6 +20,14 @@ COMMON="$COMMON -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITING_APIS
 DESCRIBE=$(git describe --always --dirty --exclude='*' 2>/dev/null | tr -cd 'A-Za-z0-9._+-' || true)
 INC="-Isrc -I../../shared -I../../shared/protocol -Ithird_party/minhook/include -Ithird_party/miniz -Ithird_party/enet/include -Ithird_party/miniupnpc/include -iquotethird_party/miniupnpc -DMINIUPNP_STATICLIB"
 
+JUICE=third_party/libjuice
+INC="$INC -I$JUICE/include -I$JUICE/include/juice -I$JUICE/src -DJUICE_STATIC -DNO_SERVER"
+relay_flags=()
+if [ -n "${HSM_RELAY_SIGNALLING_HOST:-}" ]; then
+  [[ "$HSM_RELAY_SIGNALLING_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,251}[a-zA-Z0-9]$ ]] ||
+    { echo "Invalid HSM_RELAY_SIGNALLING_HOST" >&2; exit 2; }
+  relay_flags=(-DHSM_RELAY_SIGNALLING_HOST=L\"$HSM_RELAY_SIGNALLING_HOST\")
+fi
 JOBS=${BUILD_JOBS:-$(( ($(nproc 2>/dev/null || echo 2) + 1) / 2 ))}
 case "$JOBS" in ''|*[!0-9]*|0) echo "build: BUILD_JOBS must be a positive number" >&2; exit 2 ;; esac
 # Each compile runs in the background with its diagnostics in OBJ.log and its exit status in OBJ.status; the logs are
@@ -44,11 +52,14 @@ done
 for f in third_party/enet/{callbacks,compress,host,list,packet,peer,protocol,win32}.c; do
   compile "build/obj/enet_$(basename "${f%.c}").o" "$CC" $COMMON -w $INC -c "$f"
 done
+for f in "$JUICE"/src/*.c; do
+  compile "build/obj/juice_$(basename "${f%.c}").o" "$CC" $COMMON -w $INC -c "$f"
+done
 for f in src/*.cpp src/*/*.cpp; do
   [ -e "$f" ] || continue
   desc=()
   if grep -q HSM_GIT_DESCRIBE "$f"; then desc=(-DHSM_GIT_DESCRIBE="\"$DESCRIBE\""); fi
-  compile "build/obj/$(echo "${f%.cpp}" | tr '/' '_').o" "$CXX" -std=c++20 $COMMON -Werror $INC "${desc[@]}" -c "$f"
+  compile "build/obj/$(echo "${f%.cpp}" | tr '/' '_').o" "$CXX" -std=c++20 $COMMON -Werror $INC "${relay_flags[@]}" "${desc[@]}" -c "$f"
 done
 wait
 failed=0
@@ -66,5 +77,5 @@ if "$CXX" -c -x c++ /dev/null -o /dev/null -mguard=cf 2>/dev/null; then
   echo 1 > build/guard_cf
 fi
 "$CXX" -shared -o build/dwmapi.dll "${objs[@]}" src/dwmapi.def \
-  $LINK_FLAGS -static -static-libgcc -static-libstdc++ -Wl,--kill-at -lws2_32 -lwinmm -liphlpapi
+  $LINK_FLAGS -static -static-libgcc -static-libstdc++ -Wl,--kill-at -lws2_32 -lwinmm -liphlpapi -lwinhttp -lbcrypt -lcrypt32
 echo "built build/dwmapi.dll ($CFG)"

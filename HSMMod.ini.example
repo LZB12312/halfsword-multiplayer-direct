@@ -10,3 +10,5 @@ reports=off
 update_check=1
 ; HTTPS public IPv4 lookup for the host address label (LAN still works when off).
 public_ip_lookup=1
+; Optional override for the relay beta operator's HTTPS signalling hostname.
+; relay_signalling_host=relay-signalling.example.org

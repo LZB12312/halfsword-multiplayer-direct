@@ -10,9 +10,16 @@ $inc = @('-Isrc','-I../../shared','-I../../shared/protocol','-Ithird_party/minho
 $describe = (git describe --always --dirty --exclude='*') -replace '[^A-Za-z0-9._+-]', ''
 New-Item -ItemType Directory -Force build/obj | Out-Null
 $objects = @()
+$juice = 'third_party/libjuice'
+$inc += @("-I$juice/include","-I$juice/include/juice","-I$juice/src",'-DJUICE_STATIC','-DNO_SERVER')
+if ($env:HSM_RELAY_SIGNALLING_HOST) {
+    if ($env:HSM_RELAY_SIGNALLING_HOST -notmatch '^[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]$') { throw 'Invalid HSM_RELAY_SIGNALLING_HOST' }
+    $inc += "-DHSM_RELAY_SIGNALLING_HOST=L`"$env:HSM_RELAY_SIGNALLING_HOST`""
+}
 $sources = @('third_party/miniz/miniz.c','third_party/minhook/src/buffer.c','third_party/minhook/src/hook.c','third_party/minhook/src/trampoline.c','third_party/minhook/src/hde/hde64.c')
 $sources += @('callbacks','compress','host','list','packet','peer','protocol','win32') | ForEach-Object { "third_party/enet/$_.c" }
 $sources += @('igd_desc_parse','miniupnpc','minixml','minisoap','minissdpc','miniwget','upnpcommands','upnpdev','upnpreplyparse','upnperrors','connecthostport','portlistingparse','receivedata','addr_is_reserved') | ForEach-Object { "third_party/miniupnpc/src/$_.c" }
+$sources += @(Get-ChildItem "$juice/src" -Filter *.c | ForEach-Object { "$juice/src/$($_.Name)" })
 foreach ($file in $sources) {
     $obj = 'build/obj/' + ($file -replace '[/\\.]','_') + '.o'
     if ($Incremental -and (Test-Path $obj) -and (Get-Item $obj).LastWriteTime -gt (Get-Item $file).LastWriteTime) { $objects += $obj; continue }
@@ -28,6 +35,6 @@ foreach ($file in Get-ChildItem src -Recurse -Filter *.cpp) {
     if ($LASTEXITCODE) { throw "Compilation failed: $relative" }
     $objects += $obj
 }
-& $cxx -shared -o build/dwmapi.dll @objects src/dwmapi.def '-fstack-protector-strong' '-s' '-Wl,-Map,build/dwmapi.map' '-static' '-static-libgcc' '-static-libstdc++' '-Wl,--kill-at' '-lws2_32' '-lwinmm' '-liphlpapi'
+& $cxx -shared -o build/dwmapi.dll @objects src/dwmapi.def '-fstack-protector-strong' '-s' '-Wl,-Map,build/dwmapi.map' '-static' '-static-libgcc' '-static-libstdc++' '-Wl,--kill-at' '-lws2_32' '-lwinmm' '-liphlpapi' '-lwinhttp' '-lbcrypt' '-lcrypt32'
 if ($LASTEXITCODE) { throw 'Link failed' }
 'Built build/dwmapi.dll'

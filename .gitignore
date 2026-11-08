@@ -8,3 +8,8 @@ HSMMod.bans
 __pycache__/
 dist/
 HalfSword-Direct-IP.zip
+
+# Local signalling configuration and Wrangler state.
+services/relay-signalling/.dev.vars*
+.wrangler/
+services/relay-signalling/node_modules/

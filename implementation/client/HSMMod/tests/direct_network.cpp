@@ -3,6 +3,7 @@
 #include "hsm_protocol.h"
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdarg>
 #include <algorithm>
 #include <set>
@@ -11,9 +12,12 @@ using namespace hsm;
 namespace d=hsm::direct;
 #define CHECK(x) do { if(!(x)) { printf("FAIL %d: %s\n",__LINE__,#x); return 1; } } while(0)
 int main(int argc,char** argv) {
-    CHECK(argc==2); CHECK(d::Init()); CHECK(!d::VoiceAvailable());
+    CHECK(argc==2 || argc==3); CHECK(d::Init()); CHECK(!d::VoiceAvailable());
     CHECK(GetModuleHandleA("steam_api64.dll")==nullptr);
-    const std::string mode=argv[1]; const bool host=mode=="host";
+    const std::string mode=argv[1];
+    const bool ice=mode=="ice-host" || mode=="ice-client";
+    const bool host=mode=="host" || mode=="ice-host";
+    const char* token = ice ? std::getenv("HSM_INVITE_TOKEN") : nullptr;
     if(mode=="lifecycle-host" || mode=="lifecycle-client") {
         const bool server=mode=="lifecycle-host"; int entered=0, chats=0; bool joining=!server;
         if(server) d::CreateLobby(d::LobbyType::Private,2); else d::JoinLobby(1);
@@ -48,20 +52,33 @@ int main(int argc,char** argv) {
         }
     }
     if(host) {
-        d::CreateLobby(d::LobbyType::Private,3);
-        CHECK(d::LobbyOwner(1)==1);
-        d::SetLobbyData(1,"test","snapshot-value");
-        CHECK(d::SetLobbyData(1,"hsm_sever","250"));
+        if (ice) d::CreateIceLobby(3,token ? token : "");
+        else d::CreateLobby(d::LobbyType::Private,3);
+    } else if (ice) {
+        CHECK(argc==3);
+        d::JoinIceLobby(token ? token : "",argv[2]);
     } else d::JoinLobby(1);
-    bool joined=host, chat=false, large=false, unreliable=false, ready=false;
+    bool joined=false, chat=false, large=false, unreliable=false, ready=false;
     std::set<d::UserId> seen, complete;
     uint32_t start=GetTickCount(), lastSend=0, finished=0;
     for(;;) {
-        const auto now=GetTickCount(); CHECK(now-start<15000);
+        const auto now=GetTickCount(); CHECK(now-start<(ice?65000u:15000u));
         d::Tick(); d::Event e;
         while(d::Poll(e)) {
-            if(e.kind==d::Event::LobbyCreated) CHECK(e.ok);
+            if(e.kind==d::Event::LobbyCreated) {
+                if (!e.ok) puts(e.text.c_str());
+                CHECK(e.ok);
+                CHECK(d::LobbyOwner(1)==1);
+                joined=true;
+                d::SetLobbyData(1,"test","snapshot-value");
+                CHECK(d::SetLobbyData(1,"hsm_sever","250"));
+                if (ice) {
+                    printf("ROOM %s\n",d::IceRoomCode().c_str());
+                    fflush(stdout);
+                }
+            }
             if(e.kind==d::Event::LobbyEntered) {
+                if (ice && !e.ok) puts(e.text.c_str());
                 if(mode=="reject") { CHECK(!e.ok); d::LeaveLobby(1); puts("PASS full-host rejection"); return 0; }
                 CHECK(e.ok); joined=true; CHECK(d::MyUserId()>1); CHECK(d::LobbyData(1,"test")=="snapshot-value");
                 CHECK(d::LobbyData(1,"hsm_sever")=="250");
@@ -78,7 +95,7 @@ int main(int argc,char** argv) {
         if(!joined) { Sleep(2); continue; }
         if(!host) ready=d::PersonaName(d::MyUserId())=="Renamed-"+std::to_string(d::MyUserId());
         if(host) for(auto id:d::LobbyMembers(1)) if(id!=1 && !seen.count(id)) {
-            CHECK(!d::RemoteAddress(id).empty()); seen.insert(id);
+            CHECK(d::RemoteAddress(id).empty()==ice); seen.insert(id);
         }
         // Exercise fragmented reliable frames at the gameplay packet limit and a
         // separate unreliable stream. Echo both directions and check every byte.

@@ -16,9 +16,9 @@ namespace hsm::game {
 constexpr int kMaxLobbyMembers = 8;   // players: == kMaxPlayers (session/hsm_roster.h; static_assert in session.cpp).
                                       // A role=server lobby has one member more: the server, which is not a player.
 #ifdef HSM_TESTBENCH
-constexpr const char* kModVersion = "0.4.0-test";
+constexpr const char* kModVersion = "0.4.1-pre1-test";
 #else
-constexpr const char* kModVersion = "0.4.0";   // bump with every release tag
+constexpr const char* kModVersion = "0.4.1-pre1";   // bump with every release tag
 #endif
 // This mod's build: kModVersion, the git describe build.sh passed and the DLL file's hash (session/hsm_build.h). Players
 // compare it.
@@ -72,7 +72,9 @@ public:
     void Host(direct::LobbyType type, bool server = false);   // server: role=server, one member more (hsm_srv=1)
     void Join(direct::UserId lobby, const std::string& password = std::string());   // password: for a locked lobby (kept for this lobby only)
     void JoinAddress(const std::string& address);
-    void Leave();
+    void HostIce(const std::string& token);
+    void JoinIce(const std::string& token, const std::string& code);
+    void Leave(bool keepIce = false);
     void Invite();
     bool SendChat(const std::string& text);        // to every member (Steam lobby chat); false: not in a lobby or Steam refused
     void SetType(direct::LobbyType type);

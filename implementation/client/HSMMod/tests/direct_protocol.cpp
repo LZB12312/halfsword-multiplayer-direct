@@ -1,6 +1,7 @@
 // Test the control parser in the same translation unit, including malformed and
 // forged frames. No router or socket is used by these tests.
 #include "../src/net/direct_api.cpp"
+#include "net/ice_crypto.h"
 #include <cstdio>
 #include <random>
 namespace hsm { void Log(const char*,...) {} }
@@ -8,6 +9,20 @@ namespace hsm::net { void UpnpMapping::Start(uint16_t) {} void UpnpMapping::Stop
 #define CHECK(x) do { if(!(x)) { printf("FAIL line %d: %s\n",__LINE__,#x); return 1; } } while(0)
 int main() {
     using namespace hsm::direct;
+    hsm::net::ice::Channel initiator("room:peer"), responder("room:peer");
+    CHECK(initiator.Accept(responder.PublicKey()));
+    CHECK(responder.Accept(initiator.PublicKey()));
+    const std::vector<uint8_t> plain{1,2,3};
+    auto sealed=initiator.Seal(plain.data(),plain.size());
+    CHECK(!sealed.empty());
+    auto tampered=sealed;
+    tampered.back()^=1;
+    CHECK(responder.Open(tampered.data(),tampered.size()).empty());
+    CHECK(responder.Open(sealed.data(),sealed.size())==plain);
+    CHECK(responder.Open(sealed.data(),sealed.size()).empty());
+    CHECK(initiator.Open(sealed.data(),sealed.size()).empty());
+    const auto reply=responder.Seal(plain.data(),plain.size());
+    CHECK(initiator.Open(reply.data(),reply.size())==plain);
     CHECK(!SetConnectAddress("")); CHECK(!SetConnectAddress("127.0.0.1:0"));
     CHECK(!SetConnectAddress("127.0.0.1:65536")); CHECK(!SetConnectAddress("host:1:2"));
     CHECK(!SetConnectAddress("host\nrole=server")); CHECK(SetConnectAddress("test.example:27015"));

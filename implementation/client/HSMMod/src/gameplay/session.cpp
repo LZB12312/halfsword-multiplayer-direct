@@ -1580,7 +1580,7 @@ public:
         const bool fight = InFightLevel();
         const direct::UserId lobbyId = lobby_.id();
         welcomed_ = false;                             // the lobby's onLeft must not open the menu a second time
-        if (steamMode()) lobby_.Leave();
+        if (steamMode()) lobby_.Leave(why == RejectReason::WrongPassword);
         ResetNetwork("rejected by the host");
         ui::ShowLine("HSMMod", style::kBone, text);
         if (why == RejectReason::WrongPassword && steamMode() && lobbyId) lobby_.AskPassword(lobbyId, msg);   // the page asks again (menu.cpp)

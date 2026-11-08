@@ -72,7 +72,7 @@ void Lobby::Tick() {
     while (direct::Poll(e)) {
         switch (e.kind) {
             case direct::Event::LobbyCreated:
-                if (!e.ok) { state_ = State::Idle; SetStatus("Could not create lobby"); break; }
+                if (!e.ok) { state_ = State::Idle; SetStatus(e.text.empty() ? "Could not create lobby" : e.text); break; }
                 direct::SetLobbyData(e.lobby, "hsm_proto", ProtocolStr());
                 direct::SetLobbyData(e.lobby, "hsm_build", BuildKeyHex());
                 direct::SetLobbyData(e.lobby, "hsm_ver", kModVersion);
@@ -86,6 +86,11 @@ void Lobby::Tick() {
             case direct::Event::LobbyEntered:
                 if (state_ == State::Creating) break;    // our own new lobby: entered before LobbyCreated sets its data
                 if (state_ == State::InLobby && lobby_ == e.lobby) break;
+                if (!e.ok && state_ == State::Idle && askLobby_ == e.lobby) {
+                    CancelPasswordAsk();
+                    SetStatus(e.text);
+                    break;
+                }
                 // An enter for a lobby we are no longer joining (a late answer after Leave or a second invite) would
                 // otherwise drop us into it, or reset a join in progress. Fix from CSLewin's PR #1.
                 if (state_ != State::Joining || e.lobby != joining_) {
@@ -94,7 +99,7 @@ void Lobby::Tick() {
                     break;
                 }
                 joining_ = 0;
-                if (!e.ok) { state_ = State::Idle; SetStatus(e.text.empty() ? "Could not connect: check address, UDP port and firewall" : e.text); break; }
+                if (!e.ok) { direct::LeaveLobby(e.lobby); state_ = State::Idle; SetStatus(e.text.empty() ? "Could not connect: check address, UDP port and firewall" : e.text); break; }
                 if (state_ != State::InLobby || lobby_ != e.lobby) {
                     LobbyListing l = Describe(e.lobby);
                     if (!l.compatible) { direct::LeaveLobby(e.lobby); state_ = State::Idle; SetStatus(l.modsText.empty() ? "Cannot join: " + l.reason : l.modsText); break; }
@@ -104,7 +109,7 @@ void Lobby::Tick() {
                         if (pc.verdict != PackVerdict::Ok) { direct::LeaveLobby(e.lobby); state_ = State::Idle; SetStatus(PackJoinLine(l.pack, pc)); break; }
                     }
                     if (l.locked && passwordLobby_ != e.lobby) {   // an invite or a friend's Join Game: no password was typed yet
-                        direct::LeaveLobby(e.lobby); state_ = State::Idle;
+                        direct::LeaveLobby(e.lobby,true); state_ = State::Idle;
                         SetStatus("This lobby needs a password");
                         AskPassword(e.lobby);
                         break;
@@ -114,7 +119,10 @@ void Lobby::Tick() {
                 break;
             case direct::Event::LobbyMembersChanged:
             case direct::Event::LobbyDataChanged:
-                if (e.lobby == lobby_ && state_ == State::InLobby) RefreshMembers();
+                if (e.lobby == lobby_ && state_ == State::InLobby) {
+                    if (e.ok) RefreshMembers();
+                    else { Leave(); SetStatus(e.text.empty() ? "Host disconnected" : e.text); }
+                }
                 break;
             case direct::Event::JoinRequested:
                 if (e.lobby && e.lobby != lobby_) { Leave(); Join(e.lobby); }   // Leave is a no-op unless in or joining a lobby
@@ -228,9 +236,30 @@ void Lobby::SetMaxPlayers(int n) {
 
 void Lobby::JoinAddress(const std::string& address) {
     if(!direct::SetConnectAddress(address)) { SetStatus("Enter an IPv4 address or hostname, optionally followed by :port (1-65535)"); return; }
+    if (direct::IceActive()) direct::LeaveLobby(1);
     SaveIniValues({{"connect",address}});
     Join(1);
 }
+void Lobby::HostIce(const std::string& token) {
+    if (state_ != State::Idle) return;
+    if (onlineBlock) if (const auto why = onlineBlock(hostPreset,hostBlock); !why.empty()) { SetStatus(why); return; }
+    password_.clear(); passwordLobby_=askLobby_=0; askNote_.clear();
+    type_=direct::LobbyType::Private;
+    server_=false;
+    state_=State::Creating;
+    SetStatus("Opening relay room...");
+    direct::CreateIceLobby(maxPlayers_,token);
+}
+
+void Lobby::JoinIce(const std::string& token, const std::string& code) {
+    if (state_ != State::Idle) return;
+    password_.clear(); passwordLobby_=askLobby_=0; askNote_.clear();
+    joining_=1;
+    state_=State::Joining;
+    SetStatus("Connecting to relay room...");
+    direct::JoinIceLobby(token,code);
+}
+
 void Lobby::Join(direct::UserId lobby, const std::string& password) {
     if (state_ != State::Idle || !lobby) return;
     password_ = CleanPassword(password); passwordLobby_ = password_.empty() ? 0 : lobby;
@@ -256,9 +285,9 @@ void Lobby::Enter(direct::UserId lobby) {
     if (onEntered) onEntered();
 }
 
-void Lobby::Leave() {
-    if (state_ != State::InLobby && state_ != State::Joining) return;
-    direct::LeaveLobby(state_ == State::Joining ? joining_ : lobby_);
+void Lobby::Leave(bool keepIce) {
+    if (state_ != State::InLobby && state_ != State::Joining && state_ != State::Creating) return;
+    direct::LeaveLobby(state_ == State::Joining ? joining_ : lobby_,keepIce);
     for (const LobbyMember& m : members_) if (m.id != direct::MyUserId() && onMemberLeft) onMemberLeft(m.id);
     members_.clear(); lobby_ = owner_ = joining_ = 0; state_ = State::Idle;
     password_.clear(); passwordLobby_ = 0;

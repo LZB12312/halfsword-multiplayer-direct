@@ -1,0 +1,1 @@
+{"name":"halfsword-relay-signalling","private":true,"type":"module","scripts":{"dev":"wrangler dev --local --ip 127.0.0.1","deploy":"wrangler deploy","test":"node --test test/*.test.mjs"},"devDependencies":{"wrangler":"4.158.0"}}

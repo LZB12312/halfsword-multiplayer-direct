@@ -1,5 +1,11 @@
 # Third-party notices
 
+## libjuice
+
+The DLL links libjuice under the Mozilla Public License 2.0. The source, relay-only
+changes, and license are in `implementation/client/HSMMod/third_party/libjuice`
+and are included as `libjuice-source` in the release archive.
+
 ## Contributions by CSLewin
 
 Parts of the Steam and match code come from CSLewin's pull request #1 to Dudiebug/halfsword-multiplayer-mod,

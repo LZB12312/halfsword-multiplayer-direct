@@ -164,7 +164,8 @@ struct State {
     Text reportHow;                              // how to report from a fight (/bug)
     Box reportBox;
     EditBox reportText;
-    EditBox connectText;
+    EditBox connectText, inviteToken, roomCode;
+    Flat hostIce, joinIce, cancelIce;
     EditBox nameEdit;
     Box addressRow;
     Text ipLabel, featureNote;
@@ -432,7 +433,24 @@ void BuildChat(Box& left) {
 // Not in a lobby, left: the two ways to host, big, and what comes next.
 void BuildIdleLeft() {
     Box& col = g.idleLeft;
-    Section(col, "HOST A LOBBY", 0);
+    Section(col, "RELAY ROOMS", 0);
+    g.inviteToken = g.kit.MakeEditBox();
+    if (!g.inviteToken.Mask()) g.inviteToken = EditBox{};
+    g.inviteToken.Hint("Relay invitation (blank uses saved token)");
+    g.roomCode = g.kit.MakeEditBox();
+    g.roomCode.Hint("Room code from host");
+    AddToVerticalBox(col, g.inviteToken, 6);
+    AddToVerticalBox(col, g.roomCode, 6);
+    Box ice = g.kit.MakeRow();
+    g.hostIce = MakeFlat("HOST RELAY", 15);
+    g.joinIce = MakeFlat("JOIN ROOM", 15);
+    g.cancelIce = MakeFlat("CANCEL", 15);
+    AddFlatH(ice, g.hostIce, 8);
+    AddFlatH(ice, g.joinIce, 8);
+    AddFlatH(ice, g.cancelIce, 0);
+    g.cancelIce.card.button.Show(false);
+    AddToVerticalBox(col, ice, 6);
+    Section(col, "DIRECT IP", 12);
     g.hostFriends = MakeHost("HOST DIRECT", "Host on your UDP port. UPnP is attempted when enabled; manual forwarding also works.");
     g.hostPublic = MakeHost("JOIN ADDRESS", "Enter the host IPv4 address or hostname below, with :port if needed.");
     for (HostView* h : {&g.hostFriends, &g.hostPublic})
@@ -1931,6 +1949,7 @@ void HandleClicks(Session& session) {
         if (ok && !cancel && typed.empty()) { g.pwNote.Set("Type the password first."); g.pwText.Focus(); return; }
         g.pwOpen = false; g.pw.Show(false); g.pwText.Clear(); SetLobbyTyping(false);
         lobby.CancelPasswordAsk();
+        if (cancel && direct::IceActive() && !lobby.InLobby()) direct::LeaveLobby(id);
         if (ok && !cancel && id) { HSM_LOG("ui: joining a locked lobby with a password"); lobby.Join(id, typed); }
         g.nextText = 0;
         return;
@@ -2172,12 +2191,18 @@ void HandleClicks(Session& session) {
         const bool ok=lobby.SetDisplayName(g.nameEdit.Value());
         g.featureNote.Set(ok?"Display name saved":"Enter a non-empty display name");
     }
+    const bool iceActive = direct::IceActive();
+    const auto code = direct::IceRoomCode();
     const auto share=direct::ShareAddress(), lan=direct::LanAddress();
     g.addressRow.Show(s.in);
-    g.ipLabel.Set(!share.empty()?"HOST IP: "+share:"Public IP not available yet"+ (lan.empty()?std::string():" | LAN: "+lan));
-    Live(g.copyIp.card,!share.empty()); Live(g.copyLan.card,!lan.empty());
+    g.ipLabel.Set(iceActive ? "RELAY ROOM: " + code : !share.empty()?"HOST IP: "+share:"Public IP not available yet"+ (lan.empty()?std::string():" | LAN: "+lan));
+    g.copyIp.label.Set(iceActive ? "COPY ROOM CODE" : "COPY PUBLIC IP");
+    Live(g.copyIp.card,iceActive ? !code.empty() : !share.empty()); Live(g.copyLan.card,!lan.empty());
     Paint(g.copyIp.card); Paint(g.copyLan.card); Paint(g.saveName.card); Paint(g.pasteAddress.card);
-    if(Clicked(g.copyIp.card) && !share.empty()) g.featureNote.Set(net::CopyText(share)?"Host address copied":"Could not open the clipboard; try again");
+    const auto& shareValue = iceActive ? code : share;
+    if(Clicked(g.copyIp.card) && !shareValue.empty())
+        g.featureNote.Set(net::CopyText(shareValue) ? (iceActive ? "Room code copied" : "Host address copied")
+                                                  : "Could not open the clipboard; try again");
     if(Clicked(g.copyLan.card) && !lan.empty()) g.featureNote.Set(net::CopyText(lan)?"LAN address copied":"Could not open the clipboard; try again");
     if(s.idle && Clicked(g.pasteAddress.card)) g.connectText.Set(net::ClipboardText());
     Paint(g.editLoadout.card);
@@ -2186,7 +2211,23 @@ void HandleClicks(Session& session) {
         if(error.empty()) { ClosePage(); return; }
         g.featureNote.Set(error);
     }
-    if (s.idle && g.connectText.Focused()) SetLobbyTyping(true);
+    if (s.idle && (g.connectText.Focused() || g.inviteToken.Focused() || g.roomCode.Focused())) SetLobbyTyping(true);
+    const bool iceConnecting = iceActive && !s.in && !s.idle;
+    g.cancelIce.card.button.Show(iceConnecting);
+    Live(g.hostIce.card,s.idle);
+    Live(g.joinIce.card,s.idle);
+    Paint(g.hostIce.card);
+    Paint(g.joinIce.card);
+    Paint(g.cancelIce.card);
+    if (act(Clicked(g.cancelIce.card),iceConnecting)) lobby.Leave();
+    if (act(Clicked(g.hostIce.card),s.idle)) {
+        lobby.HostIce(g.inviteToken.Value());
+        g.inviteToken.Clear();
+    }
+    if (act(Clicked(g.joinIce.card),s.idle)) {
+        lobby.JoinIce(g.inviteToken.Value(),g.roomCode.Value());
+        g.inviteToken.Clear();
+    }
     HandlePassword(session, s.hostPassword && !g.settingsShown);
     HandleDamage(lobby, s, acted);               // after the two boxes: its own text box keeps the hotkeys off too
     if (ClassesOpen(s) && g.classNameBox && g.classNameBox.Focused()) SetLobbyTyping(true);   // and the class name's, after all of them

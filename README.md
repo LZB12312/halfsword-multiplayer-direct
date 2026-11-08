@@ -9,7 +9,7 @@ The game's own distribution, launcher and supported executable requirements are 
 
 Based on Dudiebug/halfsword-multiplayer-mod commit
 `10c3fa9ad78a0c25b76c48f83336da2efb0859ad` ([0.8.0-pre40](https://github.com/Dudiebug/halfsword-multiplayer-mod/releases/tag/v0.8.0-pre40)).
-Fork version: **0.4.0**. Everyone must use this same fork and build.
+Fork version: **0.4.1-pre1**. Everyone must use this same fork and build.
 The upstream Steam mod cannot connect to it.
 
 ## Install
@@ -27,6 +27,18 @@ existing executable fingerprint checks. This change does not change game compati
 This build includes upstream's UE4SS bundle and compatibility checks. Use `ue4ss=0`
 under `[mod]` to disable automatic UE4SS installation and loading. Upstream lists
 crossbows as a known issue in pre40.
+
+## Relay rooms
+
+A build configured for relay rooms can host and join from **Multiplayer** using
+**Host Relay**, **Copy Room Code**, and **Join Room**. A registered relay invitation
+is needed on first use. Windows Credential Manager remembers it for that room
+service. Relay rooms send encrypted game traffic through the configured UDP TURN
+server and exchange only relay addresses. The existing **Direct IP** controls
+remain available for players choosing to share an address.
+
+See [relay service setup](services/relay-signalling/README.md) for the operator
+configuration, test commands, and service limits.
 
 ## Host
 

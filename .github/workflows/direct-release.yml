@@ -34,6 +34,8 @@ jobs:
           "LLVM_MINGW=$tc" >> $env:GITHUB_ENV
       - name: Build DLL
         shell: pwsh
+        env:
+          HSM_RELAY_SIGNALLING_HOST: ${{ vars.HSM_RELAY_SIGNALLING_HOST }}
         run: ./implementation/client/HSMMod/build.ps1
       - name: Test direct transport, updater and sever recovery
         shell: pwsh
@@ -55,6 +57,7 @@ jobs:
           $hash = (Get-FileHash dist/dwmapi.dll -Algorithm SHA256).Hash.ToLowerInvariant()
           [IO.File]::WriteAllText((Join-Path (Resolve-Path dist) 'dwmapi.dll.sha256'), "$hash  dwmapi.dll`n")
           Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md,HSMMod.ini.example dist/
+          Copy-Item -Recurse implementation/client/HSMMod/third_party/libjuice dist/libjuice-source
           Compress-Archive -Path dist/* -DestinationPath HalfSword-Direct-IP.zip
       - uses: actions/upload-artifact@v4
         with:
