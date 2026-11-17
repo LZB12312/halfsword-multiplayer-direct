@@ -105,7 +105,8 @@ in the lobby and start the next match. Clients cannot force a host map change.
 
 ## Join
 
-Open MULTIPLAYER, enter **host IPv4 or hostname:port** in the address field, then
+Open MULTIPLAYER, if the room code joining fails, you can connect via
+direct IP, this is slightly less secure. To do this, enter **host IPv4 or hostname:port** in the address field, then
 click **JOIN ADDRESS**. Example: `192.168.1.50:27015` for a LAN host.
 The address is saved to `connect=` in your INI. A missing port uses the local
 `port=` value (27015 by default). IPv4/DNS names are supported; IPv6 is not.
