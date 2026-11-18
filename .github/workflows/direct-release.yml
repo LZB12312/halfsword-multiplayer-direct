@@ -21,7 +21,10 @@ jobs:
         shell: pwsh
         run: |
           $header = Get-Content implementation/client/HSMMod/src/gameplay/lobby.h -Raw
-          $version = [regex]::Match($header, 'kModVersion\s*=\s*"(\d+\.\d+\.\d+(?:-pre\d+)?)"').Groups[1].Value
+          $releaseBranch = [regex]::Match($header, '#else\s*constexpr\s+const\s+char\*\s+kModVersion\s*=\s*"([^"]+)"', 'IgnoreCase,Singleline')
+          if (-not $releaseBranch.Success) { throw 'Release mod version not found in lobby.h' }
+          $version = $releaseBranch.Groups[1].Value
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:-pre\d+)?$') { throw 'Invalid compiled mod version' }
           if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag does not match compiled mod version' }
       - name: Fetch pinned LLVM-MinGW toolchain
         shell: pwsh
