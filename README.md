@@ -1,7 +1,7 @@
 # Half Sword Multiplayer Direct IP fork
 
 This fork replaces the original half sword multiplayer mod's Steamworks networking and lobby backend with ENet
-over UDP. It provides a host-owned lobby, player names from `HSMMod.ini`, chat,
+over UDP, this completely bypasses the need for steam to be open or for steam to verify your copy. It provides a host-owned lobby, player names from `HSMMod.ini`, chat,
 ready/team/settings synchronization and a direct address field in the game menu.
 UPnP is optional; manual UDP forwarding also works. No Steam SDK, Steamworks
 interfaces, Steam lobby, Steam account lookup or Steam relay is used by the mod.
